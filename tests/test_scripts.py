@@ -71,6 +71,27 @@ class RsonTests(unittest.TestCase):
             project.data["Visual.Links"][0]["End"] = 999
             self.assertTrue(any(issue.code == "rson-link-ref" for issue in project.validate()))
 
+    def test_syntax_preflight_rejects_uncommented_prose_before_compiler(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            project.object_by_id(1)["Code"] = [
+                'message="Русский текст в строке допустим";',
+                "// Русский комментарий допустим",
+                "q=0;Правильная, но неработающая строка",
+            ]
+            issues = project.validate()
+            matching = [issue for issue in issues if issue.code == "rscript-uncommented-text"]
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0].location, "object #1 Code:3")
+
+    def test_syntax_preflight_reports_unclosed_comment_and_delimiter(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            project.object_by_id(1)["Code"] = ["if(Player() {", "/* unfinished"]
+            codes = {issue.code for issue in project.validate()}
+            self.assertIn("rscript-unclosed-comment", codes)
+            self.assertIn("rscript-unbalanced-delimiter", codes)
+
     def test_state_events_are_headless_and_preserve_handler(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

@@ -1305,6 +1305,7 @@ def cmd_script_build(args: argparse.Namespace) -> int:
         args.scr,
         args.lang,
         overwrite=args.overwrite,
+        timeout=getattr(args, "timeout", None),
     )
     if preflight is not None:
         result["runtime_preflight"] = preflight
@@ -1339,15 +1340,53 @@ def cmd_script_decompile(args: argparse.Namespace) -> int:
         args.output,
         lang_dat=args.lang_dat,
         overwrite=args.overwrite,
+        decompile_timeout=args.decompile_timeout,
+        roundtrip_timeout=args.roundtrip_timeout,
+        keep_unverified=args.keep_unverified,
+        deep_roundtrip=args.deep_roundtrip,
     )
     if args.json:
         print_json(result)
-    else:
+    elif result["verified"]:
         print(f"RSON восстановлен: {result['destination']}")
         print(f"Объектов: {result['objects']}")
-        print(f"Проверочный цикл SCR -> RSON -> SCR: {'пройден' if result['verified'] else 'НЕТ'}")
+        print("Проверочный цикл SCR -> RSON -> SCR: пройден")
         print(f"SHA-256 RSON: {result['destination_sha256']}")
-    return 0
+    else:
+        print(f"RSON не опубликован: {result['error']['message']}")
+        for phase in result["phases"]:
+            print(f"  {phase['status'].upper():7} {phase['name']} ({phase['seconds']:.3f} с)")
+        if result.get("unverified_path"):
+            print(f"Непроверенная копия сохранена явно: {result['unverified_path']}")
+    if result["verified"]:
+        return 0
+    return 1 if result.get("operational_failure") else 2
+
+
+def cmd_script_compare_scr(args: argparse.Namespace) -> int:
+    result = Toolchain(args.tools_root).compare_scr(
+        args.left,
+        args.right,
+        left_lang_dat=args.left_lang_dat,
+        right_lang_dat=args.right_lang_dat,
+        decompile_timeout=args.decompile_timeout,
+        roundtrip_timeout=args.roundtrip_timeout,
+        deep_roundtrip=args.deep_roundtrip,
+        max_diff_lines=args.max_diff_lines,
+    )
+    if args.json:
+        print_json(result)
+    elif not result["verified"]:
+        print("Сравнение неполное: хотя бы один SCR не прошёл проверочный round-trip.")
+    else:
+        comparison = result["comparison"]
+        print(f"Структурные метаданные совпадают: {'да' if comparison['metadata_match'] else 'нет'}")
+        print(f"Изменённых блоков кода: {len(comparison['changed_blocks'])}")
+        runtime = comparison["runtime_issues"]
+        print(f"Runtime-замечания: +{len(runtime['added'])}, -{len(runtime['resolved'])}, ={len(runtime['unchanged'])}")
+    if result["verified"]:
+        return 0
+    return 1 if result.get("operational_failure") else 2
 
 
 def cmd_script_inspect_scr(args: argparse.Namespace) -> int:
@@ -1473,7 +1512,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.2")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.3")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -1843,6 +1882,11 @@ def build_parser() -> argparse.ArgumentParser:
     script_build.add_argument("--scr", required=True)
     script_build.add_argument("--lang", required=True)
     script_build.add_argument("--overwrite", action="store_true")
+    script_build.add_argument(
+        "--timeout",
+        type=float,
+        help="Лимит RScript в секундах; по умолчанию адаптивный, 0 отключает общий лимит",
+    )
     script_build.add_argument("--tools-root")
     script_build.add_argument("--json", action="store_true")
     script_build.set_defaults(func=cmd_script_build)
@@ -1862,10 +1906,45 @@ def build_parser() -> argparse.ArgumentParser:
     script_decompile.add_argument("source")
     script_decompile.add_argument("output")
     script_decompile.add_argument("--lang-dat", help="Необязательный Lang.dat для восстановления диалогов")
+    script_decompile.add_argument(
+        "--decompile-timeout",
+        type=float,
+        help="Лимит восстановления в секундах; по умолчанию адаптивный, 0 отключает общий лимит",
+    )
+    script_decompile.add_argument(
+        "--roundtrip-timeout",
+        type=float,
+        help="Лимит контрольной сборки в секундах; по умолчанию адаптивный, 0 отключает общий лимит",
+    )
+    script_decompile.add_argument(
+        "--keep-unverified",
+        help="Явный отдельный .rson для сохранения результата, не прошедшего round-trip",
+    )
+    script_decompile.add_argument(
+        "--deep-roundtrip",
+        action="store_true",
+        help="Дополнительно проверить SCR -> RSON -> SCR -> RSON (медленнее)",
+    )
     script_decompile.add_argument("--overwrite", action="store_true")
     script_decompile.add_argument("--tools-root")
     script_decompile.add_argument("--json", action="store_true")
     script_decompile.set_defaults(func=cmd_script_decompile)
+
+    script_compare = script_sub.add_parser(
+        "compare-scr",
+        help="Восстановить и сравнить два SCR без сохранения файлов мода",
+    )
+    script_compare.add_argument("left")
+    script_compare.add_argument("right")
+    script_compare.add_argument("--left-lang-dat")
+    script_compare.add_argument("--right-lang-dat")
+    script_compare.add_argument("--decompile-timeout", type=float)
+    script_compare.add_argument("--roundtrip-timeout", type=float)
+    script_compare.add_argument("--deep-roundtrip", action="store_true")
+    script_compare.add_argument("--max-diff-lines", type=int, default=200)
+    script_compare.add_argument("--tools-root")
+    script_compare.add_argument("--json", action="store_true")
+    script_compare.set_defaults(func=cmd_script_compare_scr)
 
     script_scr = script_sub.add_parser("inspect-scr", help="Проверить заголовок и строки скомпилированного SCR")
     script_scr.add_argument("source")

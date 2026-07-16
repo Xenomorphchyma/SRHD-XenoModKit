@@ -126,8 +126,76 @@ class RuntimeLintTests(unittest.TestCase):
         self.assertEqual(issue.severity, "error")
         self.assertEqual(issue.evidence, "ModTurn();")
 
+    def test_explicit_init_functions_are_shared_with_turn_objects(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        init = data["Visual.Objects"][0]["Operations"][0]
+        init["Code.Type"] = "Init"
+        init["Code"].extend(["function ModTurn()", "{", "    result = 1;", "}"])
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = ["ModTurn();"]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("init-library.rson")))
+        }
+        self.assertNotIn("runtime-cross-block-function-call", codes)
+
+    def test_tvar_is_a_shared_rscript_variable(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "runtime_ready", "Parent": -1, "#": 10},
+            {"Type": "TVar", "Name": "runtime_ready_turn", "Parent": -1, "#": 11},
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("shared-tvar.rson")))
+        self.assertNotIn(
+            "runtime-cross-block-variable-reference",
+            {issue.code for issue in issues},
+        )
+
+    def test_dialog_turn_chain_is_not_treated_as_periodic_turn(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Operations"][1]["Code"] = ["GetShipPlanet(Player());"]
+        group["Dialogs"] = [
+            {"Type": "TDialogMsg", "Name": "Message", "Parent": -1, "#": 10}
+        ]
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 10, "End": 2, "Nom": 0, "Arrow": True}
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("dialog-turn.rson")))
+        }
+        self.assertNotIn("runtime-turn-direct-world-access", codes)
+
+    def test_mixed_dialog_and_periodic_entry_remains_periodic(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Operations"][1]["Code"] = ["GetShipPlanet(Player());"]
+        group["Dialogs"] = [
+            {"Type": "TDialogMsg", "Name": "Message", "Parent": -1, "#": 10}
+        ]
+        group["Statements"] = [
+            {
+                "Type": "Tif",
+                "Name": "Periodic",
+                "Parent": -1,
+                "#": 11,
+                "Code.Type": "Turn",
+                "Code": ["1"],
+            }
+        ]
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 10, "End": 2, "Nom": 0, "Arrow": True},
+            {"Type": "TGraphLink", "Begin": 11, "End": 2, "Nom": 0, "Arrow": True},
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("mixed-dialog-turn.rson")))
+        }
+        self.assertIn("runtime-turn-direct-world-access", codes)
+
     def test_state_handler_cannot_call_function_from_top_code(self) -> None:
         data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code.Type"] = "Init"
         data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
             ["function ModPlayerActCode()", "{", "    runtime_ready = 1;", "}"]
         )
@@ -433,6 +501,28 @@ class RuntimeLintTests(unittest.TestCase):
         codes = {issue.code for issue in issues}
         self.assertIn("runtime-recursion-cycle", codes)
         self.assertIn("runtime-unbounded-loop", codes)
+
+    def test_one_step_base_case_recursion_is_proven_bounded(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        init = data["Visual.Objects"][0]["Operations"][0]
+        init["Code.Type"] = "Init"
+        init["Code"].extend(
+            [
+                "function choice2(w1, a, w2, b) {",
+                "    if(w1 + w2 == 0) {",
+                "        result = choice2(1.0, a, 1.0, b);",
+                "    } else {",
+                "        result = a;",
+                "    }",
+                "}",
+            ]
+        )
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = ["choice2(0, 1, 0, 2);"]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("bounded-recursion.rson")))
+        }
+        self.assertNotIn("runtime-recursion-cycle", codes)
 
     def test_nested_world_loops_on_turn_are_build_blocking(self) -> None:
         data = deepcopy(SAFE_RSON)

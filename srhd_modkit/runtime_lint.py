@@ -13,6 +13,10 @@ from .scripts import RsonProject
 IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 FUNCTION_RE = re.compile(r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.IGNORECASE)
+FUNCTION_HEADER_RE = re.compile(
+    r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)",
+    re.IGNORECASE,
+)
 ASSIGN_ZERO_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*0\s*;")
 ASSIGN_ONE_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*1\s*;")
 ASSIGN_TURN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*CurTurn\s*\(\s*\)\s*;", re.IGNORECASE)
@@ -79,6 +83,7 @@ class FunctionBlock:
     field: str
     start_line: int
     lines: tuple[str, ...]
+    code_type: str = ""
 
     @property
     def text(self) -> str:
@@ -187,6 +192,7 @@ def _extract_functions(project: RsonProject) -> tuple[dict[str, FunctionBlock], 
                     field,
                     start + 1,
                     tuple(str(value) for value in lines[start:index]),
+                    str(item.get("Code.Type", "")).casefold(),
                 )
                 key = block.name.casefold()
                 if key in functions:
@@ -253,6 +259,12 @@ def _lint_cross_block_calls(
                     if call == declared or call not in known or call in local or call in reported:
                         continue
                     target = functions[call]
+                    # Projects produced by RScript 4.10f use an explicit Init
+                    # Top as the shared function library for runtime objects.
+                    # Unlabelled/Global code objects remain separate scopes.
+                    caller_code_type = str(item.get("Code.Type", "")).casefold()
+                    if target.code_type == "init" and field == "Code" and caller_code_type == "turn":
+                        continue
                     issues.append(
                         RuntimeIssue(
                             "error",
@@ -285,6 +297,11 @@ def _lint_runtime_cross_block_variables(project: RsonProject) -> list[RuntimeIss
     ``Not link var :variable`` when evaluating that runtime object.
     """
     definitions: dict[str, set[tuple[int | None, str]]] = {}
+    shared_tvars = {
+        str(item.get("Name", "")).casefold()
+        for item in project.iter_objects()
+        if str(item.get("Type", "")).casefold() == "tvar" and str(item.get("Name", "")).strip()
+    }
     containers: list[tuple[dict[str, Any], str, list[str]]] = []
     for item in project.iter_objects():
         object_id = item.get("#") if isinstance(item.get("#"), int) else None
@@ -314,6 +331,8 @@ def _lint_runtime_cross_block_variables(project: RsonProject) -> list[RuntimeIss
             masked = _mask_non_code(line)
             for match in IDENTIFIER_RE.finditer(masked):
                 variable = match.group(0).casefold()
+                if variable in shared_tvars:
+                    continue
                 owners = definitions.get(variable, set())
                 if not owners or variable in local or variable in reported:
                     continue
@@ -559,7 +578,10 @@ def _runtime_loop_depths(
 def _global_initialization_lines(project: RsonProject) -> list[tuple[int | None, int, str]]:
     result: list[tuple[int | None, int, str]] = []
     for item in project.iter_objects():
-        if str(item.get("Code.Type", "")).casefold() == "turn":
+        code_type = str(item.get("Code.Type", "")).casefold()
+        if code_type not in {"", "global", "init"}:
+            continue
+        if not code_type and str(item.get("Type", "")).casefold() != "top":
             continue
         lines = item.get("Code")
         if not isinstance(lines, list):
@@ -582,6 +604,153 @@ def _global_initialization_lines(project: RsonProject) -> list[tuple[int | None,
                 continue
             result.append((item.get("#") if isinstance(item.get("#"), int) else None, index, line))
     return result
+
+
+def _dialog_scoped_turn_objects(project: RsonProject) -> set[int]:
+    """Find Turn graph nodes reached from dialog events, not the game clock."""
+
+    objects = {
+        item["#"]: item
+        for item in project.iter_objects()
+        if isinstance(item.get("#"), int)
+    }
+    turns = {
+        object_id
+        for object_id, item in objects.items()
+        if str(item.get("Code.Type", "")).casefold() == "turn"
+    }
+    dialog_sources = {
+        object_id
+        for object_id, item in objects.items()
+        if str(item.get("Type", "")).casefold().startswith("tdialog")
+        or str(item.get("Code.Type", "")).casefold() == "dialogbegin"
+    }
+    outgoing: dict[int, set[int]] = {object_id: set() for object_id in objects}
+    incoming: dict[int, set[int]] = {object_id: set() for object_id in turns}
+    links = project.data.get("Visual.Links", [])
+    if isinstance(links, list):
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            begin = link.get("Begin")
+            end = link.get("End")
+            if begin in objects and end in objects:
+                outgoing[begin].add(end)
+                if end in turns:
+                    incoming[end].add(begin)
+
+    entry_states: dict[int, set[bool]] = {object_id: set() for object_id in turns}
+    pending: list[tuple[int, bool]] = []
+    for object_id in turns:
+        parent = objects[object_id].get("Parent")
+        if parent in dialog_sources:
+            pending.append((object_id, True))
+        elif parent not in (-1, None):
+            pending.append((object_id, False))
+        if not incoming[object_id]:
+            pending.append((object_id, False))
+        for source in incoming[object_id]:
+            if source in dialog_sources:
+                pending.append((object_id, True))
+            elif source not in turns:
+                pending.append((object_id, False))
+
+    seen: set[tuple[int, bool]] = set()
+    while pending:
+        current, dialog_scoped = pending.pop()
+        state = (current, dialog_scoped)
+        if state in seen:
+            continue
+        seen.add(state)
+        entry_states[current].add(dialog_scoped)
+        for child in outgoing.get(current, ()):
+            if child in turns:
+                pending.append((child, dialog_scoped))
+    return {
+        object_id
+        for object_id, states in entry_states.items()
+        if states == {True}
+    }
+
+
+def _call_arguments(text: str, function_name: str) -> list[tuple[int, list[str]]]:
+    """Return balanced argument lists for calls in already masked code."""
+
+    pattern = re.compile(rf"\b{re.escape(function_name)}\s*\(", re.IGNORECASE)
+    result: list[tuple[int, list[str]]] = []
+    for match in pattern.finditer(text):
+        depth = 1
+        start = match.end()
+        index = start
+        argument_start = start
+        arguments: list[str] = []
+        while index < len(text) and depth:
+            char = text[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    arguments.append(text[argument_start:index].strip())
+                    result.append((match.start(), arguments))
+                    break
+            elif char == "," and depth == 1:
+                arguments.append(text[argument_start:index].strip())
+                argument_start = index + 1
+            index += 1
+    return result
+
+
+def _proven_bounded_self_recursion(block: FunctionBlock) -> bool:
+    """Prove a narrow one-step base-case normalization used by old mods."""
+
+    header = FUNCTION_HEADER_RE.match(_mask_non_code(block.lines[0])) if block.lines else None
+    if not header:
+        return False
+    parameters = [value.strip().casefold() for value in header.group(2).split(",")]
+    if not parameters or any(not IDENTIFIER_RE.fullmatch(value) for value in parameters):
+        return False
+    body = _mask_non_code(block.body_text)
+    calls = _call_arguments(body, block.name)
+    if not calls:
+        return False
+
+    guard_re = re.compile(
+        r"\bif\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\+\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*==\s*0(?:\.0+)?\s*\)\s*\{",
+        re.IGNORECASE,
+    )
+    guard = guard_re.search(body)
+    if not guard:
+        return False
+    guarded_parameters = (guard.group(1).casefold(), guard.group(2).casefold())
+    if any(value not in parameters for value in guarded_parameters):
+        return False
+    open_brace = body.find("{", guard.start())
+    depth = 0
+    close_brace = -1
+    for index in range(open_brace, len(body)):
+        if body[index] == "{":
+            depth += 1
+        elif body[index] == "}":
+            depth -= 1
+            if depth == 0:
+                close_brace = index
+                break
+    if close_brace < 0:
+        return False
+
+    numeric = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
+    parameter_indexes = [parameters.index(value) for value in guarded_parameters]
+    for position, arguments in calls:
+        if not (open_brace < position < close_brace) or len(arguments) != len(parameters):
+            return False
+        selected = [arguments[index] for index in parameter_indexes]
+        if not all(numeric.fullmatch(value) for value in selected):
+            return False
+        if sum(float(value) for value in selected) == 0:
+            return False
+    return True
 
 
 def _first_top_level_risky_line(lines: list[str], risky: set[str]) -> tuple[int, set[str]] | None:
@@ -780,6 +949,7 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     }
 
     graph_guarded_turn_entries = _graph_guarded_turn_entries(project, ready_vars, ready_turn_vars)
+    dialog_scoped_turns = _dialog_scoped_turn_objects(project)
 
     for variable in sorted(ready_vars):
         assignment = re.compile(rf"\b{re.escape(variable)}\s*=\s*1\s*;", re.IGNORECASE)
@@ -813,6 +983,9 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     for item in project.iter_objects():
         if str(item.get("Code.Type", "")).casefold() != "turn":
             continue
+        object_id = item.get("#") if isinstance(item.get("#"), int) else None
+        if object_id in dialog_scoped_turns:
+            continue
         lines = item.get("Code")
         if not isinstance(lines, list):
             continue
@@ -827,7 +1000,6 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
         wrapped_lines = ("<turn>", *(str(line) for line in lines))
         before = risk_index + 1
         guarded_by = [variable for variable in ready_vars if _has_exit_guard(wrapped_lines, variable, before)]
-        object_id = item.get("#") if isinstance(item.get("#"), int) else None
         if object_id in graph_guarded_turn_entries:
             continue
         if guarded_by:
@@ -894,6 +1066,8 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
 
     runtime_starts = turn_starts | entering_handlers
     for cycle in _find_recursion_cycles(graph, runtime_starts):
+        if len(cycle) == 1 and _proven_bounded_self_recursion(functions[cycle[0]]):
+            continue
         label = " -> ".join(functions[name].name for name in cycle) + f" -> {functions[cycle[0]].name}"
         issues.append(
             RuntimeIssue(

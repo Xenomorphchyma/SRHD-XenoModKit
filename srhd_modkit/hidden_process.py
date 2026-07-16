@@ -75,7 +75,7 @@ def run_on_hidden_desktop(
     *,
     cwd: str | Path,
     expected_outputs: Sequence[str | Path] = (),
-    timeout: float = 120.0,
+    timeout: float | None = 120.0,
     settle_seconds: float = 1.5,
     abort_window_patterns: Sequence[str] = (),
     control_actions: Sequence[HiddenControlAction] = (),
@@ -255,7 +255,7 @@ def run_on_hidden_desktop(
                     kernel32.WaitForSingleObject(process.hProcess, 5000)
                     details = "; ".join(window_text)
                     raise RuntimeError(f"Процесс показал окно ошибки: {details}")
-            if now - started >= timeout:
+            if timeout is not None and now - started >= timeout:
                 captured_window_text = _read_desktop_window_text(user32, desktop)
                 windows = "; ".join(_read_desktop_window_diagnostics(user32, desktop))
                 controls = "; ".join(_read_hidden_dialog_controls(user32, desktop))

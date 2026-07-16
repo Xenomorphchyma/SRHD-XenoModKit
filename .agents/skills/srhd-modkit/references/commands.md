@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.8.2
+# Команды SRHD ModKit 0.8.3
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -40,10 +40,14 @@ python -B srhd.py script set-code "<WORK>/Script.rson" "<OUT>/Script.rson" --id 
 python -B srhd.py script set-events "<WORK>/Script.rson" "<OUT>/Script.rson" --id 17 --event t_OnEnteringForm
 python -B srhd.py script build "<OUT>/Script.rson" --scr "<OUT>/Script.scr" --lang "<OUT>/Lang.txt"
 python -B srhd.py script decompile "<WORK>/Script.scr" "<OUT>/Script.rson" --lang-dat "<WORK>/Lang.dat" --json
+python -B srhd.py script decompile "<WORK>/Script.scr" "<OUT>/Script.rson" --deep-roundtrip --json
+python -B srhd.py script compare-scr "<WORK>/Original.scr" "<WORK>/Patched.scr" --json
 python -B srhd.py script inspect-scr "<OUT>/Script.scr" --json
 ```
 
 Также доступны `set-field`, `clone-object`, `add-link`, `delete-link`, `delete-object`, `register` и `convert`. Перед точечным изменением смотреть `python -B srhd.py script <command> --help`.
+
+RScript использует адаптивный лимит без верхнего потолка. Ноль у `build --timeout`, `decompile --decompile-timeout`, `decompile --roundtrip-timeout` и одноимённых параметров `compare-scr` отключает общий дедлайн. Непроверенный RSON сохранять только отдельным явным `--keep-unverified`; штатный output остаётся fail-closed.
 
 ## Ресурсы
 
@@ -75,4 +79,4 @@ python -B srhd.py manifest "<MOD>" -o "<OUT>/MyMod.manifest.json"
 
 ## Python API
 
-Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `inspect_gai`, `inspect_hai`, `inspect_pkg`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`.
+Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `inspect_gai`, `inspect_hai`, `inspect_pkg`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1`.

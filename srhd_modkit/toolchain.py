@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import errno
+import difflib
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,6 +24,83 @@ from .legacy_manifest import ensure_legacy_codepage_executable
 
 
 EMPTY_RSCRIPT_LANG_DAT = b"\xff\xfe"
+
+
+def _rscript_timeout_policy(
+    source: Path,
+    operation: str,
+    requested: float | None,
+) -> tuple[float | None, dict[str, Any]]:
+    """Choose a generous size-aware limit without imposing a maximum size.
+
+    ``requested=None`` means adaptive, ``0`` disables the total deadline, and
+    a positive value is an explicit operator policy.  The adaptive formula is
+    intentionally uncapped: a large project receives more time instead of
+    becoming impossible to build merely because it crossed a fixed threshold.
+    """
+
+    if requested is not None and requested < 0:
+        raise ValueError("Таймаут не может быть отрицательным; 0 отключает общий лимит")
+    size_mib = source.stat().st_size / (1024 * 1024) if source.is_file() else 0.0
+    code_lines = 0
+    objects = 0
+    if source.suffix.casefold() == ".rson" and source.is_file():
+        try:
+            summary = load_rson(source).summary()
+            code_lines = int(summary.get("code_lines", 0))
+            objects = int(summary.get("objects", 0))
+        except Exception:
+            pass
+    if operation in {"compile", "roundtrip"}:
+        adaptive = max(600.0, 180.0 + code_lines * 0.35 + objects * 1.5 + size_mib * 30.0)
+    else:
+        adaptive = max(600.0, 300.0 + size_mib * 180.0)
+    adaptive = round(adaptive, 3)
+    if requested is None:
+        selected = adaptive
+        mode = "adaptive"
+    elif requested == 0:
+        selected = None
+        mode = "disabled"
+    else:
+        selected = float(requested)
+        mode = "explicit"
+    return selected, {
+        "mode": mode,
+        "seconds": selected,
+        "adaptive_seconds": adaptive,
+        "source_size": source.stat().st_size if source.is_file() else None,
+        "objects": objects or None,
+        "code_lines": code_lines or None,
+    }
+
+
+def _project_graph_sha256(project: Any) -> str:
+    payload = {
+        "Visual.Objects": project.data.get("Visual.Objects"),
+        "Visual.Links": project.data.get("Visual.Links"),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cleanup_stale_decompile_transactions(parent: Path, *, older_than_seconds: float = 86400.0) -> list[str]:
+    """Remove only marked ModKit transactions left by an interrupted process."""
+
+    removed: list[str] = []
+    now = time.time()
+    for candidate in parent.glob(".srhd-decompile-*"):
+        marker = candidate / ".srhd-transaction"
+        if not candidate.is_dir() or not marker.is_file():
+            continue
+        try:
+            if now - marker.stat().st_mtime < older_than_seconds:
+                continue
+            shutil.rmtree(candidate)
+            removed.append(str(candidate))
+        except OSError:
+            continue
+    return removed
 
 
 def is_empty_rscript_lang_dat(path: str | Path) -> bool:
@@ -370,10 +451,13 @@ class Toolchain:
         source: Path,
         scr_output: Path,
         lang_output: Path,
-    ) -> tuple[Any, dict[str, Any]]:
+        *,
+        timeout: float | None = None,
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
         """Run the RScript compiler after callers perform their own policy checks."""
 
         tool = self.require("rscript")
+        timeout_seconds, timeout_policy = _rscript_timeout_policy(source, "compile", timeout)
         scr_output.parent.mkdir(parents=True, exist_ok=True)
         lang_output.parent.mkdir(parents=True, exist_ok=True)
         common_parent = scr_output.parent
@@ -394,7 +478,7 @@ class Toolchain:
                     str(staged_lang),
                 ],
                 cwd=tool.path.parent,
-                timeout=300,
+                timeout=timeout_seconds,
                 expected_outputs=[staged_scr, staged_lang],
                 abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
             )
@@ -407,7 +491,7 @@ class Toolchain:
                 raise RuntimeError(f"RScript создал SCR неподдерживаемой версии {scr_info['version']}")
             _replace_cross_device_safe(staged_scr, scr_output)
             _replace_cross_device_safe(staged_lang, lang_output)
-        return process_result, scr_info
+        return process_result, scr_info, timeout_policy
 
     def compile_rson(
         self,
@@ -416,6 +500,7 @@ class Toolchain:
         lang_output: str | Path,
         *,
         overwrite: bool = False,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         source = Path(source).resolve()
         scr_output = Path(scr_output).resolve()
@@ -437,7 +522,12 @@ class Toolchain:
         existing = [path for path in (scr_output, lang_output) if path.exists()]
         if existing and not overwrite:
             raise FileExistsError(f"Результат уже существует: {existing[0]}")
-        process_result, _scr_info = self._compile_rson_with_rscript(source, scr_output, lang_output)
+        process_result, _scr_info, timeout_policy = self._compile_rson_with_rscript(
+            source,
+            scr_output,
+            lang_output,
+            timeout=timeout,
+        )
         return {
             "source": str(source),
             "scr": str(scr_output),
@@ -448,50 +538,31 @@ class Toolchain:
             "compiler_exit_code": process_result.exit_code,
             "compiler_was_waiting_after_output": process_result.forced_after_outputs,
             "compiler_seconds": round(process_result.elapsed_seconds, 3),
+            "compiler_timeout": timeout_policy,
             "runtime_warnings": [
                 issue.as_dict() for issue in runtime_issues if issue.severity == "warning"
             ],
         }
 
-    def decompile_scr(
+    def _recover_scr_with_rscript(
         self,
-        source: str | Path,
-        destination: str | Path,
+        source: Path,
+        recovered: Path,
         *,
-        lang_dat: str | Path | None = None,
-        overwrite: bool = False,
-    ) -> dict[str, Any]:
-        """Recover a compilable RSON project from SCR without a visible GUI."""
-
-        source = Path(source).resolve()
-        destination = Path(destination).resolve()
-        if source.suffix.casefold() != ".scr":
-            raise ValueError("Декомпилятор принимает только .scr")
-        if destination.suffix.casefold() != ".rson":
-            raise ValueError("Результат декомпиляции должен иметь расширение .rson")
-        if not source.is_file():
-            raise FileNotFoundError(source)
-        if destination.exists() and not overwrite:
-            raise FileExistsError(f"Результат уже существует: {destination}")
-        resolved_lang = Path(lang_dat).resolve() if lang_dat is not None else None
-        if resolved_lang is not None:
-            if resolved_lang.suffix.casefold() != ".dat":
-                raise ValueError("Файл диалогов должен иметь расширение .dat")
-            if not resolved_lang.is_file():
-                raise FileNotFoundError(resolved_lang)
-        source_info = inspect_scr(source)
-        if not source_info["supported_version"]:
-            raise ValueError(f"RScript 4.10f не поддерживает SCR версии {source_info['version']}")
+        lang_dat: Path | None,
+        timeout: float | None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Automate RScript's hidden decompiler and always remove its staged SCR."""
 
         tool = self.require("rscript")
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        timeout_seconds, timeout_policy = _rscript_timeout_policy(source, "decompile", timeout)
         stem = f"_srhd_{uuid.uuid4().hex}"
         staged_scr = tool.path.parent / f"{stem}.scr"
-        recovered = destination.parent / f".srhd-recovered-{uuid.uuid4().hex}.rson"
+        recovered.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(source, staged_scr)
             control_actions: list[HiddenControlAction] = []
-            if resolved_lang is not None:
+            if lang_dat is not None:
                 control_actions.extend(
                     [
                         HiddenControlAction(
@@ -503,7 +574,7 @@ class Toolchain:
                         HiddenControlAction(
                             parent_title="SCR decompilation",
                             button_class="TsFilenameEdit",
-                            type_text=str(resolved_lang),
+                            type_text=str(lang_dat),
                             delay_seconds=0.5,
                         ),
                     ]
@@ -541,7 +612,7 @@ class Toolchain:
                 [staged_scr.name],
                 cwd=tool.path.parent,
                 expected_outputs=[recovered],
-                timeout=180,
+                timeout=timeout_seconds,
                 abort_window_patterns=(
                     "Run-time error",
                     "Runtime error",
@@ -552,23 +623,224 @@ class Toolchain:
             )
             if not recovered.is_file():
                 raise RuntimeError("RScript не создал восстановленный RSON")
-            project = load_rson(recovered)
-            validation_issues = project.validate()
+            return process_result, timeout_policy
+        finally:
+            staged_scr.unlink(missing_ok=True)
+
+    def decompile_scr(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        lang_dat: str | Path | None = None,
+        overwrite: bool = False,
+        decompile_timeout: float | None = None,
+        roundtrip_timeout: float | None = None,
+        keep_unverified: str | Path | None = None,
+        deep_roundtrip: bool = False,
+    ) -> dict[str, Any]:
+        """Recover RSON and publish it only after a fail-closed round trip."""
+
+        source = Path(source).resolve()
+        destination = Path(destination).resolve()
+        if source.suffix.casefold() != ".scr":
+            raise ValueError("Декомпилятор принимает только .scr")
+        if destination.suffix.casefold() != ".rson":
+            raise ValueError("Результат декомпиляции должен иметь расширение .rson")
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        if destination.exists() and not overwrite:
+            raise FileExistsError(f"Результат уже существует: {destination}")
+        unverified_destination = Path(keep_unverified).resolve() if keep_unverified is not None else None
+        if unverified_destination is not None:
+            if unverified_destination.suffix.casefold() != ".rson":
+                raise ValueError("--keep-unverified должен указывать отдельный .rson")
+            if unverified_destination == destination:
+                raise ValueError("Непроверенный RSON нельзя сохранять по пути штатного результата")
+            if unverified_destination.exists() and not overwrite:
+                raise FileExistsError(f"Непроверенный результат уже существует: {unverified_destination}")
+        resolved_lang = Path(lang_dat).resolve() if lang_dat is not None else None
+        if resolved_lang is not None:
+            if resolved_lang.suffix.casefold() != ".dat":
+                raise ValueError("Файл диалогов должен иметь расширение .dat")
+            if not resolved_lang.is_file():
+                raise FileNotFoundError(resolved_lang)
+        source_info = inspect_scr(source)
+        if not source_info["supported_version"]:
+            raise ValueError(f"RScript 4.10f не поддерживает SCR версии {source_info['version']}")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        stale_transactions_removed = _cleanup_stale_decompile_transactions(destination.parent)
+        transaction = destination.parent / f".srhd-decompile-{uuid.uuid4().hex}"
+        transaction.mkdir()
+        (transaction / ".srhd-transaction").write_text("decompile-v1\n", encoding="ascii")
+        recovered = transaction / "recovered.rson"
+        phases: list[dict[str, Any]] = [
+            {"name": "inspect-source", "status": "passed", "seconds": 0.0}
+        ]
+        project = None
+        summary: dict[str, Any] | None = None
+        runtime_issues: list[Any] = []
+        process_result = None
+        rebuild_result = None
+        rebuilt_sha256 = None
+        exact_binary_match = False
+        roundtrip_policy: dict[str, Any] | None = None
+        decompile_policy: dict[str, Any] | None = None
+
+        def preserve_unverified() -> str | None:
+            if unverified_destination is None or not recovered.is_file():
+                return None
+            unverified_destination.parent.mkdir(parents=True, exist_ok=True)
+            _replace_cross_device_safe(recovered, unverified_destination)
+            return str(unverified_destination)
+
+        def failure_result(
+            exc: Exception,
+            *,
+            operational: bool,
+            validation_issues: list[Any] | None = None,
+        ) -> dict[str, Any]:
+            kept = preserve_unverified()
+            reported_summary = dict(summary) if summary is not None else None
+            if reported_summary is not None:
+                reported_summary["path"] = kept
+            return {
+                "schema": "srhd-modkit-decompile-v1",
+                "status": "failed" if operational else "unverified",
+                "verified": False,
+                "operational_failure": operational,
+                "source": str(source),
+                "requested_destination": str(destination),
+                "destination": None,
+                "unverified_path": kept,
+                "source_sha256": sha256_file(source),
+                "source_version": source_info["version"],
+                "lang_dat": str(resolved_lang) if resolved_lang is not None else None,
+                "dialogs_imported": resolved_lang is not None,
+                "recovered_project": reported_summary,
+                "phases": phases,
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+                "validation_issues": [item.as_dict() for item in (validation_issues or [])],
+                "runtime_issues": [issue.as_dict() for issue in runtime_issues],
+                "timeouts": {
+                    "decompile": decompile_policy,
+                    "roundtrip": roundtrip_policy,
+                },
+                "stale_transactions_removed": stale_transactions_removed,
+            }
+
+        try:
+            phase_started = time.monotonic()
+            _selected_decompile_timeout, decompile_policy = _rscript_timeout_policy(
+                source,
+                "decompile",
+                decompile_timeout,
+            )
+            try:
+                process_result, decompile_policy = self._recover_scr_with_rscript(
+                    source,
+                    recovered,
+                    lang_dat=resolved_lang,
+                    timeout=decompile_timeout,
+                )
+                phases.append(
+                    {
+                        "name": "recover-rson",
+                        "status": "passed",
+                        "seconds": round(time.monotonic() - phase_started, 3),
+                        "exit_code": process_result.exit_code,
+                    }
+                )
+            except Exception as exc:
+                phases.append(
+                    {
+                        "name": "recover-rson",
+                        "status": "failed",
+                        "seconds": round(time.monotonic() - phase_started, 3),
+                        "error": str(exc),
+                    }
+                )
+                return failure_result(exc, operational=True)
+
+            phase_started = time.monotonic()
+            try:
+                project = load_rson(recovered)
+                summary = project.summary()
+                validation_issues = project.validate()
+            except Exception as exc:
+                phases.append(
+                    {
+                        "name": "validate-rson",
+                        "status": "failed",
+                        "seconds": round(time.monotonic() - phase_started, 3),
+                        "error": str(exc),
+                    }
+                )
+                return failure_result(exc, operational=False)
             validation_errors = [issue for issue in validation_issues if issue.severity == "error"]
             if validation_errors:
-                raise RuntimeError(
+                exc = RuntimeError(
                     "Восстановленный RSON не прошёл проверку: "
                     + "; ".join(issue.message for issue in validation_errors[:5])
                 )
+                phases.append(
+                    {
+                        "name": "validate-rson",
+                        "status": "failed",
+                        "seconds": round(time.monotonic() - phase_started, 3),
+                        "issues": len(validation_errors),
+                    }
+                )
+                return failure_result(exc, operational=False, validation_issues=validation_issues)
+            phases.append(
+                {
+                    "name": "validate-rson",
+                    "status": "passed",
+                    "seconds": round(time.monotonic() - phase_started, 3),
+                    "issues": len(validation_issues),
+                }
+            )
 
-            with tempfile.TemporaryDirectory(prefix=".srhd-scr-roundtrip-", dir=destination.parent) as temp_name:
-                temp = Path(temp_name)
-                rebuilt_scr = temp / "roundtrip.scr"
-                rebuilt_lang = temp / "roundtrip.txt"
-                rebuild_result, rebuilt_info = self._compile_rson_with_rscript(
+            phase_started = time.monotonic()
+            project.path = destination
+            summary = project.summary()
+            try:
+                runtime_issues = lint_rson_runtime(project)
+            except Exception as exc:
+                phases.append(
+                    {
+                        "name": "lint-runtime",
+                        "status": "failed",
+                        "seconds": round(time.monotonic() - phase_started, 3),
+                        "error": str(exc),
+                    }
+                )
+                return failure_result(exc, operational=True)
+            phases.append(
+                {
+                    "name": "lint-runtime",
+                    "status": "passed",
+                    "seconds": round(time.monotonic() - phase_started, 3),
+                    "errors": sum(issue.severity == "error" for issue in runtime_issues),
+                    "warnings": sum(issue.severity == "warning" for issue in runtime_issues),
+                }
+            )
+
+            rebuilt_scr = transaction / "roundtrip.scr"
+            rebuilt_lang = transaction / "roundtrip.txt"
+            phase_started = time.monotonic()
+            _selected_roundtrip_timeout, roundtrip_policy = _rscript_timeout_policy(
+                recovered,
+                "roundtrip",
+                roundtrip_timeout,
+            )
+            try:
+                rebuild_result, rebuilt_info, roundtrip_policy = self._compile_rson_with_rscript(
                     recovered,
                     rebuilt_scr,
                     rebuilt_lang,
+                    timeout=roundtrip_timeout,
                 )
                 if source_info["version"] != rebuilt_info["version"]:
                     raise RuntimeError(
@@ -577,35 +849,291 @@ class Toolchain:
                     )
                 if source_info["event_signatures"] != rebuilt_info["event_signatures"]:
                     raise RuntimeError("После SCR -> RSON -> SCR изменились сигнатуры событий")
-                project.path = destination
-                runtime_issues = lint_rson_runtime(project)
                 rebuilt_sha256 = sha256_file(rebuilt_scr)
                 exact_binary_match = sha256_file(source) == rebuilt_sha256
-            os.replace(recovered, destination)
+                phases.append(
+                    {
+                        "name": "compile-roundtrip",
+                        "status": "passed",
+                        "seconds": round(time.monotonic() - phase_started, 3),
+                        "exit_code": rebuild_result.exit_code,
+                    }
+                )
+            except Exception as exc:
+                phases.append(
+                    {
+                        "name": "compile-roundtrip",
+                        "status": "failed",
+                        "seconds": round(time.monotonic() - phase_started, 3),
+                        "error": str(exc),
+                    }
+                )
+                return failure_result(exc, operational=False)
+
+            deep_result: dict[str, Any] | None = None
+            if deep_roundtrip:
+                phase_started = time.monotonic()
+                deep_rson = transaction / "deep-roundtrip.rson"
+                try:
+                    deep_process, deep_policy = self._recover_scr_with_rscript(
+                        rebuilt_scr,
+                        deep_rson,
+                        lang_dat=None,
+                        timeout=decompile_timeout,
+                    )
+                    deep_project = load_rson(deep_rson)
+                    deep_errors = [issue for issue in deep_project.validate() if issue.severity == "error"]
+                    if deep_errors:
+                        raise RuntimeError(
+                            "Повторно восстановленный RSON не прошёл проверку: "
+                            + "; ".join(issue.message for issue in deep_errors[:5])
+                        )
+                    deep_summary = deep_project.summary()
+                    stable_fields = ("file_version", "objects", "links", "code_lines", "types")
+                    structural_match = all(summary[field] == deep_summary[field] for field in stable_fields)
+                    if not structural_match:
+                        raise RuntimeError("Глубокий SCR -> RSON -> SCR -> RSON изменил структуру проекта")
+                    deep_result = {
+                        "verified": True,
+                        "project": {**deep_summary, "path": None},
+                        "canonical_graph_match": _project_graph_sha256(project) == _project_graph_sha256(deep_project),
+                        "decompiler_exit_code": deep_process.exit_code,
+                        "timeout": deep_policy,
+                    }
+                    phases.append(
+                        {
+                            "name": "deep-roundtrip",
+                            "status": "passed",
+                            "seconds": round(time.monotonic() - phase_started, 3),
+                        }
+                    )
+                except Exception as exc:
+                    phases.append(
+                        {
+                            "name": "deep-roundtrip",
+                            "status": "failed",
+                            "seconds": round(time.monotonic() - phase_started, 3),
+                            "error": str(exc),
+                        }
+                    )
+                    return failure_result(exc, operational=False)
+
+            phase_started = time.monotonic()
+            try:
+                _replace_cross_device_safe(recovered, destination)
+            except Exception as exc:
+                phases.append(
+                    {
+                        "name": "publish",
+                        "status": "failed",
+                        "seconds": round(time.monotonic() - phase_started, 3),
+                        "error": str(exc),
+                    }
+                )
+                return failure_result(exc, operational=True)
+            phases.append(
+                {
+                    "name": "publish",
+                    "status": "passed",
+                    "seconds": round(time.monotonic() - phase_started, 3),
+                }
+            )
         finally:
-            staged_scr.unlink(missing_ok=True)
-            recovered.unlink(missing_ok=True)
+            shutil.rmtree(transaction, ignore_errors=True)
 
         return {
+            "schema": "srhd-modkit-decompile-v1",
+            "status": "verified",
             "source": str(source),
             "destination": str(destination),
+            "requested_destination": str(destination),
+            "unverified_path": None,
             "source_sha256": sha256_file(source),
             "destination_sha256": sha256_file(destination),
             "source_version": source_info["version"],
             "lang_dat": str(resolved_lang) if resolved_lang is not None else None,
             "dialogs_imported": resolved_lang is not None,
-            "objects": project.summary()["objects"],
+            "objects": summary["objects"],
+            "recovered_project": summary,
             "verified": True,
+            "operational_failure": False,
             "roundtrip": {
                 "scr_sha256": rebuilt_sha256,
                 "exact_binary_match": exact_binary_match,
                 "event_signatures_match": True,
                 "compiler_exit_code": rebuild_result.exit_code,
+                "compiler_seconds": round(rebuild_result.elapsed_seconds, 3),
             },
+            "deep_roundtrip": deep_result,
             "decompiler_exit_code": process_result.exit_code,
             "decompiler_was_waiting_after_output": process_result.forced_after_outputs,
+            "decompiler_seconds": round(process_result.elapsed_seconds, 3),
+            "timeouts": {
+                "decompile": decompile_policy,
+                "roundtrip": roundtrip_policy,
+            },
+            "phases": phases,
+            "stale_transactions_removed": stale_transactions_removed,
             "runtime_issues": [issue.as_dict() for issue in runtime_issues],
         }
+
+    def compare_scr(
+        self,
+        left: str | Path,
+        right: str | Path,
+        *,
+        left_lang_dat: str | Path | None = None,
+        right_lang_dat: str | Path | None = None,
+        decompile_timeout: float | None = None,
+        roundtrip_timeout: float | None = None,
+        deep_roundtrip: bool = False,
+        max_diff_lines: int = 200,
+    ) -> dict[str, Any]:
+        """Compare two SCR projects through verified temporary RSON recovery."""
+
+        left = Path(left).resolve()
+        right = Path(right).resolve()
+        if max_diff_lines < 0:
+            raise ValueError("max_diff_lines должен быть неотрицательным")
+        with tempfile.TemporaryDirectory(prefix="srhd-scr-compare-") as temp_name:
+            temp = Path(temp_name)
+            left_rson = temp / "left.rson"
+            right_rson = temp / "right.rson"
+            left_result = self.decompile_scr(
+                left,
+                left_rson,
+                lang_dat=left_lang_dat,
+                decompile_timeout=decompile_timeout,
+                roundtrip_timeout=roundtrip_timeout,
+                deep_roundtrip=deep_roundtrip,
+            )
+            right_result = self.decompile_scr(
+                right,
+                right_rson,
+                lang_dat=right_lang_dat,
+                decompile_timeout=decompile_timeout,
+                roundtrip_timeout=roundtrip_timeout,
+                deep_roundtrip=deep_roundtrip,
+            )
+
+            def side(result: dict[str, Any]) -> dict[str, Any]:
+                value = {
+                    key: result.get(key)
+                    for key in (
+                        "source",
+                        "status",
+                        "verified",
+                        "operational_failure",
+                        "source_sha256",
+                        "source_version",
+                        "recovered_project",
+                        "roundtrip",
+                        "deep_roundtrip",
+                        "runtime_issues",
+                        "phases",
+                        "error",
+                        "timeouts",
+                    )
+                }
+                if isinstance(value.get("recovered_project"), dict):
+                    value["recovered_project"] = dict(value["recovered_project"])
+                    value["recovered_project"]["path"] = None
+                return value
+
+            verified = bool(left_result["verified"] and right_result["verified"])
+            changed_blocks: list[dict[str, Any]] = []
+            metadata_match = False
+            event_signatures_match: bool | None = None
+            runtime_changes = {"added": [], "resolved": [], "unchanged": []}
+            if verified:
+                left_project = load_rson(left_rson)
+                right_project = load_rson(right_rson)
+                stable_fields = ("file_version", "objects", "links", "code_lines", "types")
+                left_summary = left_project.summary()
+                right_summary = right_project.summary()
+                left_scr_info = inspect_scr(left)
+                right_scr_info = inspect_scr(right)
+                event_signatures_match = (
+                    left_scr_info["event_signatures"] == right_scr_info["event_signatures"]
+                )
+                metadata_match = (
+                    left_scr_info["version"] == right_scr_info["version"]
+                    and event_signatures_match
+                    and all(left_summary[field] == right_summary[field] for field in stable_fields)
+                )
+
+                def code_blocks(project: Any) -> dict[str, list[str]]:
+                    blocks: dict[str, list[str]] = {}
+                    for item in project.iter_objects():
+                        object_id = item.get("#")
+                        for field, value in item.items():
+                            if field in {"Code", "ActCode", "LinkCode"} and isinstance(value, list):
+                                blocks[f"#{object_id} {field}"] = [str(line) for line in value]
+                            elif field.casefold().endswith("code") and isinstance(value, str):
+                                blocks[f"#{object_id} {field}"] = value.splitlines()
+                    return blocks
+
+                left_blocks = code_blocks(left_project)
+                right_blocks = code_blocks(right_project)
+                remaining = max_diff_lines
+                for key in sorted(set(left_blocks) | set(right_blocks)):
+                    before = left_blocks.get(key, [])
+                    after = right_blocks.get(key, [])
+                    if before == after:
+                        continue
+                    diff = list(
+                        difflib.unified_diff(
+                            before,
+                            after,
+                            fromfile=f"left {key}",
+                            tofile=f"right {key}",
+                            lineterm="",
+                        )
+                    )
+                    emitted = diff[:remaining]
+                    remaining -= len(emitted)
+                    changed_blocks.append(
+                        {
+                            "block": key,
+                            "left_lines": len(before),
+                            "right_lines": len(after),
+                            "diff": emitted,
+                            "diff_truncated": len(emitted) < len(diff),
+                        }
+                    )
+
+                def issue_map(result: dict[str, Any]) -> dict[tuple[Any, ...], dict[str, Any]]:
+                    mapped: dict[tuple[Any, ...], dict[str, Any]] = {}
+                    for issue in result.get("runtime_issues", []):
+                        signature = tuple(issue.get(field) for field in ("severity", "code", "message", "location", "evidence"))
+                        mapped[signature] = {key: value for key, value in issue.items() if key != "path"}
+                    return mapped
+
+                left_issues = issue_map(left_result)
+                right_issues = issue_map(right_result)
+                runtime_changes = {
+                    "added": [right_issues[key] for key in sorted(set(right_issues) - set(left_issues), key=repr)],
+                    "resolved": [left_issues[key] for key in sorted(set(left_issues) - set(right_issues), key=repr)],
+                    "unchanged": [right_issues[key] for key in sorted(set(left_issues) & set(right_issues), key=repr)],
+                }
+
+            return {
+                "schema": "srhd-modkit-scr-compare-v1",
+                "verified": verified,
+                "operational_failure": bool(
+                    left_result.get("operational_failure") or right_result.get("operational_failure")
+                ),
+                "left": side(left_result),
+                "right": side(right_result),
+                "comparison": {
+                    "metadata_match": metadata_match if verified else None,
+                    "event_signatures_match": event_signatures_match,
+                    "code_changed": bool(changed_blocks) if verified else None,
+                    "changed_blocks": changed_blocks,
+                    "runtime_issues": runtime_changes,
+                    "temporary_projects_persisted": False,
+                },
+            }
 
     def convert_script_project(
         self,

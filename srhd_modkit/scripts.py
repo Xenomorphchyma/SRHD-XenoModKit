@@ -17,6 +17,135 @@ STATE_EVENTS_RE = re.compile(
 EVENT_NAME_RE = re.compile(r"^t_[A-Za-z0-9_]+$")
 
 
+def _scan_rscript_syntax(text: str, location: str) -> list["ScriptIssue"]:
+    """Catch lexical damage that makes RScript 4.10f hang instead of failing.
+
+    This is deliberately a conservative preflight, not a replacement parser.
+    Strings and comments are skipped so Russian game text remains valid there,
+    while prose accidentally appended to executable code is rejected before the
+    legacy compiler is started.
+    """
+
+    issues: list[ScriptIssue] = []
+    delimiters = {"(": ")", "[": "]", "{": "}"}
+    closing = {value: key for key, value in delimiters.items()}
+    stack: list[tuple[str, int, int]] = []
+    state = "code"
+    quote = ""
+    state_line = 1
+    state_column = 1
+    line = 1
+    column = 1
+    index = 0
+    non_ascii_lines: set[int] = set()
+    source_lines = text.splitlines()
+
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if state == "line-comment":
+            if char == "\n":
+                state = "code"
+        elif state == "block-comment":
+            if char == "*" and following == "/":
+                index += 1
+                column += 1
+                state = "code"
+        elif state == "string":
+            if char == "\\" and following:
+                index += 1
+                column += 1
+            elif char == quote:
+                state = "code"
+            elif char == "\n":
+                issues.append(
+                    ScriptIssue(
+                        "error",
+                        "rscript-unclosed-string",
+                        f"Строка, начатая в столбце {state_column}, не закрыта до конца строки",
+                        f"{location}:{state_line}",
+                    )
+                )
+                state = "code"
+        elif char == "/" and following == "/":
+            state = "line-comment"
+            index += 1
+            column += 1
+        elif char == "/" and following == "*":
+            state = "block-comment"
+            state_line = line
+            state_column = column
+            index += 1
+            column += 1
+        elif char in {"'", '"'}:
+            state = "string"
+            quote = char
+            state_line = line
+            state_column = column
+        elif char in delimiters:
+            stack.append((char, line, column))
+        elif char in closing:
+            if not stack or stack[-1][0] != closing[char]:
+                issues.append(
+                    ScriptIssue(
+                        "error",
+                        "rscript-unbalanced-delimiter",
+                        f"Закрывающая скобка {char!r} не соответствует открывающей",
+                        f"{location}:{line}",
+                    )
+                )
+            else:
+                stack.pop()
+        elif ord(char) > 127 and (char.isalpha() or char == "_") and line not in non_ascii_lines:
+            non_ascii_lines.add(line)
+            snippet = source_lines[line - 1].strip() if line <= len(source_lines) else ""
+            issues.append(
+                ScriptIssue(
+                    "error",
+                    "rscript-uncommented-text",
+                    "Не-ASCII текст находится вне строки или комментария; возможно, потеряны // перед комментарием"
+                    + (f": {snippet[:120]}" if snippet else ""),
+                    f"{location}:{line}",
+                )
+            )
+
+        if char == "\n":
+            line += 1
+            column = 1
+        else:
+            column += 1
+        index += 1
+
+    if state == "string":
+        issues.append(
+            ScriptIssue(
+                "error",
+                "rscript-unclosed-string",
+                f"Строка, начатая в столбце {state_column}, не закрыта",
+                f"{location}:{state_line}",
+            )
+        )
+    elif state == "block-comment":
+        issues.append(
+            ScriptIssue(
+                "error",
+                "rscript-unclosed-comment",
+                "Блочный комментарий /* не закрыт последовательностью */",
+                f"{location}:{state_line}",
+            )
+        )
+    for opened, opened_line, _opened_column in stack:
+        issues.append(
+            ScriptIssue(
+                "error",
+                "rscript-unbalanced-delimiter",
+                f"Открывающая скобка {opened!r} не закрыта {delimiters[opened]!r}",
+                f"{location}:{opened_line}",
+            )
+        )
+    return issues
+
+
 @dataclass(frozen=True)
 class ScriptIssue:
     severity: str
@@ -208,6 +337,13 @@ class RsonProject:
                             location,
                         )
                     )
+
+            object_location = f"object #{item.get('#')}"
+            for field, value in item.items():
+                if field in {"Code", "ActCode", "LinkCode"} and isinstance(value, list):
+                    issues.extend(_scan_rscript_syntax("\n".join(value), f"{object_location} {field}"))
+                elif field.casefold().endswith("code") and isinstance(value, str):
+                    issues.extend(_scan_rscript_syntax(value, f"{object_location} {field}"))
 
         duplicates = sorted({value for value in identifiers if identifiers.count(value) > 1})
         for value in duplicates:

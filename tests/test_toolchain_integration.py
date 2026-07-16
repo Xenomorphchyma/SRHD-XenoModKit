@@ -173,6 +173,7 @@ class ToolchainIntegrationTests(unittest.TestCase):
                         "decompile",
                         str(source_scr),
                         str(recovered),
+                        "--deep-roundtrip",
                         "--json",
                     ]
                 )
@@ -181,6 +182,17 @@ class ToolchainIntegrationTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue(result["verified"])
             self.assertTrue(result["roundtrip"]["exact_binary_match"])
+            self.assertTrue(result["deep_roundtrip"]["verified"])
+            self.assertEqual(
+                {
+                    key: result["deep_roundtrip"]["project"][key]
+                    for key in ("objects", "links", "code_lines", "types")
+                },
+                {
+                    key: result["recovered_project"][key]
+                    for key in ("objects", "links", "code_lines", "types")
+                },
+            )
             self.assertFalse(result["dialogs_imported"])
             self.assertEqual(source_scr.read_bytes(), source_bytes)
             self.assertEqual(load_rson(recovered).validate(), [])

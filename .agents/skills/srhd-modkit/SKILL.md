@@ -11,7 +11,7 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 
 1. Найти корень репозитория, содержащий `srhd.py`, `pyproject.toml` и каталог `srhd_modkit`. Обозначать его как `<MODKIT_ROOT>`.
 2. Если этот скилл загружен прямо из репозитория, `<MODKIT_ROOT>` находится на три уровня выше `SKILL.md`: `.agents/skills/srhd-modkit/../../..`.
-3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.8.2` или новее.
+3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.8.3` или новее.
 4. При другой версии сначала прочитать локальные `README_RU.md`, `AUDIT_RU.md` и вывод `python -B srhd.py --help`; не предполагать наличие `script decompile`.
 5. Если корень найти нельзя, запросить путь к клону ModKit. Не использовать каталог установленной игры вместо инструментария.
 6. Для точного синтаксиса читать [references/commands.md](references/commands.md).
@@ -21,7 +21,7 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 - Для первичного анализа запускать `audit --profile dev --json`.
 - Для проверки коллекции передавать корень коллекции той же команде; ModKit сам обнаружит моды.
 - Для DAT использовать только `dat`-команды. Сначала читать дерево или значение, затем писать в новый DAT и повторно запускать `dat validate` или релизный аудит.
-- Для скриптов сначала выполнять `script audit-mod` и `script lint-runtime`; если исходника нет, восстанавливать его через `script decompile`, затем изменять RSON headless-командами и собирать через `script build`.
+- Для скриптов сначала выполнять `script audit-mod` и `script lint-runtime`; если исходника нет, восстанавливать его через `script decompile`, затем изменять RSON headless-командами и собирать через `script build`. Для доказательства различий двух бинарников использовать `script compare-scr`, а не ручный поиск байтов.
 - Для ресурсов использовать `resource info/list/verify/extract/build-gai/build-pkg`. Не пытаться записывать HAI.
 - Для активного набора модов использовать `compat` с существующим ModCFG только для чтения.
 - Для публикации использовать `release check`, затем `release build`. Не считать низкоуровневый `pack` полноценной релизной проверкой.
@@ -44,6 +44,8 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 5. Перед записью предпочитать новый output. Использовать `--overwrite` только когда пользователь явно разрешил замену или операция идёт во временной рабочей копии.
 6. После изменения запускать ближайшую структурную проверку и затем `audit --profile release`.
 7. Для релиза располагать ZIP вне дерева мода. Передавать пользователю ZIP вместе с внешними `*.manifest.json` и `*.audit.json`.
+8. Не уменьшать адаптивные таймауты для крупного RSON/SCR без причины. При заведомо долгой штатной сборке использовать значение `0`, отключающее общий дедлайн; синтаксический preflight при этом остаётся обязательным.
+9. Непроверенный результат декомпиляции сохранять только по отдельному явно названному `--keep-unverified`; не подменять им штатный output и игровой SCR.
 
 ## Границы гарантии
 
