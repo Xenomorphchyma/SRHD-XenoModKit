@@ -1,0 +1,17 @@
+{
+  "operations": [
+    {
+      "op": "set",
+      "node": "Data/SE/Ship/Akrin/Fei_PC",
+      "key": "StateTime",
+      "value": "2001"
+    },
+    {
+      "op": "set",
+      "node": "Data/SE/Ship/Akrin/Fei_PC",
+      "key": "CodexRoundtripProbe",
+      "value": "ok",
+      "create": true
+    }
+  ]
+}

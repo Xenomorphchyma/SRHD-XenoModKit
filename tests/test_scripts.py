@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, inspect_scr, load_rson
+
+
+SAMPLE = {
+    "FileID": RSON_FILE_ID,
+    "FileVersion": RSON_FILE_VERSION,
+    "ScriptName": "TestMod",
+    "ScriptFileOut": "TestMod.scr",
+    "ScriptTextOut": "TestMod.txt",
+    "Visual.Objects": [
+        {
+            "Operations": [
+                {"Type": "Top", "Name": "Init", "Parent": -1, "#": 1, "Total.Lines": 1, "Code": ["GRun();"]},
+                {"Type": "Top", "Name": "Turn", "Parent": -1, "#": 2, "Total.Lines": 1, "Code": ["HullHP(Player(),1);"]},
+            ]
+        }
+    ],
+    "Visual.Links": [{"Type": "TGraphLink", "Begin": 1, "End": 2, "Nom": 0, "Arrow": True}],
+    "BlockPar.EC.Total.Strings": 0,
+    "BlockPar.EC": [],
+}
+
+
+class RsonTests(unittest.TestCase):
+    def _project(self, root: Path):
+        path = root / "test.rson"
+        path.write_text(json.dumps(SAMPLE), encoding="utf-8")
+        return load_rson(path)
+
+    def test_valid_project_and_search(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            self.assertEqual(project.validate(), [])
+            self.assertEqual(project.summary()["objects"], 2)
+            result = project.search_code("HullHP")
+            self.assertEqual(result[0]["object_id"], 2)
+
+    def test_set_code_updates_line_count_and_survives_json(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            project = self._project(root)
+            project.set_code(2, ["a=1;", "b=2;"])
+            output = project.save(root / "edited.rson")
+            edited = load_rson(output)
+            item = edited.object_by_id(2)
+            self.assertEqual(item["Code"], ["a=1;", "b=2;"])
+            self.assertEqual(item["Total.Lines"], 2)
+            self.assertEqual(edited.validate(), [])
+
+    def test_set_field_updates_json_and_protects_object_id(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            project.set_field(2, "Name", "Changed")
+            self.assertEqual(project.object_by_id(2)["Name"], "Changed")
+            with self.assertRaises(ValueError):
+                project.set_field(2, "#", 10)
+
+    def test_broken_link_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            project.data["Visual.Links"][0]["End"] = 999
+            self.assertTrue(any(issue.code == "rson-link-ref" for issue in project.validate()))
+
+    def test_state_events_are_headless_and_preserve_handler(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            project = self._project(root)
+            project.data["Visual.Objects"][0]["Operations"].append(
+                {
+                    "Type": "TState",
+                    "Name": "PlayerState",
+                    "Parent": -1,
+                    "#": 3,
+                    "OnActCode": "PlayerActCode();",
+                }
+            )
+            project.set_state_events(3, ["t_OnEnteringForm", "t_OnPlayerBuyEq", "t_OnEnteringForm"])
+            state = project.object_by_id(3)
+            self.assertEqual(
+                state["OnActCode"],
+                "[t_OnEnteringForm,t_OnPlayerBuyEq|]\nPlayerActCode();",
+            )
+            self.assertEqual(project.state_events(3), ["t_OnEnteringForm", "t_OnPlayerBuyEq"])
+            self.assertEqual(project.summary()["state_event_subscriptions"][0]["object_id"], 3)
+            project.set_state_events(3, [])
+            self.assertEqual(state["OnActCode"], "PlayerActCode();")
+
+    def test_invalid_state_event_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            with self.assertRaises(ValueError):
+                project.set_state_events(2, ["t_OnEnteringForm"])
+
+    def test_graph_clone_add_and_delete_are_reference_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            clone = project.clone_object(2, name="Turn copy")
+            self.assertEqual(clone["#"], 3)
+            self.assertEqual(clone["Name"], "Turn copy")
+            self.assertEqual(clone["Code"], ["HullHP(Player(),1);"])
+            link = project.add_link(2, 3, nom=1, arrow=False)
+            self.assertEqual(link["Type"], "TGraphLink")
+            with self.assertRaises(ValueError):
+                project.delete_object(2)
+            removed = project.delete_object(2, detach_references=True)
+            self.assertEqual(removed["removed_links"], 2)
+            self.assertEqual(project.validate(), [])
+
+    def test_delete_link_uses_stable_zero_based_index(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            removed = project.delete_link(0)
+            self.assertEqual((removed["Begin"], removed["End"]), (1, 2))
+            self.assertEqual(project.data["Visual.Links"], [])
+            with self.assertRaises(IndexError):
+                project.delete_link(0)
+
+    def test_inspect_scr_reports_compiled_event_signatures(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "events.scr"
+            path.write_bytes(
+                (8).to_bytes(4, "little")
+                + "[t_OnEnteringForm,t_OnPlayerBuyEq|]".encode("utf-16-le")
+                + b"\x00\x00"
+            )
+            result = inspect_scr(path)
+            self.assertEqual(result["event_signatures"], ["[t_OnEnteringForm,t_OnPlayerBuyEq|]"])
+
+
+if __name__ == "__main__":
+    unittest.main()
