@@ -11,7 +11,9 @@ from typing import Any, Iterable
 
 RSON_FILE_ID = 573785173
 RSON_FILE_VERSION = 8
-STATE_EVENTS_RE = re.compile(r"^\s*\[([A-Za-z_][A-Za-z0-9_]*(?:,[A-Za-z_][A-Za-z0-9_]*)*)\|\](?:\r?\n|$)")
+STATE_EVENTS_RE = re.compile(
+    r"^\s*\[([A-Za-z_][A-Za-z0-9_]*(?:,[A-Za-z_][A-Za-z0-9_]*)*)\|((?:-?\d+)?)\](?:\r?\n|$)"
+)
 EVENT_NAME_RE = re.compile(r"^t_[A-Za-z0-9_]+$")
 
 
@@ -368,7 +370,8 @@ class RsonProject:
         handler = on_act_code[match.end():] if match else on_act_code
         handler = handler.lstrip("\r\n")
         if normalized:
-            signature = f"[{','.join(normalized)}|]"
+            suffix = match.group(2) if match else ""
+            signature = f"[{','.join(normalized)}|{suffix}]"
             item["OnActCode"] = signature + (f"\n{handler}" if handler else "")
         else:
             item["OnActCode"] = handler
@@ -400,7 +403,7 @@ def inspect_scr(path: str | Path) -> dict[str, Any]:
     event_signatures = [
         value
         for value in strings
-        if re.fullmatch(r"\[t_[A-Za-z0-9_]+(?:,t_[A-Za-z0-9_]+)*\|\]", value)
+        if re.fullmatch(r"\[t_[A-Za-z0-9_]+(?:,t_[A-Za-z0-9_]+)*\|(?:-?\d+)?\]", value)
     ]
     return {
         "path": str(path),

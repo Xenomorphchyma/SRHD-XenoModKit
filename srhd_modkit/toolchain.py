@@ -15,7 +15,7 @@ from .formats import inspect_file
 from .blockpar import load_blockpar
 from .scripts import inspect_scr, load_rson
 from .runtime_lint import lint_rson_runtime
-from .hidden_process import run_on_hidden_desktop
+from .hidden_process import HiddenControlAction, run_on_hidden_desktop
 from .legacy_manifest import ensure_legacy_codepage_executable
 
 
@@ -122,7 +122,7 @@ class Toolchain:
             "rscript": Tool(
                 "rscript",
                 self.tools_root / "RScript" / "RScript.exe",
-                "Headless-проверка, конвертация и компиляция RSON/SVR/SCR 4.10f",
+                "Headless-проверка, декомпиляция, конвертация и компиляция RSON/SVR/SCR 4.10f",
                 True,
             ),
             "shipviewer": Tool(
@@ -365,38 +365,17 @@ class Toolchain:
             "verified": verified,
         }
 
-    def compile_rson(
+    def _compile_rson_with_rscript(
         self,
-        source: str | Path,
-        scr_output: str | Path,
-        lang_output: str | Path,
-        *,
-        overwrite: bool = False,
-    ) -> dict[str, Any]:
-        source = Path(source).resolve()
-        scr_output = Path(scr_output).resolve()
-        lang_output = Path(lang_output).resolve()
-        if source.suffix.casefold() != ".rson":
-            raise ValueError("Компилятор принимает проект .rson")
-        project = load_rson(source)
-        issues = project.validate()
-        errors = [issue for issue in issues if issue.severity == "error"]
-        if errors:
-            raise ValueError("RSON не прошёл проверку: " + "; ".join(issue.message for issue in errors[:5]))
-        runtime_issues = lint_rson_runtime(project)
-        runtime_errors = [issue for issue in runtime_issues if issue.severity == "error"]
-        if runtime_errors:
-            raise ValueError(
-                "RSON не прошёл runtime-lint: "
-                + "; ".join(f"{issue.code}: {issue.message}" for issue in runtime_errors[:5])
-            )
-        existing = [path for path in (scr_output, lang_output) if path.exists()]
-        if existing and not overwrite:
-            raise FileExistsError(f"Результат уже существует: {existing[0]}")
+        source: Path,
+        scr_output: Path,
+        lang_output: Path,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Run the RScript compiler after callers perform their own policy checks."""
+
         tool = self.require("rscript")
         scr_output.parent.mkdir(parents=True, exist_ok=True)
         lang_output.parent.mkdir(parents=True, exist_ok=True)
-
         common_parent = scr_output.parent
         with tempfile.TemporaryDirectory(prefix=".srhd-script-", dir=common_parent) as temp_name:
             temp = Path(temp_name)
@@ -428,6 +407,37 @@ class Toolchain:
                 raise RuntimeError(f"RScript создал SCR неподдерживаемой версии {scr_info['version']}")
             _replace_cross_device_safe(staged_scr, scr_output)
             _replace_cross_device_safe(staged_lang, lang_output)
+        return process_result, scr_info
+
+    def compile_rson(
+        self,
+        source: str | Path,
+        scr_output: str | Path,
+        lang_output: str | Path,
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        source = Path(source).resolve()
+        scr_output = Path(scr_output).resolve()
+        lang_output = Path(lang_output).resolve()
+        if source.suffix.casefold() != ".rson":
+            raise ValueError("Компилятор принимает проект .rson")
+        project = load_rson(source)
+        issues = project.validate()
+        errors = [issue for issue in issues if issue.severity == "error"]
+        if errors:
+            raise ValueError("RSON не прошёл проверку: " + "; ".join(issue.message for issue in errors[:5]))
+        runtime_issues = lint_rson_runtime(project)
+        runtime_errors = [issue for issue in runtime_issues if issue.severity == "error"]
+        if runtime_errors:
+            raise ValueError(
+                "RSON не прошёл runtime-lint: "
+                + "; ".join(f"{issue.code}: {issue.message}" for issue in runtime_errors[:5])
+            )
+        existing = [path for path in (scr_output, lang_output) if path.exists()]
+        if existing and not overwrite:
+            raise FileExistsError(f"Результат уже существует: {existing[0]}")
+        process_result, _scr_info = self._compile_rson_with_rscript(source, scr_output, lang_output)
         return {
             "source": str(source),
             "scr": str(scr_output),
@@ -441,6 +451,160 @@ class Toolchain:
             "runtime_warnings": [
                 issue.as_dict() for issue in runtime_issues if issue.severity == "warning"
             ],
+        }
+
+    def decompile_scr(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        lang_dat: str | Path | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Recover a compilable RSON project from SCR without a visible GUI."""
+
+        source = Path(source).resolve()
+        destination = Path(destination).resolve()
+        if source.suffix.casefold() != ".scr":
+            raise ValueError("Декомпилятор принимает только .scr")
+        if destination.suffix.casefold() != ".rson":
+            raise ValueError("Результат декомпиляции должен иметь расширение .rson")
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        if destination.exists() and not overwrite:
+            raise FileExistsError(f"Результат уже существует: {destination}")
+        resolved_lang = Path(lang_dat).resolve() if lang_dat is not None else None
+        if resolved_lang is not None:
+            if resolved_lang.suffix.casefold() != ".dat":
+                raise ValueError("Файл диалогов должен иметь расширение .dat")
+            if not resolved_lang.is_file():
+                raise FileNotFoundError(resolved_lang)
+        source_info = inspect_scr(source)
+        if not source_info["supported_version"]:
+            raise ValueError(f"RScript 4.10f не поддерживает SCR версии {source_info['version']}")
+
+        tool = self.require("rscript")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        stem = f"_srhd_{uuid.uuid4().hex}"
+        staged_scr = tool.path.parent / f"{stem}.scr"
+        recovered = destination.parent / f".srhd-recovered-{uuid.uuid4().hex}.rson"
+        try:
+            shutil.copy2(source, staged_scr)
+            control_actions: list[HiddenControlAction] = []
+            if resolved_lang is not None:
+                control_actions.extend(
+                    [
+                        HiddenControlAction(
+                            parent_title="SCR decompilation",
+                            button_text="Import dialogs from Lang.dat",
+                            button_class="TCheckBox",
+                            delay_seconds=3.0,
+                        ),
+                        HiddenControlAction(
+                            parent_title="SCR decompilation",
+                            button_class="TsFilenameEdit",
+                            type_text=str(resolved_lang),
+                            delay_seconds=0.5,
+                        ),
+                    ]
+                )
+                save_delay = 0.5
+            else:
+                save_delay = 3.0
+            control_actions.extend(
+                [
+                    HiddenControlAction(
+                        parent_title="SCR decompilation",
+                        button_text="Save RSON",
+                        force_enable=True,
+                        delay_seconds=save_delay,
+                        confirm_parent_class="#32770",
+                        retry_seconds=1.0,
+                    ),
+                    HiddenControlAction(
+                        parent_class="#32770",
+                        button_control_id=1001,
+                        button_class="Edit",
+                        type_text=str(recovered),
+                        delay_seconds=0.5,
+                    ),
+                    HiddenControlAction(
+                        parent_class="#32770",
+                        button_control_id=1,
+                        button_class="Button",
+                        delay_seconds=0.5,
+                    ),
+                ]
+            )
+            process_result = run_on_hidden_desktop(
+                tool.path,
+                [staged_scr.name],
+                cwd=tool.path.parent,
+                expected_outputs=[recovered],
+                timeout=180,
+                abort_window_patterns=(
+                    "Run-time error",
+                    "Runtime error",
+                    "Application Error",
+                    "Access violation",
+                ),
+                control_actions=control_actions,
+            )
+            if not recovered.is_file():
+                raise RuntimeError("RScript не создал восстановленный RSON")
+            project = load_rson(recovered)
+            validation_issues = project.validate()
+            validation_errors = [issue for issue in validation_issues if issue.severity == "error"]
+            if validation_errors:
+                raise RuntimeError(
+                    "Восстановленный RSON не прошёл проверку: "
+                    + "; ".join(issue.message for issue in validation_errors[:5])
+                )
+
+            with tempfile.TemporaryDirectory(prefix=".srhd-scr-roundtrip-", dir=destination.parent) as temp_name:
+                temp = Path(temp_name)
+                rebuilt_scr = temp / "roundtrip.scr"
+                rebuilt_lang = temp / "roundtrip.txt"
+                rebuild_result, rebuilt_info = self._compile_rson_with_rscript(
+                    recovered,
+                    rebuilt_scr,
+                    rebuilt_lang,
+                )
+                if source_info["version"] != rebuilt_info["version"]:
+                    raise RuntimeError(
+                        "После SCR -> RSON -> SCR изменилась версия формата: "
+                        f"{source_info['version']} -> {rebuilt_info['version']}"
+                    )
+                if source_info["event_signatures"] != rebuilt_info["event_signatures"]:
+                    raise RuntimeError("После SCR -> RSON -> SCR изменились сигнатуры событий")
+                project.path = destination
+                runtime_issues = lint_rson_runtime(project)
+                rebuilt_sha256 = sha256_file(rebuilt_scr)
+                exact_binary_match = sha256_file(source) == rebuilt_sha256
+            os.replace(recovered, destination)
+        finally:
+            staged_scr.unlink(missing_ok=True)
+            recovered.unlink(missing_ok=True)
+
+        return {
+            "source": str(source),
+            "destination": str(destination),
+            "source_sha256": sha256_file(source),
+            "destination_sha256": sha256_file(destination),
+            "source_version": source_info["version"],
+            "lang_dat": str(resolved_lang) if resolved_lang is not None else None,
+            "dialogs_imported": resolved_lang is not None,
+            "objects": project.summary()["objects"],
+            "verified": True,
+            "roundtrip": {
+                "scr_sha256": rebuilt_sha256,
+                "exact_binary_match": exact_binary_match,
+                "event_signatures_match": True,
+                "compiler_exit_code": rebuild_result.exit_code,
+            },
+            "decompiler_exit_code": process_result.exit_code,
+            "decompiler_was_waiting_after_output": process_result.forced_after_outputs,
+            "runtime_issues": [issue.as_dict() for issue in runtime_issues],
         }
 
     def convert_script_project(

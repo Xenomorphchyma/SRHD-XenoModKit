@@ -119,25 +119,25 @@ class RuntimeLintTests(unittest.TestCase):
     def test_user_function_in_another_code_object_is_not_linkable(self) -> None:
         data = deepcopy(SAFE_RSON)
         global_code = data["Visual.Objects"][0]["Operations"][0]["Code"]
-        global_code.extend(["function EIDM_Turn()", "{", "    GetShipPlanet(Player());", "}"])
-        data["Visual.Objects"][0]["Operations"][1]["Code"] = ["EIDM_Turn();"]
+        global_code.extend(["function ModTurn()", "{", "    GetShipPlanet(Player());", "}"])
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = ["ModTurn();"]
         issues = lint_rson_runtime(RsonProject(data, Path("cross-block.rson")))
         issue = next(item for item in issues if item.code == "runtime-cross-block-function-call")
         self.assertEqual(issue.severity, "error")
-        self.assertEqual(issue.evidence, "EIDM_Turn();")
+        self.assertEqual(issue.evidence, "ModTurn();")
 
     def test_state_handler_cannot_call_function_from_top_code(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
-            ["function EIDM_PlayerActCode()", "{", "    runtime_ready = 1;", "}"]
+            ["function ModPlayerActCode()", "{", "    runtime_ready = 1;", "}"]
         )
         data["Visual.Objects"][0]["States"][0]["OnActCode"] = (
-            "[t_OnEnteringForm|]\nEIDM_PlayerActCode();"
+            "[t_OnEnteringForm|]\nModPlayerActCode();"
         )
         issues = lint_rson_runtime(RsonProject(data, Path("state-cross-block.rson")))
         issue = next(item for item in issues if item.code == "runtime-cross-block-function-call")
         self.assertIn("OnActCode", issue.location or "")
-        self.assertEqual(issue.evidence, "EIDM_PlayerActCode();")
+        self.assertEqual(issue.evidence, "ModPlayerActCode();")
 
     def test_cross_block_call_blocks_build_and_audit(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -146,9 +146,9 @@ class RuntimeLintTests(unittest.TestCase):
             source.mkdir()
             data = deepcopy(SAFE_RSON)
             data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
-                ["function EIDM_Turn()", "{", "    GetShipPlanet(Player());", "}"]
+                ["function ModTurn()", "{", "    GetShipPlanet(Player());", "}"]
             )
-            data["Visual.Objects"][0]["Operations"][1]["Code"] = ["EIDM_Turn();"]
+            data["Visual.Objects"][0]["Operations"][1]["Code"] = ["ModTurn();"]
             rson = source / "cross-block.rson"
             rson.write_text(json.dumps(data), encoding="utf-8")
             (root / "ModuleInfo.txt").write_text("Name=Test\nLanguages=Rus\n", encoding="utf-8")

@@ -41,7 +41,7 @@ FORMAT_SPECS: tuple[FormatSpec, ...] = (
     ),
     FormatSpec("BlockPar DAT", (".dat",), "structured-data", "headless", "SRHD ModKit + BlockParEditor CLI", "txt"),
     FormatSpec("resource package", (".pkg",), "package", "headless", "SRHD ModKit", "extract"),
-    FormatSpec("compiled Ranger script", (".scr",), "script-binary", "inspectable", "SRHD ModKit + RScript"),
+    FormatSpec("compiled Ranger script", (".scr",), "script-binary", "headless", "SRHD ModKit + RScript", "rson"),
     FormatSpec("RSON script project", (".rson",), "structured-text", "headless", "SRHD ModKit + RScript", "scr/svr"),
     FormatSpec("SVR script project", (".svr",), "script-project", "headless", "RScript", "rson"),
     FormatSpec("PNG image", (".png",), "image", "convertible", automatic_conversion="gi", signature=b"\x89PNG\r\n\x1a\n"),

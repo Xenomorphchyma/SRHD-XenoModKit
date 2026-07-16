@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 import os
 import errno
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
+from srhd_modkit.cli import main
 from srhd_modkit.formats import inspect_file
 from srhd_modkit.scripts import inspect_scr, load_rson
 from srhd_modkit.toolchain import Toolchain, _replace_cross_device_safe
@@ -143,6 +147,50 @@ class ToolchainIntegrationTests(unittest.TestCase):
             self.assertIn(
                 "[t_OnEnteringForm,t_OnPlayerBuyEq|]",
                 inspect_scr(scr)["event_signatures"],
+            )
+
+    def test_rscript_decompiles_scr_headlessly_and_roundtrips(self) -> None:
+        rscript = self.chain.tools["rscript"].path
+        source_svr = rscript.parent / "LastOneHP.svr"
+        if not rscript.is_file() or not source_svr.is_file():
+            self.skipTest("RScript 4.10f или проверочный SVR не найден")
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source_rson = root / "source.rson"
+            source_scr = root / "source.scr"
+            source_lang = root / "source.txt"
+            recovered = root / "recovered.rson"
+            self.chain.convert_script_project(source_svr, source_rson)
+            self.chain.compile_rson(source_rson, source_scr, source_lang)
+            source_bytes = source_scr.read_bytes()
+            staged_before = {path.name for path in rscript.parent.glob("_srhd_*")}
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "script",
+                        "decompile",
+                        str(source_scr),
+                        str(recovered),
+                        "--json",
+                    ]
+                )
+
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(result["verified"])
+            self.assertTrue(result["roundtrip"]["exact_binary_match"])
+            self.assertFalse(result["dialogs_imported"])
+            self.assertEqual(source_scr.read_bytes(), source_bytes)
+            self.assertEqual(load_rson(recovered).validate(), [])
+            self.assertEqual(list(root.glob(".srhd-*")), [])
+            self.assertTrue(
+                all(issue["path"] == str(recovered.resolve()) for issue in result["runtime_issues"])
+            )
+            self.assertEqual(
+                {path.name for path in rscript.parent.glob("_srhd_*")},
+                staged_before,
             )
 
 

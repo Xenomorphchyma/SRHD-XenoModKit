@@ -770,7 +770,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
                 name,
                 "info",
                 "scr-semantic-analysis-unavailable",
-                "SCR проверен бинарно, но без RSON полный смысловой анализ невозможен",
+                "SCR проверен бинарно; для смыслового анализа явно восстановите RSON командой script decompile",
                 context.root,
             )
         )

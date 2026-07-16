@@ -166,6 +166,27 @@ class RsonTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 project.set_state_events(2, ["t_OnEnteringForm"])
 
+    def test_decompiled_state_event_suffix_is_valid_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            project.data["Visual.Objects"][0]["Operations"].append(
+                {
+                    "Type": "TState",
+                    "Name": "RecoveredState",
+                    "Parent": -1,
+                    "#": 3,
+                    "OnActCode": "[t_OnItemPickUp,t_OnEnteringForm|0]\r\nRecoveredHandler();",
+                }
+            )
+
+            self.assertEqual(project.validate(), [])
+            self.assertEqual(project.state_events(3), ["t_OnItemPickUp", "t_OnEnteringForm"])
+            project.set_state_events(3, ["t_OnPlayerBuyEq"])
+            self.assertEqual(
+                project.object_by_id(3)["OnActCode"],
+                "[t_OnPlayerBuyEq|0]\nRecoveredHandler();",
+            )
+
     def test_graph_clone_add_and_delete_are_reference_safe(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             project = self._project(Path(name))

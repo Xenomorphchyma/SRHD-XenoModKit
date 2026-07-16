@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.8.1
+# Команды SRHD ModKit 0.8.2
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -39,6 +39,7 @@ python -B srhd.py script set-code "<WORK>/Script.rson" "<OUT>/Script.rson" --id 
 python -B srhd.py script set-code "<WORK>/Script.rson" "<OUT>/Script.rson" --id 17 --field OnActCode --code-file "<WORK>/player-buy.txt"
 python -B srhd.py script set-events "<WORK>/Script.rson" "<OUT>/Script.rson" --id 17 --event t_OnEnteringForm
 python -B srhd.py script build "<OUT>/Script.rson" --scr "<OUT>/Script.scr" --lang "<OUT>/Lang.txt"
+python -B srhd.py script decompile "<WORK>/Script.scr" "<OUT>/Script.rson" --lang-dat "<WORK>/Lang.dat" --json
 python -B srhd.py script inspect-scr "<OUT>/Script.scr" --json
 ```
 

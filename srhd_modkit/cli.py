@@ -1333,6 +1333,23 @@ def cmd_script_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_script_decompile(args: argparse.Namespace) -> int:
+    result = Toolchain(args.tools_root).decompile_scr(
+        args.source,
+        args.output,
+        lang_dat=args.lang_dat,
+        overwrite=args.overwrite,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"RSON восстановлен: {result['destination']}")
+        print(f"Объектов: {result['objects']}")
+        print(f"Проверочный цикл SCR -> RSON -> SCR: {'пройден' if result['verified'] else 'НЕТ'}")
+        print(f"SHA-256 RSON: {result['destination_sha256']}")
+    return 0
+
+
 def cmd_script_inspect_scr(args: argparse.Namespace) -> int:
     result = inspect_scr(args.source)
     if args.json:
@@ -1401,7 +1418,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
         except Exception as exc:
             issues.append({"severity": "error", "code": "rson-json", "message": f"{path.relative_to(root)}: {exc}"})
     if scripts and not valid_rsons:
-        issues.append({"severity": "warning", "code": "rson-source-missing", "message": "Для SCR не найдено ни одного полноценного исходного RSON-проекта"})
+        issues.append({"severity": "warning", "code": "rson-source-missing", "message": "Для SCR не найдено исходного RSON; восстановите его отдельной командой script decompile"})
     misplaced = root / "DATA" / "Main.dat"
     if misplaced.is_file():
         issues.append({"severity": "error", "code": "main-dat-misplaced", "message": "DATA/Main.dat расположен неверно; конфигурационный Main.dat должен находиться в CFG/Main.dat"})
@@ -1456,7 +1473,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.1")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.2")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -1690,7 +1707,7 @@ def build_parser() -> argparse.ArgumentParser:
     dat_validate.add_argument("--json", action="store_true")
     dat_validate.set_defaults(func=cmd_dat_validate)
 
-    script = sub.add_parser("script", help="Headless-анализ и сборка RSON/SCR")
+    script = sub.add_parser("script", help="Headless-анализ, декомпиляция и сборка RSON/SCR")
     script_sub = script.add_subparsers(dest="script_command", required=True)
 
     script_info = script_sub.add_parser("info", help="Показать устройство RSON-проекта")
@@ -1837,6 +1854,18 @@ def build_parser() -> argparse.ArgumentParser:
     script_convert.add_argument("--tools-root")
     script_convert.add_argument("--json", action="store_true")
     script_convert.set_defaults(func=cmd_script_convert)
+
+    script_decompile = script_sub.add_parser(
+        "decompile",
+        help="Восстановить проверенный RSON из SCR без видимого GUI",
+    )
+    script_decompile.add_argument("source")
+    script_decompile.add_argument("output")
+    script_decompile.add_argument("--lang-dat", help="Необязательный Lang.dat для восстановления диалогов")
+    script_decompile.add_argument("--overwrite", action="store_true")
+    script_decompile.add_argument("--tools-root")
+    script_decompile.add_argument("--json", action="store_true")
+    script_decompile.set_defaults(func=cmd_script_decompile)
 
     script_scr = script_sub.add_parser("inspect-scr", help="Проверить заголовок и строки скомпилированного SCR")
     script_scr.add_argument("source")
