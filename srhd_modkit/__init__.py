@@ -46,6 +46,12 @@ from .audit import (
     audit_collection,
     audit_mod,
 )
+from .release import (
+    ReleaseBlockedError,
+    ReleaseResult,
+    build_release,
+    verify_release_archive,
+)
 
 __all__ = [
     "build_manifest",
@@ -100,6 +106,10 @@ __all__ = [
     "AuditReport",
     "audit_collection",
     "audit_mod",
+    "ReleaseBlockedError",
+    "ReleaseResult",
+    "build_release",
+    "verify_release_archive",
     "validate_collection",
     "validate_mod",
     "validate_modcfg",

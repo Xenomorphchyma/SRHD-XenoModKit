@@ -361,6 +361,8 @@ _JUNK_PATTERNS = (
     "*.bak_*",
     "*~",
     ".ds_store",
+    ".gitignore",
+    ".gitattributes",
     "thumbs.db",
     "desktop.ini",
 )
@@ -374,6 +376,10 @@ def _workspace_artifacts_check(context: AuditContext) -> AuditCheck:
         relative = path.relative_to(context.root).as_posix()
         folded_parts = [part.casefold() for part in path.relative_to(context.root).parts]
         junk = any(part.startswith(".srhd-") for part in folded_parts)
+        junk = junk or any(
+            part in {".git", ".hg", ".svn", "__pycache__", ".pytest_cache"}
+            for part in folded_parts
+        )
         junk = junk or any(fnmatch.fnmatch(path.name.casefold(), pattern) for pattern in _JUNK_PATTERNS)
         if junk:
             issues.append(
@@ -877,4 +883,3 @@ def audit_collection(
         ),
         allow,
     )
-

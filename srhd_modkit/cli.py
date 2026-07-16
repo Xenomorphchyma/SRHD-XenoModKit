@@ -27,6 +27,8 @@ from .runtime_lint import (
     lint_rson_runtime,
 )
 from .validation import validate_collection
+from .audit import AuditProfile, AuditReport, audit_collection, audit_mod
+from .release import ReleaseBlockedError, build_release
 
 
 def human_size(value: int) -> str:
@@ -107,6 +109,99 @@ def cmd_validate(args: argparse.Namespace) -> int:
         totals = {level: sum(issue.severity == level for issue in issues) for level in ("error", "warning", "info")}
         print(f"Итог: ошибок {totals['error']}, предупреждений {totals['warning']}, сведений {totals['info']}.")
     return 2 if any(issue.severity == "error" for issue in issues) else 0
+
+
+def _print_audit_report(report: AuditReport) -> None:
+    value = report.as_dict()
+    print(f"Цель: {report.target}")
+    print(f"Профиль: {report.profile.value}; полное покрытие: {'да' if report.coverage_complete else 'НЕТ'}")
+    for check in report.checks:
+        print(f"{check.status.upper():11} {check.name}: файлов {len(check.checked_files)}, проблем {len(check.issues)}")
+    if report.children:
+        print(f"Модов в коллекции: {len(report.children)}")
+    for issue in report.issues:
+        marker = " [ПОДАВЛЕНО]" if issue.suppressed else ""
+        location = f" [{issue.path}" if issue.path else ""
+        if issue.location:
+            location += f": {issue.location}"
+        if location:
+            location += "]"
+        print(f"{issue.severity.upper():7} {issue.code}: {issue.message}{marker}{location}")
+        if issue.evidence:
+            print(f"         {issue.evidence}")
+    summary = value["summary"]
+    print(
+        f"Итог: ошибок {summary['error']}, предупреждений {summary['warning']}, "
+        f"сведений {summary['info']}, подавлено {summary['suppressed']}."
+    )
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    target = Path(args.target).resolve()
+    if find_module_info(target):
+        report = audit_mod(
+            target,
+            profile=args.profile,
+            tools_root=args.tools_root,
+            allow=args.allow,
+        )
+    else:
+        report = audit_collection(
+            target,
+            profile=args.profile,
+            tools_root=args.tools_root,
+            allow=args.allow,
+        )
+    if args.json:
+        print_json(report.as_dict())
+    else:
+        _print_audit_report(report)
+    return 2 if report.blocking_issues(warnings_as_errors=args.warnings_as_errors) else 0
+
+
+def cmd_release_check(args: argparse.Namespace) -> int:
+    report = audit_mod(
+        args.mod,
+        profile=AuditProfile.RELEASE,
+        tools_root=args.tools_root,
+        allow=args.allow,
+    )
+    if args.json:
+        print_json(report.as_dict())
+    else:
+        _print_audit_report(report)
+    return 2 if report.blocking_issues(warnings_as_errors=args.warnings_as_errors) else 0
+
+
+def cmd_release_build(args: argparse.Namespace) -> int:
+    try:
+        result = build_release(
+            args.mod,
+            args.output,
+            prefix=args.prefix,
+            exclude=args.exclude,
+            tools_root=args.tools_root,
+            allow=args.allow,
+            warnings_as_errors=args.warnings_as_errors,
+            overwrite=args.overwrite,
+        )
+    except ReleaseBlockedError as exc:
+        if args.json:
+            print_json({"schema": "srhd-modkit-release-v1", "blocked": True, "audit": exc.report.as_dict()})
+        else:
+            print(str(exc))
+            _print_audit_report(exc.report)
+        return 2
+    if args.json:
+        print_json(result.as_dict())
+    else:
+        print(f"Релиз: {result.output}")
+        print(f"Файлов: {result.file_count}; размер: {human_size(result.archive_size)}")
+        print(f"SHA-256: {result.sha256}")
+        print(f"Манифест: {result.manifest_path}")
+        print(f"Аудит: {result.audit_path}")
+        print(f"Архив повторно проверен: {'да' if result.verified else 'НЕТ'}")
+    return 0
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
@@ -1320,6 +1415,38 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("root")
     validate.add_argument("--json", action="store_true")
     validate.set_defaults(func=cmd_validate)
+
+    audit = sub.add_parser("audit", help="Универсально проверить мод или коллекцию")
+    audit.add_argument("target")
+    audit.add_argument("--profile", choices=("dev", "release"), default="dev")
+    audit.add_argument("--allow", action="append", default=[], help="Подавить CODE или CODE:GLOB с записью в отчёт")
+    audit.add_argument("--warnings-as-errors", action="store_true")
+    audit.add_argument("--tools-root")
+    audit.add_argument("--json", action="store_true")
+    audit.set_defaults(func=cmd_audit)
+
+    release = sub.add_parser("release", help="Проверить и собрать безопасный релиз")
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+
+    release_check = release_sub.add_parser("check", help="Запустить полный релизный аудит")
+    release_check.add_argument("mod")
+    release_check.add_argument("--allow", action="append", default=[])
+    release_check.add_argument("--warnings-as-errors", action="store_true")
+    release_check.add_argument("--tools-root")
+    release_check.add_argument("--json", action="store_true")
+    release_check.set_defaults(func=cmd_release_check)
+
+    release_build = release_sub.add_parser("build", help="Собрать и повторно проверить ZIP-релиз")
+    release_build.add_argument("mod")
+    release_build.add_argument("output")
+    release_build.add_argument("--prefix")
+    release_build.add_argument("--exclude", action="append", default=[])
+    release_build.add_argument("--allow", action="append", default=[])
+    release_build.add_argument("--warnings-as-errors", action="store_true")
+    release_build.add_argument("--overwrite", action="store_true")
+    release_build.add_argument("--tools-root")
+    release_build.add_argument("--json", action="store_true")
+    release_build.set_defaults(func=cmd_release_build)
 
     compare = sub.add_parser("compare", help="Точно сравнить две папки")
     compare.add_argument("left")
