@@ -160,6 +160,65 @@ class HiddenProcessTests(unittest.TestCase):
                     parent.kill()
                     parent.communicate(timeout=5)
 
+    def test_hidden_child_is_visible_and_externally_terminable(self) -> None:
+        self.assert_clean()
+        with tempfile.TemporaryDirectory(prefix="srhd-task-manager-test-") as temp_name:
+            marker = Path(temp_name) / "child.pid"
+            child_code = (
+                "import os,time;from pathlib import Path;"
+                f"Path({str(marker)!r}).write_text(str(os.getpid()),encoding='ascii');"
+                "time.sleep(60)"
+            )
+            parent_code = (
+                "from pathlib import Path;import sys;"
+                "from srhd_modkit.hidden_process import run_on_hidden_desktop;"
+                f"run_on_hidden_desktop(sys.executable,['-B','-c',{child_code!r}],"
+                "cwd=Path.cwd(),timeout=30)"
+            )
+            parent = subprocess.Popen(
+                [sys.executable, "-B", "-c", parent_code],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and parent.poll() is None and not marker.is_file():
+                    time.sleep(0.05)
+                if marker.is_file():
+                    child_pid = int(marker.read_text(encoding="ascii"))
+                self.assertIsNotNone(child_pid, "hidden child did not publish its PID")
+
+                listing = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(listing.returncode, 0, listing.stderr)
+                self.assertIn(Path(sys.executable).name.encode("ascii").lower(), listing.stdout.lower())
+
+                termination = subprocess.run(
+                    ["taskkill", "/PID", str(child_pid), "/F"],
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(termination.returncode, 0, termination.stderr)
+                parent.wait(timeout=5)
+                self.assertFalse(_process_alive(child_pid))
+                self.assert_clean()
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                try:
+                    parent.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    parent.kill()
+                    parent.communicate(timeout=5)
+                if child_pid is not None and _process_alive(child_pid):
+                    os.kill(child_pid, 15)
+
     def test_doctor_processes_reports_clean_json(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
