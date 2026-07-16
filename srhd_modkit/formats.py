@@ -47,8 +47,10 @@ FORMAT_SPECS: tuple[FormatSpec, ...] = (
     FormatSpec("PNG image", (".png",), "image", "convertible", automatic_conversion="gi", signature=b"\x89PNG\r\n\x1a\n"),
     FormatSpec("JPEG image", (".jpg", ".jpeg"), "image", "standard", signature=b"\xff\xd8\xff"),
     FormatSpec("BMP image", (".bmp",), "image", "standard", signature=b"BM"),
+    FormatSpec("DirectDraw Surface", (".dds",), "image", "standard", signature=b"DDS "),
     FormatSpec("Photoshop image", (".psd",), "image-source", "standard", signature=b"8BPS"),
     FormatSpec("WAVE audio", (".wav",), "audio", "standard", signature=b"RIFF"),
+    FormatSpec("WebM video", (".webm",), "video", "standard", signature=b"\x1aE\xdf\xa3"),
     FormatSpec("Space Rangers video", (".vdo",), "video", "passthrough"),
     FormatSpec("ZIP archive", (".zip",), "archive", "standard", signature=b"PK\x03\x04"),
     FormatSpec("7-Zip archive", (".7z",), "archive", "standard", signature=b"7z\xbc\xaf\x27\x1c"),
@@ -95,14 +97,21 @@ def inspect_file(path: str | Path, *, include_hash: bool = False) -> dict[str, A
         raise FileNotFoundError(path)
     spec = get_format_spec(path)
     signature_valid: bool | None = None
+    signature_reason: str | None = None
     if spec and spec.signature is not None:
         with path.open("rb") as stream:
             stream.seek(spec.signature_offset)
-            actual = stream.read(max(len(spec.signature), 4))
+            actual = stream.read(max(len(spec.signature), 32))
             if spec.name == "ZIP archive":
                 signature_valid = actual[:4] in {b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"}
+            elif spec.name == "WAVE audio":
+                signature_valid = actual[:4] == b"RIFF" and actual[8:12] == b"WAVE"
             else:
                 signature_valid = actual[: len(spec.signature)] == spec.signature
+            if signature_valid is False:
+                signature_reason = (
+                    f"expected={spec.signature.hex()}; actual={actual[:len(spec.signature)].hex()}"
+                )
     result: dict[str, Any] = {
         "path": str(path),
         "extension": path.suffix.casefold(),
@@ -113,6 +122,7 @@ def inspect_file(path: str | Path, *, include_hash: bool = False) -> dict[str, A
         "editor": spec.editor if spec else None,
         "automatic_conversion": spec.automatic_conversion if spec else None,
         "signature_valid": signature_valid,
+        "signature_reason": signature_reason,
     }
     result.update(_dimensions(path, spec))
     if include_hash:

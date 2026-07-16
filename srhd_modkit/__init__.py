@@ -37,6 +37,15 @@ from .runtime_lint import (
 )
 from .script_artifacts import ScriptArtifactIssue, lint_script_cache
 from .game_text import GameTextIssue, lint_game_text
+from .audit import (
+    AuditCheck,
+    AuditIssue,
+    AuditProfile,
+    AuditRegistry,
+    AuditReport,
+    audit_collection,
+    audit_mod,
+)
 
 __all__ = [
     "build_manifest",
@@ -84,6 +93,13 @@ __all__ = [
     "lint_script_cache",
     "GameTextIssue",
     "lint_game_text",
+    "AuditCheck",
+    "AuditIssue",
+    "AuditProfile",
+    "AuditRegistry",
+    "AuditReport",
+    "audit_collection",
+    "audit_mod",
     "validate_collection",
     "validate_mod",
     "validate_modcfg",
