@@ -1,4 +1,4 @@
-# SRHD ModKit 0.8.0
+# SRHD ModKit 0.8.1
 
 Публичная GitHub-версия называется **SRHD XenoModKit**. Внутренние имена
 каталога, Python-пакета и CLI не переименованы. Автор и сопровождающий:
@@ -213,6 +213,8 @@ python srhd.py script get D:\work\MyScript.rson 42
 python srhd.py script list-links D:\work\MyScript.rson
 python srhd.py script set-code D:\work\MyScript.rson D:\work\MyScript.new.rson `
   --id 42 --field Code --code-file D:\work\object42.txt
+python srhd.py script set-code D:\work\MyScript.rson D:\work\MyScript.state.rson `
+  --id 17 --field OnActCode --code-file D:\work\player-buy-handler.txt
 python srhd.py script set-field D:\work\MyScript.rson D:\work\MyScript.named.rson `
   --id 42 --field Name --value '\"Новый объект\"'
 python srhd.py script set-events D:\work\MyScript.rson D:\work\MyScript.events.rson `
@@ -379,7 +381,7 @@ ModKit через GitHub.
 python -m unittest discover -s tests -v
 ```
 
-77 тестов используют настоящие локальные RangerTools, BlockParEditor и RScript:
+79 тестов используют настоящие локальные RangerTools, BlockParEditor и RScript:
 проверяют пиксель-в-пиксель круговой проход ARGB8888, ASCII/Unicode DAT,
 события TState в собранном SCR, runtime-блокировки, граф RSON, аудит/релиз,
 совместимость, круговые проходы GAI/PKG и запрет GUI по умолчанию. Дополнительно

@@ -304,9 +304,22 @@ class RsonProject:
         return results
 
     def set_code(self, object_id: int, lines: list[str], *, field: str = "Code") -> None:
-        if field not in {"Code", "ActCode", "LinkCode"}:
-            raise ValueError("Поле кода: Code, ActCode или LinkCode")
+        if field not in {"Code", "ActCode", "LinkCode", "OnActCode"}:
+            raise ValueError("Поле кода: Code, ActCode, LinkCode или OnActCode")
         item = self.object_by_id(object_id)
+        if field == "OnActCode":
+            if item.get("Type") != "TState":
+                raise ValueError(f"OnActCode можно менять только у TState, объект #{object_id}: {item.get('Type')}")
+            existing = item.get("OnActCode", "")
+            if not isinstance(existing, str):
+                raise ValueError(f"TState #{object_id}: OnActCode должен быть строкой")
+            handler = "\n".join(str(line) for line in lines)
+            if handler.lstrip().startswith("["):
+                raise ValueError("Файл обработчика не должен содержать сигнатуру событий; используйте script set-events")
+            match = STATE_EVENTS_RE.match(existing)
+            signature = match.group(0).rstrip("\r\n") if match else ""
+            item[field] = signature + (f"\n{handler}" if signature and handler else handler)
+            return
         item[field] = [str(line) for line in lines]
         if "Total.Lines" in item:
             item["Total.Lines"] = len(lines)

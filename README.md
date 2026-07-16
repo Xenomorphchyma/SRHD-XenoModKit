@@ -1,4 +1,4 @@
-# SRHD XenoModKit 0.8.0
+# SRHD XenoModKit 0.8.1
 
 Headless modding toolkit for **Space Rangers HD: A War Apart** / **Космические рейнджеры HD: Революция**.
 
@@ -116,6 +116,8 @@ python -B srhd.py dat validate C:\Work\MyMod\CFG\Main.dat --json
 ```powershell
 python -B srhd.py script audit-mod C:\Work\MyMod --json
 python -B srhd.py script lint-runtime C:\Work\MyMod --strict --json
+python -B srhd.py script set-code C:\Work\Script.rson C:\Work\Script.edited.rson `
+  --id 17 --field OnActCode --code-file C:\Work\player-buy-handler.txt
 python -B srhd.py script build C:\Work\Script.rson --scr C:\Work\Script.scr --lang C:\Work\Lang.txt
 ```
 
@@ -159,7 +161,7 @@ $srhd-modkit
 python -B -m unittest discover -s tests -v
 ```
 
-В версии 0.8.0 проходят 77 тестов. Дополнительно dev-аудит был выполнен на 418 установленных модах без падений валидаторов.
+В версии 0.8.1 проходят 79 тестов. Дополнительно dev-аудит был выполнен на 418 установленных модах без падений валидаторов.
 
 ## Авторство
 

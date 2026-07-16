@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
+from srhd_modkit.cli import main
 from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, inspect_scr, load_rson
 
 
@@ -91,6 +94,71 @@ class RsonTests(unittest.TestCase):
             self.assertEqual(project.summary()["state_event_subscriptions"][0]["object_id"], 3)
             project.set_state_events(3, [])
             self.assertEqual(state["OnActCode"], "PlayerActCode();")
+
+    def test_set_code_updates_state_handler_and_preserves_event_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            project.data["Visual.Objects"][0]["Operations"].append(
+                {
+                    "Type": "TState",
+                    "Name": "PlayerState",
+                    "Parent": -1,
+                    "#": 3,
+                    "OnActCode": "[t_OnPlayerBuyEq|]\nOldHandler();",
+                }
+            )
+            project.set_code(3, ["if(!ScriptItemActionType(t_OnPlayerBuyEq)) exit;", "NewHandler();"], field="OnActCode")
+            self.assertEqual(
+                project.object_by_id(3)["OnActCode"],
+                "[t_OnPlayerBuyEq|]\nif(!ScriptItemActionType(t_OnPlayerBuyEq)) exit;\nNewHandler();",
+            )
+            with self.assertRaises(ValueError):
+                project.set_code(2, ["NotAState();"], field="OnActCode")
+            with self.assertRaises(ValueError):
+                project.set_code(3, ["[t_OnEnteringForm|]", "Bad();"], field="OnActCode")
+
+    def test_cli_set_code_updates_on_act_code_headlessly(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            project = self._project(root)
+            project.data["Visual.Objects"][0]["Operations"].append(
+                {
+                    "Type": "TState",
+                    "Name": "PlayerState",
+                    "Parent": -1,
+                    "#": 3,
+                    "OnActCode": "[t_OnPlayerBuyEq|]\nOldHandler();",
+                }
+            )
+            project.save(project.path)
+            handler = root / "player-buy.txt"
+            handler.write_text("if(!ScriptItemActionType(t_OnPlayerBuyEq)) exit;\nNormalizePurchase();\n", encoding="utf-8")
+            output = root / "edited.rson"
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                result = main(
+                    [
+                        "script",
+                        "set-code",
+                        str(project.path),
+                        str(output),
+                        "--id",
+                        "3",
+                        "--field",
+                        "OnActCode",
+                        "--code-file",
+                        str(handler),
+                        "--json",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(stdout.getvalue())["field"], "OnActCode")
+            self.assertEqual(
+                load_rson(output).object_by_id(3)["OnActCode"],
+                "[t_OnPlayerBuyEq|]\nif(!ScriptItemActionType(t_OnPlayerBuyEq)) exit;\nNormalizePurchase();",
+            )
 
     def test_invalid_state_event_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as name:

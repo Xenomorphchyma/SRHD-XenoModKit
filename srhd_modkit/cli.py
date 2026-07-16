@@ -1456,7 +1456,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.0")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.1")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -1721,11 +1721,11 @@ def build_parser() -> argparse.ArgumentParser:
     script_links.add_argument("--json", action="store_true")
     script_links.set_defaults(func=cmd_script_list_links)
 
-    script_code = script_sub.add_parser("set-code", help="Заменить массив Code/ActCode/LinkCode без GUI")
+    script_code = script_sub.add_parser("set-code", help="Заменить Code/ActCode/LinkCode/OnActCode без GUI")
     script_code.add_argument("source")
     script_code.add_argument("output")
     script_code.add_argument("--id", required=True, type=int)
-    script_code.add_argument("--field", choices=("Code", "ActCode", "LinkCode"), default="Code")
+    script_code.add_argument("--field", choices=("Code", "ActCode", "LinkCode", "OnActCode"), default="Code")
     script_code.add_argument("--code-file", required=True)
     script_code.add_argument("--encoding", default="utf-8")
     script_code.add_argument("--overwrite", action="store_true")
