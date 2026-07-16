@@ -14,7 +14,7 @@ from .files import iter_files
 from .formats import get_format_spec, inspect_file
 from .game_text import lint_game_text
 from .module_info import find_module_info, parse_module_info
-from .resources import verify_resource
+from .resources import UnsupportedResourceFormat, verify_resource
 from .runtime_lint import (
     has_onstart_script_run,
     lint_main_runtime,
@@ -586,13 +586,24 @@ def _resource_integrity_check(context: AuditContext) -> AuditCheck:
         return AuditCheck(name, "skipped", details={"reason": "GAI/HAI/PKG не найдены"})
     issues: list[AuditIssue] = []
     checked: list[str] = []
+    unsupported: list[dict[str, str]] = []
     for path in resources:
         try:
             verify_resource(path)
             checked.append(str(path))
+        except UnsupportedResourceFormat as exc:
+            unsupported.append({"path": str(path), "reason": str(exc)})
         except Exception as exc:
             issues.append(_issue(context, name, "error", "resource-invalid", str(exc), path))
-    return AuditCheck(name, _status(issues), tuple(issues), tuple(checked))
+    status = _status(issues) if issues else "unsupported" if unsupported else "passed"
+    return AuditCheck(
+        name,
+        status,
+        tuple(issues),
+        tuple(checked),
+        details={"unsupported": unsupported},
+        complete=not unsupported,
+    )
 
 
 def _registrations(document: BlockParDocument) -> dict[str, list[str]]:

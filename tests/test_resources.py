@@ -8,6 +8,8 @@ from pathlib import Path
 
 from srhd_modkit.resources import (
     ResourceFormatError,
+    build_gai,
+    build_pkg,
     extract_resource,
     inspect_gai,
     inspect_hai,
@@ -95,6 +97,47 @@ class ResourceTests(unittest.TestCase):
             self.assertEqual(info.verify()["verified_files"], 1)
             extract_resource(source, root / "unpacked")
             self.assertEqual((root / "unpacked" / "Mods" / "Frame.gi").read_bytes(), payload)
+
+    def test_gai_writer_is_deterministic_and_preserves_template_auxiliary(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            frame_paths = []
+            for index, payload in enumerate((_gi(10, 12), _gi(11, 13, 1))):
+                path = root / f"{index:02d}.gi"
+                path.write_bytes(payload)
+                frame_paths.append(path)
+            first = root / "first.gai"
+            second = root / "second.gai"
+            one = build_gai(frame_paths, first, width=32, height=32, auxiliary=b"aux")
+            two = build_gai(frame_paths, second, template=first)
+            self.assertEqual(one["sha256"], two["sha256"])
+            info = inspect_gai(second)
+            self.assertEqual((info.width, info.height, info.auxiliary_size), (32, 32, 3))
+
+    def test_pkg_writer_roundtrips_nested_tree_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "source"
+            (source / "Images").mkdir(parents=True)
+            (source / "Images" / "frame.gi").write_bytes(_gi(4, 5))
+            (source / "readme.txt").write_text("тест", encoding="cp1251")
+            first = root / "first.pkg"
+            second = root / "second.pkg"
+            one = build_pkg(source, first, package_folders=("Mods", "Fixture"), chunk_size=8)
+            two = build_pkg(source, second, package_folders=("Mods", "Fixture"), chunk_size=8)
+            self.assertEqual(one["sha256"], two["sha256"])
+            info = inspect_pkg(first)
+            self.assertEqual(info.verify()["verified_files"], 2)
+            paths = {entry.relative_path.as_posix() for entry in info.entries}
+            self.assertEqual(
+                paths,
+                {"Mods/Fixture/Images/frame.gi", "Mods/Fixture/readme.txt"},
+            )
+            extract_resource(first, root / "unpacked")
+            self.assertEqual(
+                (root / "unpacked" / "Mods" / "Fixture" / "Images" / "frame.gi").read_bytes(),
+                _gi(4, 5),
+            )
 
 
 if __name__ == "__main__":

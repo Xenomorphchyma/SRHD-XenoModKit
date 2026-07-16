@@ -15,7 +15,7 @@ from .module_info import find_module_info, parse_module_info
 from .toolchain import Toolchain, is_empty_rscript_lang_dat
 from .blockpar import BlockParDocument, BlockParNode, load_blockpar
 from .scripts import inspect_scr, load_rson
-from .resources import extract_resource, inspect_resource, verify_resource
+from .resources import build_gai, build_pkg, extract_resource, inspect_resource, verify_resource
 from .game_text import GameTextIssue, lint_game_text
 from .script_artifacts import ScriptArtifactIssue, lint_script_cache
 from .textio import DecodedText, read_text
@@ -407,6 +407,42 @@ def cmd_resource_extract(args: argparse.Namespace) -> int:
         print(f"Каталог: {result['output']}")
         if result.get("package_root"):
             print(f"Корень содержимого PKG: {result['package_root']}")
+    return 0
+
+
+def cmd_resource_build_gai(args: argparse.Namespace) -> int:
+    result = build_gai(
+        args.frames,
+        args.output,
+        template=args.template,
+        width=args.width,
+        height=args.height,
+        overwrite=args.overwrite,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"GAI: {result['output']}")
+        print(f"Кадров: {result['frames']}; холст: {result['width']} × {result['height']}")
+        print(f"SHA-256: {result['sha256']}; проверен: {'да' if result['verified'] else 'НЕТ'}")
+    return 0
+
+
+def cmd_resource_build_pkg(args: argparse.Namespace) -> int:
+    result = build_pkg(
+        args.source,
+        args.output,
+        package_folders=args.folders,
+        template=args.template,
+        chunk_size=args.chunk_size,
+        overwrite=args.overwrite,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"PKG: {result['output']}")
+        print(f"Файлов: {result['files']}; после распаковки: {human_size(result['uncompressed_size'])}")
+        print(f"SHA-256: {result['sha256']}; проверен: {'да' if result['verified'] else 'НЕТ'}")
     return 0
 
 
@@ -1546,6 +1582,26 @@ def build_parser() -> argparse.ArgumentParser:
     resource_extract.add_argument("--overwrite", action="store_true")
     resource_extract.add_argument("--json", action="store_true")
     resource_extract.set_defaults(func=cmd_resource_extract)
+
+    resource_build_gai = resource_sub.add_parser("build-gai", help="Собрать GAI из GI-кадров и проверить результат")
+    resource_build_gai.add_argument("frames", nargs="+", help="GI-файлы или каталоги с GI")
+    resource_build_gai.add_argument("--output", "-o", required=True)
+    resource_build_gai.add_argument("--template", help="Исходный GAI для сохранения подтверждённых полей")
+    resource_build_gai.add_argument("--width", type=int)
+    resource_build_gai.add_argument("--height", type=int)
+    resource_build_gai.add_argument("--overwrite", action="store_true")
+    resource_build_gai.add_argument("--json", action="store_true")
+    resource_build_gai.set_defaults(func=cmd_resource_build_gai)
+
+    resource_build_pkg = resource_sub.add_parser("build-pkg", help="Собрать каталог в детерминированный PKG")
+    resource_build_pkg.add_argument("source")
+    resource_build_pkg.add_argument("output")
+    resource_build_pkg.add_argument("--folder", dest="folders", action="append", help="Компонент пути внутри PKG; ключ повторяется")
+    resource_build_pkg.add_argument("--template", help="Исходный PKG для сохранения корневого заголовка/пути")
+    resource_build_pkg.add_argument("--chunk-size", type=parse_size, default=1024 * 1024)
+    resource_build_pkg.add_argument("--overwrite", action="store_true")
+    resource_build_pkg.add_argument("--json", action="store_true")
+    resource_build_pkg.set_defaults(func=cmd_resource_build_pkg)
 
     tools = sub.add_parser("tools", help="Проверить доступность локальных конвертеров и редакторов")
     tools.add_argument("--tools-root")

@@ -78,6 +78,17 @@ class AuditTests(unittest.TestCase):
                 any(item.code == "dat-source-binary-mismatch" for item in report.issues)
             )
 
+    def test_known_alternative_pkg_is_unsupported_not_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            (root / "DATA" / "alternate.pkg").write_bytes(b"XPKG" + bytes(60))
+            report = audit_mod(root, profile="release")
+            check = next(item for item in report.checks if item.name == "resource-integrity")
+            self.assertEqual(check.status, "unsupported")
+            self.assertFalse(check.complete)
+            self.assertFalse(any(item.code == "resource-invalid" for item in report.issues))
+
 
 if __name__ == "__main__":
     unittest.main()
