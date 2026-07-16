@@ -61,6 +61,8 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual([item["name"] for item in report.load_order], ["A", "B"])
             self.assertEqual([item["priority"] for item in report.load_order], [10, 20])
             self.assertEqual(report.cycles, (("A", "B", "A"),))
+            self.assertEqual(report.conflict_edges[0]["status"], "enabled")
+            self.assertEqual(report.conflict_edges[0]["to"], ["B"])
             by_path = {item.path: item for item in report.collisions}
             self.assertEqual(by_path["DATA/same.bin"].kind, "identical")
             self.assertEqual(by_path["DATA/different.bin"].kind, "binary-replacement")

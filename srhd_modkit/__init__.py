@@ -126,4 +126,4 @@ __all__ = [
     "validate_modcfg",
 ]
 
-__version__ = "0.5.7"
+__version__ = "0.8.0"

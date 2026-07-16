@@ -65,6 +65,7 @@ class ModSetReport:
     mods_root: str
     load_order: tuple[dict[str, Any], ...]
     dependency_edges: tuple[dict[str, Any], ...]
+    conflict_edges: tuple[dict[str, Any], ...]
     cycles: tuple[tuple[str, ...], ...]
     collisions: tuple[OverlayCollision, ...]
     issues: tuple[AuditIssue, ...]
@@ -77,12 +78,14 @@ class ModSetReport:
             "mods_root": self.mods_root,
             "load_order": list(self.load_order),
             "dependency_edges": list(self.dependency_edges),
+            "conflict_edges": list(self.conflict_edges),
             "cycles": [list(cycle) for cycle in self.cycles],
             "collisions": [collision.as_dict() for collision in self.collisions],
             "issues": [issue.as_dict() for issue in self.issues],
             "summary": {
                 "enabled_mods": len(self.load_order),
                 "dependency_edges": len(self.dependency_edges),
+                "conflict_edges": len(self.conflict_edges),
                 "cycles": len(self.cycles),
                 "collisions": len(self.collisions),
                 "errors": sum(issue.severity == "error" for issue in self.issues),
@@ -101,8 +104,10 @@ def _indexes(mods: Iterable[ModRecord]) -> tuple[dict[str, ModRecord], dict[str,
             key = normalize_ref(ref)
             if not key:
                 continue
-            by_ref.setdefault(key, []).append(mod)
-            by_ref.setdefault(key.split("\\")[-1], []).append(mod)
+            for candidate in {key, key.split("\\")[-1]}:
+                values = by_ref.setdefault(candidate, [])
+                if mod not in values:
+                    values.append(mod)
     return by_path, by_ref
 
 
@@ -150,6 +155,30 @@ def _dependency_edges(
             for target in active:
                 graph[mod.name].add(target.name)
     return edges, graph
+
+
+def _conflict_edges(enabled: list[ModRecord], all_mods: list[ModRecord]) -> list[dict[str, Any]]:
+    _, by_ref = _indexes(all_mods)
+    enabled_ids = {normalize_ref(mod.relative_path.as_posix().replace("/", "\\")) for mod in enabled}
+    edges: list[dict[str, Any]] = []
+    for mod in enabled:
+        for conflict in mod.module.conflicts:
+            matches = by_ref.get(normalize_ref(conflict), [])
+            active = [
+                item
+                for item in matches
+                if normalize_ref(item.relative_path.as_posix().replace("/", "\\")) in enabled_ids
+            ]
+            status = "missing" if not matches else "disabled" if not active else "enabled"
+            edges.append(
+                {
+                    "from": mod.name,
+                    "reference": conflict,
+                    "to": [item.name for item in (active or matches)],
+                    "status": status,
+                }
+            )
+    return edges
 
 
 def _cycles(graph: dict[str, set[str]]) -> tuple[tuple[str, ...], ...]:
@@ -334,6 +363,7 @@ def analyze_modset(
         if item.code == "duplicate-name"
     )
     edges, graph = _dependency_edges(enabled, mods)
+    conflicts = _conflict_edges(enabled, mods)
     found_cycles = _cycles(graph)
     for cycle in found_cycles:
         issues.append(
@@ -362,6 +392,7 @@ def analyze_modset(
         str(root),
         order,
         tuple(edges),
+        tuple(conflicts),
         found_cycles,
         tuple(collision_items),
         tuple(issues),

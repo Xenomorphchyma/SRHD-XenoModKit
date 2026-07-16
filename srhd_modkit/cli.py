@@ -267,6 +267,7 @@ def cmd_compat(args: argparse.Namespace) -> int:
         for item in report.load_order:
             priority = item["priority"] if item["priority"] is not None else "—"
             print(f"  [{item['order']}] Priority={priority} {item['name']} ({item['path']})")
+        print(f"Зависимостей: {len(report.dependency_edges)}; объявленных конфликтов: {len(report.conflict_edges)}")
         print(f"Циклов зависимостей: {len(report.cycles)}")
         for cycle in report.cycles:
             print("  " + " -> ".join(cycle))
@@ -1455,7 +1456,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.5.7")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.0")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
