@@ -6,8 +6,13 @@ build-backend = "setuptools.build_meta"
 name = "srhd-modkit"
 version = "0.8.0"
 description = "Safe inspection, conversion and release tools for Space Rangers HD mods"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
+authors = [
+  { name = "Xenomorphchyma" },
+]
+keywords = ["space-rangers-hd", "space-rangers-2", "modding", "modkit", "srhd"]
 
 [project.scripts]
 srhd-mod = "srhd_modkit.cli:main"
