@@ -56,6 +56,23 @@ from .release import (
     verify_release_archive,
 )
 from .compat import ModSetReport, OverlayCollision, OverlayOwner, analyze_modset
+from .image_codec import (
+    GiInfo,
+    GiLayerInfo,
+    ImageFormatError,
+    RgbaImage,
+    UnsupportedImageFormat,
+    decode_gi,
+    decode_png,
+    encode_gi,
+    encode_png,
+    inspect_gi,
+    read_gi,
+    read_png,
+    verify_gi,
+    write_gi,
+    write_png,
+)
 
 __all__ = [
     "build_manifest",
@@ -124,6 +141,21 @@ __all__ = [
     "validate_collection",
     "validate_mod",
     "validate_modcfg",
+    "RgbaImage",
+    "GiInfo",
+    "GiLayerInfo",
+    "ImageFormatError",
+    "UnsupportedImageFormat",
+    "decode_gi",
+    "encode_gi",
+    "read_gi",
+    "write_gi",
+    "inspect_gi",
+    "verify_gi",
+    "decode_png",
+    "encode_png",
+    "read_png",
+    "write_png",
 ]
 
-__version__ = "0.8.3"
+__version__ = "0.8.4"

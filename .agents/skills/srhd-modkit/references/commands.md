@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.8.3
+# Команды SRHD ModKit 0.8.4
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -54,6 +54,7 @@ RScript использует адаптивный лимит без верхне
 ```powershell
 python -B srhd.py formats "<MOD>" --json
 python -B srhd.py resource info "<WORK>/anim.gai" --json
+python -B srhd.py resource verify "<WORK>/image.gi" --json
 python -B srhd.py resource list "<WORK>/resources.pkg" --json
 python -B srhd.py resource verify "<WORK>/resources.pkg" --json
 python -B srhd.py resource extract "<WORK>/resources.pkg" "<TEMP>/unpacked"
@@ -62,6 +63,10 @@ python -B srhd.py resource build-pkg "<TEMP>/tree" "<OUT>/resources.pkg" --folde
 python -B srhd.py convert gi-png "<WORK>/Images" -o "<TEMP>/PNG"
 python -B srhd.py convert png-gi "<TEMP>/PNG" -o "<OUT>/Images" --mode 0_32
 ```
+
+GI/PNG преобразуются собственным кодеком ModKit без RangerTools и Pillow.
+`0_32` точен по RGBA; `0_16` и `2` используют подтверждённое квантование.
+GI типов `1/3/4` и нулевой холст остаются read-only/passthrough с `unsupported`.
 
 HAI поддерживает только `info`, `list` и `verify`. Альтернативный PKG может получить `unsupported`; не преобразовывать его автоматически.
 
@@ -79,4 +84,4 @@ python -B srhd.py manifest "<MOD>" -o "<OUT>/MyMod.manifest.json"
 
 ## Python API
 
-Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `inspect_gai`, `inspect_hai`, `inspect_pkg`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1`.
+Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `RgbaImage`, `inspect_gi`, `read_gi`, `write_gi`, `read_png`, `write_png`, `verify_gi`, `inspect_gai`, `inspect_hai`, `inspect_pkg`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1`.

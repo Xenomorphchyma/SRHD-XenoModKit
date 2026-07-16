@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .files import sha256_file
+from .image_codec import UnsupportedImageFormat, inspect_gi, verify_gi
 
 
 GAI_MAGIC = b"gai\0"
@@ -832,19 +833,26 @@ def build_pkg(
 def inspect_resource(path: str | Path, *, listing: bool = False) -> dict[str, Any]:
     path = Path(path).resolve()
     extension = path.suffix.casefold()
-    if extension == ".gai":
+    if extension == ".gi":
+        info = inspect_gi(path)
+    elif extension == ".gai":
         info = inspect_gai(path)
     elif extension == ".hai":
         info = inspect_hai(path)
     elif extension == ".pkg":
         info = inspect_pkg(path)
     else:
-        raise ValueError("Поддерживаются ресурсы GAI, HAI и PKG")
+        raise ValueError("Поддерживаются ресурсы GI, GAI, HAI и PKG")
     return info.listing() if listing else info.summary()
 
 
 def verify_resource(path: str | Path) -> dict[str, Any]:
     path = Path(path).resolve()
+    if path.suffix.casefold() == ".gi":
+        try:
+            return verify_gi(path)
+        except UnsupportedImageFormat as exc:
+            raise UnsupportedResourceFormat(str(exc)) from exc
     if path.suffix.casefold() == ".pkg":
         return inspect_pkg(path).verify()
     value = inspect_resource(path)

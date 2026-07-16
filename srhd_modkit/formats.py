@@ -29,7 +29,7 @@ class FormatSpec:
 # "handling" is deliberately conservative.  A binary format is not marked as
 # convertible unless the local toolchain has been exercised successfully.
 FORMAT_SPECS: tuple[FormatSpec, ...] = (
-    FormatSpec("GI image", (".gi",), "image", "convertible", "RangerTools", "png", b"gi\0\0"),
+    FormatSpec("GI image", (".gi",), "image", "headless", "SRHD ModKit", "png", b"gi\0\0"),
     FormatSpec("GAI animation", (".gai",), "animation", "headless", "SRHD ModKit", "gi", b"gai\0"),
     FormatSpec(
         "HAI animation/image",
@@ -44,7 +44,7 @@ FORMAT_SPECS: tuple[FormatSpec, ...] = (
     FormatSpec("compiled Ranger script", (".scr",), "script-binary", "headless", "SRHD ModKit + RScript", "rson"),
     FormatSpec("RSON script project", (".rson",), "structured-text", "headless", "SRHD ModKit + RScript", "scr/svr"),
     FormatSpec("SVR script project", (".svr",), "script-project", "headless", "RScript", "rson"),
-    FormatSpec("PNG image", (".png",), "image", "convertible", automatic_conversion="gi", signature=b"\x89PNG\r\n\x1a\n"),
+    FormatSpec("PNG image", (".png",), "image", "headless", "SRHD ModKit", "gi", b"\x89PNG\r\n\x1a\n"),
     FormatSpec("JPEG image", (".jpg", ".jpeg"), "image", "standard", signature=b"\xff\xd8\xff"),
     FormatSpec("BMP image", (".bmp",), "image", "standard", signature=b"BM"),
     FormatSpec("DirectDraw Surface", (".dds",), "image", "standard", signature=b"DDS "),

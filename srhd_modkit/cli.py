@@ -349,6 +349,11 @@ def cmd_resource_info(args: argparse.Namespace) -> int:
         print_json(result)
     else:
         print(f"Формат: {result['format']}; размер: {human_size(result['size'])}")
+        if result["format"] == "GI image":
+            print(
+                f"Размер: {result['width']} × {result['height']}; "
+                f"тип: {result['frame_type']}; слоёв: {result['layer_count']}"
+            )
         if result["format"].startswith(("GAI", "HAI")):
             print(f"Кадров: {result['frame_count']}; размер: {result['width']} × {result['height']}")
         if result["format"] == "HAI animation/image":
@@ -375,13 +380,20 @@ def cmd_resource_list(args: argparse.Namespace) -> int:
                 f"{item['index']:4}  {human_size(item['uncompressed_size']):>10}  "
                 f"{human_size(item['compressed_size']):>10}  {item['name']}"
             )
-    else:
+    elif "frames" in result:
         print(f"Кадров: {len(result['frames'])}")
         for item in result["frames"]:
             dimensions = ""
             if "width" in item:
                 dimensions = f"  {item['width']}×{item['height']}"
             print(f"{item['index']:4}  {item['offset']:10}  {human_size(item['size']):>10}{dimensions}")
+    else:
+        print(f"Слоёв GI: {len(result['layers'])}")
+        for item in result["layers"]:
+            print(
+                f"{item['index']:4}  {item['offset']:10}  {human_size(item['size']):>10}  "
+                f"{item['width']}×{item['height']}"
+            )
     return 0
 
 
@@ -395,7 +407,7 @@ def cmd_resource_verify(args: argparse.Namespace) -> int:
             f"{human_size(result['verified_uncompressed_size'])}"
         )
     else:
-        print(f"{result['format']} корректен: структура и границы кадров проверены.")
+        print(f"{result['format']} корректен: структура и границы данных проверены.")
     return 0
 
 
@@ -1512,7 +1524,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.3")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.4")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -1615,7 +1627,7 @@ def build_parser() -> argparse.ArgumentParser:
     formats.add_argument("--json", action="store_true")
     formats.set_defaults(func=cmd_formats)
 
-    resource = sub.add_parser("resource", help="Headless-анализ GAI, HAI и PKG")
+    resource = sub.add_parser("resource", help="Headless-анализ GI, GAI, HAI и PKG")
     resource_sub = resource.add_subparsers(dest="resource_command", required=True)
 
     resource_info = resource_sub.add_parser("info", help="Проверить заголовок и показать сводку ресурса")
@@ -1623,12 +1635,12 @@ def build_parser() -> argparse.ArgumentParser:
     resource_info.add_argument("--json", action="store_true")
     resource_info.set_defaults(func=cmd_resource_info)
 
-    resource_list = resource_sub.add_parser("list", help="Показать кадры GAI/HAI или файлы PKG")
+    resource_list = resource_sub.add_parser("list", help="Показать слои GI, кадры GAI/HAI или файлы PKG")
     resource_list.add_argument("source")
     resource_list.add_argument("--json", action="store_true")
     resource_list.set_defaults(func=cmd_resource_list)
 
-    resource_verify = resource_sub.add_parser("verify", help="Полностью проверить индексы и ZL02 в PKG")
+    resource_verify = resource_sub.add_parser("verify", help="Глубоко проверить поддерживаемый ресурс")
     resource_verify.add_argument("source")
     resource_verify.add_argument("--json", action="store_true")
     resource_verify.set_defaults(func=cmd_resource_verify)
@@ -1660,7 +1672,7 @@ def build_parser() -> argparse.ArgumentParser:
     resource_build_pkg.add_argument("--json", action="store_true")
     resource_build_pkg.set_defaults(func=cmd_resource_build_pkg)
 
-    tools = sub.add_parser("tools", help="Проверить доступность локальных конвертеров и редакторов")
+    tools = sub.add_parser("tools", help="Проверить доступность внешних кодеков и редакторов")
     tools.add_argument("--tools-root")
     tools.add_argument("--json", action="store_true")
     tools.set_defaults(func=cmd_tools)

@@ -8,4 +8,4 @@
 
 Внутреннее имя библиотеки и CLI остаётся `SRHD ModKit` для совместимости.
 
-Сторонние кодеки BlockParEditor, RScript и RangerTools не являются авторской разработкой Xenomorphchyma. Их происхождение и контрольные суммы указаны в [THIRD_PARTY_TOOLS_RU.md](THIRD_PARTY_TOOLS_RU.md).
+Сторонние BlockParEditor и RScript не являются авторской разработкой Xenomorphchyma. Их происхождение и контрольные суммы указаны в [THIRD_PARTY_TOOLS_RU.md](THIRD_PARTY_TOOLS_RU.md). Нативная реализация команд `GI ↔ PNG` входит в SRHD XenoModKit.

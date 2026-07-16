@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 from .files import sha256_file
 from .formats import inspect_file
+from .image_codec import read_gi, read_png, write_gi, write_png
 from .blockpar import load_blockpar
 from .scripts import inspect_scr, load_rson
 from .runtime_lint import lint_rson_runtime
@@ -176,18 +177,6 @@ class Toolchain:
         if blockpar_original.is_file():
             ensure_legacy_codepage_executable(blockpar_original, blockpar_codec)
         self.tools = {
-            "gi-to-png": Tool(
-                "gi-to-png",
-                self.tools_root / "RangerTools" / "gi-to-png_ranger-tools.exe",
-                "Проверенное автоматическое преобразование GI в PNG",
-                True,
-            ),
-            "png-to-gi": Tool(
-                "png-to-gi",
-                self.tools_root / "RangerTools" / "png-to-gi_ranger-tools.exe",
-                "Проверенное автоматическое преобразование PNG в GI",
-                True,
-            ),
             "blockpar": Tool(
                 "blockpar",
                 blockpar_codec,
@@ -269,7 +258,6 @@ class Toolchain:
             preview = ", ".join(str(path) for path in existing[:3])
             raise FileExistsError(f"Результат уже существует (используйте --overwrite): {preview}")
 
-        tool = self.require({"gi-png": "gi-to-png", "png-gi": "png-to-gi"}[direction])
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         converted: list[ConversionItem] = []
         with tempfile.TemporaryDirectory(prefix=".srhd-convert-", dir=output_dir.parent) as temp_name:
@@ -279,24 +267,23 @@ class Toolchain:
                 relative = destination.relative_to(output_dir)
                 stage_dir = (stage_root / relative.parent)
                 stage_dir.mkdir(parents=True, exist_ok=True)
-                command = [str(tool.path), "-o", str(stage_dir)]
-                if direction == "png-gi":
-                    command.extend(["-t", gi_mode])
-                command.append(str(source))
-                completed = subprocess.run(
-                    command,
-                    cwd=tool.path.parent,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=300,
-                    check=False,
-                )
                 stage_file = stage_dir / source.with_suffix(target_ext).name
-                if completed.returncode != 0 or not stage_file.is_file():
-                    details = (completed.stderr or completed.stdout).strip()
-                    raise RuntimeError(f"{tool.name} не создал корректный результат для {source}: {details}")
+                try:
+                    if direction == "gi-png":
+                        source_image = read_gi(source)
+                        write_png(source_image, stage_file)
+                        if read_png(stage_file) != source_image:
+                            raise RuntimeError("PNG не прошёл пиксельную обратную проверку")
+                    else:
+                        source_image = read_png(source)
+                        write_gi(source_image, stage_file, gi_mode)
+                        rebuilt = read_gi(stage_file)
+                        if (rebuilt.width, rebuilt.height) != (source_image.width, source_image.height):
+                            raise RuntimeError("GI изменил размер изображения при обратной проверке")
+                        if gi_mode == "0_32" and rebuilt != source_image:
+                            raise RuntimeError("GI 0_32 не прошёл пиксельную обратную проверку")
+                except Exception as exc:
+                    raise RuntimeError(f"Нативный GI/PNG-кодек не обработал {source}: {exc}") from exc
                 inspected = inspect_file(stage_file)
                 if inspected["signature_valid"] is False:
                     raise RuntimeError(f"Неверная сигнатура результата: {stage_file}")

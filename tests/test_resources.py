@@ -14,7 +14,10 @@ from srhd_modkit.resources import (
     inspect_gai,
     inspect_hai,
     inspect_pkg,
+    inspect_resource,
+    verify_resource,
 )
+from srhd_modkit.image_codec import RgbaImage, encode_gi
 
 
 def _gi(width: int, height: int, marker: int = 0) -> bytes:
@@ -52,6 +55,15 @@ def _pkg(payload: bytes, name: str = "Frame.gi") -> bytes:
 
 
 class ResourceTests(unittest.TestCase):
+    def test_gi_is_available_through_resource_api(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "image.gi"
+            path.write_bytes(encode_gi(RgbaImage(2, 3, bytes((1, 2, 3, 4)) * 6), "0_32"))
+            info = inspect_resource(path, listing=True)
+            self.assertEqual((info["width"], info["height"], info["frame_type"]), (2, 3, 0))
+            self.assertEqual(len(info["layers"]), 1)
+            self.assertTrue(verify_resource(path)["verified"])
+
     def test_gai_lists_and_extracts_embedded_gi_frames(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

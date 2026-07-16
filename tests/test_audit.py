@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from srhd_modkit.audit import AuditProfile, audit_mod
+from srhd_modkit.image_codec import RgbaImage, encode_gi
 from srhd_modkit.toolchain import Toolchain
 
 
@@ -18,6 +19,20 @@ def _mod(root: Path) -> None:
 
 
 class AuditTests(unittest.TestCase):
+    def test_release_deeply_checks_gi_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            path = root / "DATA" / "image.gi"
+            payload = bytearray(encode_gi(RgbaImage(2, 1, bytes((1, 2, 3, 4)) * 2), "0_32"))
+            payload.pop()
+            path.write_bytes(payload)
+
+            report = audit_mod(root, profile="release")
+            check = next(item for item in report.checks if item.name == "resource-integrity")
+            self.assertEqual(check.status, "issues")
+            self.assertTrue(any(item.code == "resource-invalid" for item in check.issues))
+
     def test_unknown_format_is_passthrough_but_coverage_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"

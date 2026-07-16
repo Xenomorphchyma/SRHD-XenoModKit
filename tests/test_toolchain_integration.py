@@ -11,6 +11,7 @@ from pathlib import Path
 
 from srhd_modkit.cli import main
 from srhd_modkit.formats import inspect_file
+from srhd_modkit.image_codec import RgbaImage, read_png, write_png
 from srhd_modkit.scripts import inspect_scr, load_rson
 from srhd_modkit.toolchain import Toolchain, _replace_cross_device_safe
 
@@ -19,34 +20,23 @@ class ToolchainIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.chain = Toolchain()
-        cls.available = all(cls.chain.tools[name].path.is_file() for name in ("gi-to-png", "png-to-gi"))
-        try:
-            from PIL import Image  # noqa: F401
-
-            cls.pillow = True
-        except ImportError:
-            cls.pillow = False
 
     def test_argb8888_png_gi_png_roundtrip_is_pixel_exact(self) -> None:
-        if not self.available:
-            self.skipTest("RangerTools не найдены")
-        if not self.pillow:
-            self.skipTest("Pillow нужен только интеграционному тесту пикселей")
-        from PIL import Image
-
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             source = root / "source" / "nested" / "sample.png"
             source.parent.mkdir(parents=True)
-            image = Image.new("RGBA", (4, 3))
-            image.putdata(
-                [
+            pixels = bytes(
+                component
+                for pixel in (
                     (255, 0, 0, 255), (0, 255, 0, 192), (0, 0, 255, 128), (1, 2, 3, 0),
                     (12, 34, 56, 78), (90, 87, 65, 43), (22, 44, 66, 88), (99, 111, 123, 135),
                     (254, 253, 252, 251), (127, 126, 125, 124), (4, 8, 16, 32), (64, 128, 192, 255),
-                ]
+                )
+                for component in pixel
             )
-            image.save(source)
+            image = RgbaImage(4, 3, pixels)
+            write_png(image, source)
             gi_root = root / "gi"
             png_root = root / "decoded"
             gi_items = self.chain.convert([root / "source"], gi_root, direction="png-gi", gi_mode="0_32")
@@ -55,24 +45,30 @@ class ToolchainIntegrationTests(unittest.TestCase):
             self.assertTrue(gi_path.is_file())
             self.assertTrue(inspect_file(gi_path)["signature_valid"])
             self.chain.convert([gi_root], png_root, direction="gi-png")
-            decoded = Image.open(png_root / "nested" / "sample.png").convert("RGBA")
-            self.assertEqual(image.tobytes(), decoded.tobytes())
+            decoded = read_png(png_root / "nested" / "sample.png")
+            self.assertEqual(image, decoded)
 
     def test_existing_output_is_not_silently_overwritten(self) -> None:
-        if not self.available or not self.pillow:
-            self.skipTest("Интеграционные зависимости не найдены")
-        from PIL import Image
-
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             source = root / "source.png"
             destination = root / "output"
             destination.mkdir()
-            Image.new("RGBA", (1, 1), (1, 2, 3, 4)).save(source)
+            write_png(RgbaImage(1, 1, bytes((1, 2, 3, 4))), source)
             (destination / "source.gi").write_bytes(b"keep")
             with self.assertRaises(FileExistsError):
                 self.chain.convert([source], destination, direction="png-gi")
             self.assertEqual((destination / "source.gi").read_bytes(), b"keep")
+
+    def test_gi_conversion_needs_no_external_tools_root(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "source.png"
+            write_png(RgbaImage(2, 1, bytes((1, 2, 3, 4)) * 2), source)
+            chain = Toolchain(root / "tools-that-do-not-exist")
+            chain.convert([source], root / "gi", direction="png-gi", gi_mode="0_32")
+            chain.convert([root / "gi" / "source.gi"], root / "png", direction="gi-png")
+            self.assertEqual(read_png(root / "png" / "source.png"), read_png(source))
 
     def test_gui_editor_is_disabled_by_default(self) -> None:
         previous = os.environ.pop("SRHD_MODKIT_ALLOW_GUI", None)
@@ -110,14 +106,10 @@ class ToolchainIntegrationTests(unittest.TestCase):
             self.assertFalse(staged.exists())
 
     def test_all_gi_encoding_modes_produce_decodable_images(self) -> None:
-        if not self.available or not self.pillow:
-            self.skipTest("Интеграционные зависимости не найдены")
-        from PIL import Image
-
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             source = root / "modes.png"
-            Image.new("RGBA", (7, 5), (23, 91, 177, 149)).save(source)
+            write_png(RgbaImage(7, 5, bytes((23, 91, 177, 149)) * 35), source)
             for mode in ("0_32", "0_16", "2"):
                 with self.subTest(mode=mode):
                     gi_root = root / f"gi-{mode}"

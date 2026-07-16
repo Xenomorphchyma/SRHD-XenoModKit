@@ -580,10 +580,12 @@ def _text_check(context: AuditContext) -> AuditCheck:
 def _resource_integrity_check(context: AuditContext) -> AuditCheck:
     name = "resource-integrity"
     resources = [
-        path for path in iter_files(context.root) if path.suffix.casefold() in {".gai", ".hai", ".pkg"}
+        path
+        for path in iter_files(context.root)
+        if path.suffix.casefold() in {".gi", ".gai", ".hai", ".pkg"}
     ]
     if not resources:
-        return AuditCheck(name, "skipped", details={"reason": "GAI/HAI/PKG не найдены"})
+        return AuditCheck(name, "skipped", details={"reason": "GI/GAI/HAI/PKG не найдены"})
     issues: list[AuditIssue] = []
     checked: list[str] = []
     unsupported: list[dict[str, str]] = []
