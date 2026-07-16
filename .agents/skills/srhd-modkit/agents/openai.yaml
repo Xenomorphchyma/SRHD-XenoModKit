@@ -1,0 +1,4 @@
+interface:
+  display_name: "SRHD ModKit"
+  short_description: "Безопасная headless-работа с модами SRHD"
+  default_prompt: "Используй $srhd-modkit для проверки и безопасной сборки этого мода Space Rangers HD."

@@ -1,0 +1,76 @@
+# Команды SRHD ModKit 0.8.0
+
+Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
+
+## Аудит и релиз
+
+```powershell
+python -B srhd.py audit "<MOD>" --profile dev --json
+python -B srhd.py audit "<MOD>" --profile release --json
+python -B srhd.py release check "<MOD>" --json
+python -B srhd.py release build "<MOD>" "<RELEASES>/MyMod.zip" --json
+```
+
+Дополнения: `--warnings-as-errors`, `--allow CODE`, `--allow CODE:GLOB`, `--exclude GLOB`, `--overwrite`. Служебные JSON создаются рядом с ZIP.
+
+## DAT / BlockPar
+
+```powershell
+python -B srhd.py dat tree "<WORK>/Main.dat" --json
+python -B srhd.py dat get "<WORK>/Main.dat" Data/Script --json
+python -B srhd.py dat decode "<WORK>/Main.dat" "<TEMP>/Main.txt"
+python -B srhd.py dat encode "<TEMP>/Main.txt" "<OUT>/Main.dat"
+python -B srhd.py dat set "<WORK>/Main.dat" "<OUT>/Main.dat" --node Data/SE/Ship --key Cost --value 1500
+python -B srhd.py dat patch "<WORK>/Main.dat" "<OUT>/Main.dat" "<WORK>/patch.json"
+python -B srhd.py dat validate "<OUT>/Main.dat" --json
+```
+
+Для создания отсутствующего параметра добавлять `--create`; для всех одноимённых — `--all`. Путь повторного узла задавать как `Name[2]`.
+
+## Скрипты
+
+```powershell
+python -B srhd.py script audit-mod "<MOD>" --json
+python -B srhd.py script lint-runtime "<MOD>" --strict --json
+python -B srhd.py script info "<WORK>/Script.rson" --json
+python -B srhd.py script validate "<WORK>/Script.rson" --json
+python -B srhd.py script search "<WORK>/Script.rson" ScriptRun --json
+python -B srhd.py script set-code "<WORK>/Script.rson" "<OUT>/Script.rson" --id 42 --field Code --code-file "<WORK>/code.txt"
+python -B srhd.py script set-events "<WORK>/Script.rson" "<OUT>/Script.rson" --id 17 --event t_OnEnteringForm
+python -B srhd.py script build "<OUT>/Script.rson" --scr "<OUT>/Script.scr" --lang "<OUT>/Lang.txt"
+python -B srhd.py script inspect-scr "<OUT>/Script.scr" --json
+```
+
+Также доступны `set-field`, `clone-object`, `add-link`, `delete-link`, `delete-object`, `register` и `convert`. Перед точечным изменением смотреть `python -B srhd.py script <command> --help`.
+
+## Ресурсы
+
+```powershell
+python -B srhd.py formats "<MOD>" --json
+python -B srhd.py resource info "<WORK>/anim.gai" --json
+python -B srhd.py resource list "<WORK>/resources.pkg" --json
+python -B srhd.py resource verify "<WORK>/resources.pkg" --json
+python -B srhd.py resource extract "<WORK>/resources.pkg" "<TEMP>/unpacked"
+python -B srhd.py resource build-gai "<TEMP>/frames" -o "<OUT>/anim.gai" --template "<WORK>/anim.gai"
+python -B srhd.py resource build-pkg "<TEMP>/tree" "<OUT>/resources.pkg" --folder Mods --folder Section --folder ModName
+python -B srhd.py convert gi-png "<WORK>/Images" -o "<TEMP>/PNG"
+python -B srhd.py convert png-gi "<TEMP>/PNG" -o "<OUT>/Images" --mode 0_32
+```
+
+HAI поддерживает только `info`, `list` и `verify`. Альтернативный PKG может получить `unsupported`; не преобразовывать его автоматически.
+
+## Совместимость и служебные операции
+
+```powershell
+python -B srhd.py compat "<GAME>/Mods/ModCFG.txt" --mods-root "<GAME>/Mods" --json
+python -B srhd.py modcfg "<GAME>/Mods/ModCFG.txt" --mods-root "<GAME>/Mods" --json
+python -B srhd.py stage "<MODS>/Original" "<WORK>/Copy" --json
+python -B srhd.py compare "<MODS>/Old" "<MODS>/New" --json
+python -B srhd.py manifest "<MOD>" -o "<OUT>/MyMod.manifest.json"
+```
+
+`stage` требует отсутствующую папку назначения и проверяет каждый скопированный файл по SHA-256.
+
+## Python API
+
+Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `inspect_gai`, `inspect_hai`, `inspect_pkg`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`.
