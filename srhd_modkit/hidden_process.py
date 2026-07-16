@@ -12,12 +12,31 @@ from pathlib import Path
 from typing import Sequence
 
 
+_HIDDEN_DESKTOP_PREFIX = "SRHDModKit_"
+_LEGACY_TOOL_MUTEX = r"Local\SRHD_XenoModKit_LegacyGUI_v1"
+
+_CREATE_SUSPENDED = 0x00000004
+_CREATE_UNICODE_ENVIRONMENT = 0x00000400
+_EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+_WAIT_TIMEOUT = 0x00000102
+_WAIT_FAILED = 0xFFFFFFFF
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_SYNCHRONIZE = 0x00100000
+
+
 @dataclass(frozen=True)
 class HiddenProcessResult:
     exit_code: int
     forced_after_outputs: bool
     elapsed_seconds: float
     window_text: tuple[str, ...] = ()
+    queue_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -66,6 +85,76 @@ class PROCESS_INFORMATION(ctypes.Structure):
         ("hThread", wintypes.HANDLE),
         ("dwProcessId", wintypes.DWORD),
         ("dwThreadId", wintypes.DWORD),
+    ]
+
+
+class STARTUPINFOEX(ctypes.Structure):
+    _fields_ = [
+        ("StartupInfo", STARTUPINFO),
+        ("lpAttributeList", ctypes.c_void_p),
+    ]
+
+
+class IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class THREADENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", wintypes.LONG),
+        ("tpDeltaPri", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
     ]
 
 
@@ -139,55 +228,192 @@ def run_on_hidden_desktop(
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
     kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
 
-    desktop_name = f"SRHDModKit_{uuid.uuid4().hex}"
-    desktop = user32.CreateDesktopW(desktop_name, None, None, 0, 0x000F01FF, None)
-    if not desktop:
-        raise ctypes.WinError(ctypes.get_last_error())
-    startup = STARTUPINFO()
-    startup.cb = ctypes.sizeof(startup)
-    startup.lpDesktop = f"WinSta0\\{desktop_name}"
-    startup.dwFlags = 0x00000001  # STARTF_USESHOWWINDOW
-    startup.wShowWindow = 0  # SW_HIDE
+    initialize_attributes = getattr(kernel32, "InitializeProcThreadAttributeList", None)
+    update_attribute = getattr(kernel32, "UpdateProcThreadAttribute", None)
+    delete_attributes = getattr(kernel32, "DeleteProcThreadAttributeList", None)
+    if initialize_attributes is not None:
+        initialize_attributes.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)]
+        initialize_attributes.restype = wintypes.BOOL
+    if update_attribute is not None:
+        update_attribute.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        update_attribute.restype = wintypes.BOOL
+    if delete_attributes is not None:
+        delete_attributes.argtypes = [ctypes.c_void_p]
+        delete_attributes.restype = None
+
     process = PROCESS_INFORMATION()
-    command = ctypes.create_unicode_buffer(subprocess.list2cmdline([str(application), *map(str, arguments)]))
-    started = time.monotonic()
-    forced = False
-    captured_window_text: tuple[str, ...] = ()
-    last_signature: tuple[tuple[int, int], ...] | None = None
-    stable_since: float | None = None
-    last_window_probe = started
-    next_button_action = 0
-    button_diagnostics = ["not found" for _ in control_actions]
-    button_action_ready_at = (
-        started + max(0.0, control_actions[0].delay_seconds)
-        if control_actions
-        else started
-    )
-    action_dispatched = False
-    last_action_dispatch = started
+    mutex = wintypes.HANDLE()
+    mutex_acquired = False
+    desktop = wintypes.HANDLE()
+    job = wintypes.HANDLE()
+    process_in_job = False
+    queue_started = time.monotonic()
+    queue_seconds = 0.0
+    started = queue_started
+
+    def terminate_process_tree(exit_code: int) -> None:
+        if not process.hProcess:
+            return
+        terminated = False
+        if job and process_in_job:
+            terminated = bool(kernel32.TerminateJobObject(job, exit_code))
+        if not terminated:
+            kernel32.TerminateProcess(process.hProcess, exit_code)
+        kernel32.WaitForSingleObject(process.hProcess, 5000)
+
     try:
-        created = kernel32.CreateProcessW(
-            str(application),
-            command,
-            None,
-            None,
-            False,
-            0x00000400,  # CREATE_UNICODE_ENVIRONMENT
-            None,
-            str(cwd),
-            ctypes.byref(startup),
-            ctypes.byref(process),
-        )
-        if not created:
+        mutex = kernel32.CreateMutexW(None, False, _LEGACY_TOOL_MUTEX)
+        if not mutex:
             raise ctypes.WinError(ctypes.get_last_error())
+        while True:
+            mutex_wait = kernel32.WaitForSingleObject(mutex, 100)
+            if mutex_wait in {_WAIT_OBJECT_0, _WAIT_ABANDONED}:
+                break
+            if mutex_wait != _WAIT_TIMEOUT:
+                raise ctypes.WinError(ctypes.get_last_error())
+        mutex_acquired = True
+        queue_seconds = time.monotonic() - queue_started
+
+        desktop_name = f"{_HIDDEN_DESKTOP_PREFIX}{uuid.uuid4().hex}"
+        desktop = user32.CreateDesktopW(desktop_name, None, None, 0, 0x000F01FF, None)
+        if not desktop:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            job,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        startup = STARTUPINFO()
+        startup.cb = ctypes.sizeof(startup)
+        startup.lpDesktop = f"WinSta0\\{desktop_name}"
+        startup.dwFlags = 0x00000001  # STARTF_USESHOWWINDOW
+        startup.wShowWindow = 0  # SW_HIDE
+        startup_pointer = ctypes.byref(startup)
+        create_flags = _CREATE_UNICODE_ENVIRONMENT | _CREATE_SUSPENDED
+
+        # On current Windows, attach the process to the job atomically at
+        # CreateProcess time. The suspended AssignProcess fallback supports
+        # older systems while preventing the child from spawning descendants.
+        attribute_buffer = None
+        attribute_initialized = False
+        job_handles = None
+        atomic_job = False
+        if initialize_attributes and update_attribute and delete_attributes:
+            attribute_size = ctypes.c_size_t()
+            initialize_attributes(None, 1, 0, ctypes.byref(attribute_size))
+            if attribute_size.value:
+                attribute_buffer = ctypes.create_string_buffer(attribute_size.value)
+                attribute_pointer = ctypes.cast(attribute_buffer, ctypes.c_void_p)
+                if initialize_attributes(attribute_pointer, 1, 0, ctypes.byref(attribute_size)):
+                    attribute_initialized = True
+                    job_handles = (wintypes.HANDLE * 1)(job)
+                    if update_attribute(
+                        attribute_pointer,
+                        0,
+                        _PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                        ctypes.cast(job_handles, ctypes.c_void_p),
+                        ctypes.sizeof(job_handles),
+                        None,
+                        None,
+                    ):
+                        startup_ex = STARTUPINFOEX()
+                        startup_ex.StartupInfo = startup
+                        startup_ex.StartupInfo.cb = ctypes.sizeof(startup_ex)
+                        startup_ex.lpAttributeList = attribute_pointer
+                        startup_pointer = ctypes.cast(ctypes.byref(startup_ex), ctypes.POINTER(STARTUPINFO))
+                        create_flags |= _EXTENDED_STARTUPINFO_PRESENT
+                        atomic_job = True
+
+        command = ctypes.create_unicode_buffer(subprocess.list2cmdline([str(application), *map(str, arguments)]))
+        create_error = 0
+        try:
+            created = kernel32.CreateProcessW(
+                str(application),
+                command,
+                None,
+                None,
+                False,
+                create_flags,
+                None,
+                str(cwd),
+                startup_pointer,
+                ctypes.byref(process),
+            )
+            if not created:
+                create_error = ctypes.get_last_error()
+        finally:
+            if attribute_initialized:
+                delete_attributes(ctypes.cast(attribute_buffer, ctypes.c_void_p))
+        if not created:
+            raise ctypes.WinError(create_error)
+        process_in_job = atomic_job
+        if not process_in_job:
+            if not kernel32.AssignProcessToJobObject(job, process.hProcess):
+                error = ctypes.get_last_error()
+                kernel32.TerminateProcess(process.hProcess, 125)
+                kernel32.WaitForSingleObject(process.hProcess, 5000)
+                raise ctypes.WinError(error)
+            process_in_job = True
+        if kernel32.ResumeThread(process.hThread) == 0xFFFFFFFF:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        started = time.monotonic()
+        forced = False
+        captured_window_text: tuple[str, ...] = ()
+        last_signature: tuple[tuple[int, int], ...] | None = None
+        stable_since: float | None = None
+        last_window_probe = started
+        next_button_action = 0
+        button_diagnostics = ["not found" for _ in control_actions]
+        button_action_ready_at = (
+            started + max(0.0, control_actions[0].delay_seconds)
+            if control_actions
+            else started
+        )
+        action_dispatched = False
+        last_action_dispatch = started
+
         while True:
             wait = kernel32.WaitForSingleObject(process.hProcess, 100)
             now = time.monotonic()
-            if wait == 0:  # process exited
+            if wait == _WAIT_OBJECT_0:  # process exited
                 break
+            if wait == _WAIT_FAILED:
+                raise ctypes.WinError(ctypes.get_last_error())
             if next_button_action < len(control_actions) and now >= button_action_ready_at:
                 action = control_actions[next_button_action]
                 confirmation_requested = (
@@ -236,8 +462,7 @@ def run_on_hidden_desktop(
                     stable_since = stable_since or now
                     if now - stable_since >= settle_seconds:
                         captured_window_text = _read_desktop_window_text(user32, desktop)
-                        kernel32.TerminateProcess(process.hProcess, 0)
-                        kernel32.WaitForSingleObject(process.hProcess, 5000)
+                        terminate_process_tree(0)
                         forced = True
                         break
                 else:
@@ -251,16 +476,14 @@ def run_on_hidden_desktop(
                 window_text = _read_desktop_window_text(user32, desktop)
                 combined = "\n".join(window_text).casefold()
                 if any(pattern.casefold() in combined for pattern in abort_window_patterns):
-                    kernel32.TerminateProcess(process.hProcess, 1)
-                    kernel32.WaitForSingleObject(process.hProcess, 5000)
+                    terminate_process_tree(1)
                     details = "; ".join(window_text)
                     raise RuntimeError(f"Процесс показал окно ошибки: {details}")
             if timeout is not None and now - started >= timeout:
                 captured_window_text = _read_desktop_window_text(user32, desktop)
                 windows = "; ".join(_read_desktop_window_diagnostics(user32, desktop))
                 controls = "; ".join(_read_hidden_dialog_controls(user32, desktop))
-                kernel32.TerminateProcess(process.hProcess, 124)
-                kernel32.WaitForSingleObject(process.hProcess, 5000)
+                terminate_process_tree(124)
                 details = "; ".join(captured_window_text)
                 suffix = f"; скрытое окно: {details}" if details else ""
                 window_suffix = f"; верхние окна: {windows}" if windows else ""
@@ -283,13 +506,284 @@ def run_on_hidden_desktop(
             forced_after_outputs=forced,
             elapsed_seconds=time.monotonic() - started,
             window_text=captured_window_text,
+            queue_seconds=queue_seconds,
         )
     finally:
+        # Explicitly terminate the job even after the main process exits: a
+        # legacy executable must never leave helper processes behind. If the
+        # Python parent is killed before this block, KILL_ON_JOB_CLOSE performs
+        # the same cleanup when Windows closes the parent's job handle.
+        terminate_process_tree(125)
         if process.hThread:
             kernel32.CloseHandle(process.hThread)
         if process.hProcess:
             kernel32.CloseHandle(process.hProcess)
-        user32.CloseDesktop(desktop)
+        if job:
+            kernel32.CloseHandle(job)
+        if desktop:
+            user32.CloseDesktop(desktop)
+        if mutex_acquired:
+            kernel32.ReleaseMutex(mutex)
+        if mutex:
+            kernel32.CloseHandle(mutex)
+
+
+def inspect_hidden_processes() -> dict[str, object]:
+    """List active processes whose threads belong to an SRHD private desktop."""
+
+    if os.name != "nt":
+        raise OSError("Диагностика скрытых desktop доступна только в Windows")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.GetProcessWindowStation.restype = wintypes.HANDLE
+    user32.EnumDesktopsW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.LPARAM]
+    user32.EnumDesktopsW.restype = wintypes.BOOL
+    user32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    user32.OpenDesktopW.restype = wintypes.HANDLE
+    user32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.LPARAM]
+    user32.EnumDesktopWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    user32.CloseDesktop.restype = wintypes.BOOL
+    user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
+    user32.GetThreadDesktop.restype = wintypes.HANDLE
+    user32.GetUserObjectInformationW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetUserObjectInformationW.restype = wintypes.BOOL
+    _configure_snapshot_api(kernel32)
+
+    desktop_names: set[str] = set()
+    desktop_callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.LPWSTR, wintypes.LPARAM)
+
+    @desktop_callback_type
+    def desktop_callback(name: str, _parameter: int) -> bool:
+        if name.startswith(_HIDDEN_DESKTOP_PREFIX):
+            desktop_names.add(name)
+        return True
+
+    station = user32.GetProcessWindowStation()
+    if not station or not user32.EnumDesktopsW(station, desktop_callback, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    process_ids: dict[str, set[int]] = {name: set() for name in desktop_names}
+    window_callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    for name in sorted(desktop_names):
+        desktop = user32.OpenDesktopW(name, 0, False, 0x00000041)  # READOBJECTS | ENUMERATE
+        if not desktop:
+            continue
+        try:
+            @window_callback_type
+            def window_callback(window: int, _parameter: int, *, desktop_name: str = name) -> bool:
+                process_id = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(window, ctypes.byref(process_id))
+                if process_id.value:
+                    process_ids.setdefault(desktop_name, set()).add(int(process_id.value))
+                return True
+
+            user32.EnumDesktopWindows(desktop, window_callback, 0)
+        finally:
+            user32.CloseDesktop(desktop)
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
+    invalid_handle = ctypes.c_void_p(-1).value
+    if snapshot and snapshot != invalid_handle:
+        try:
+            entry = THREADENTRY32()
+            entry.dwSize = ctypes.sizeof(entry)
+            available = bool(kernel32.Thread32First(snapshot, ctypes.byref(entry)))
+            while available:
+                desktop = user32.GetThreadDesktop(entry.th32ThreadID)
+                name = _user_object_name(user32, desktop) if desktop else None
+                if name and name.startswith(_HIDDEN_DESKTOP_PREFIX):
+                    desktop_names.add(name)
+                    process_ids.setdefault(name, set()).add(int(entry.th32OwnerProcessID))
+                entry.dwSize = ctypes.sizeof(entry)
+                available = bool(kernel32.Thread32Next(snapshot, ctypes.byref(entry)))
+        finally:
+            kernel32.CloseHandle(snapshot)
+
+    process_snapshot = _snapshot_processes(kernel32)
+    desktops: list[dict[str, object]] = []
+    all_process_ids: set[int] = set()
+    for name in sorted(desktop_names, key=str.casefold):
+        processes: list[dict[str, object]] = []
+        for process_id in sorted(process_ids.get(name, ())):
+            all_process_ids.add(process_id)
+            details = process_snapshot.get(process_id, {"pid": process_id, "parent_pid": None, "name": None})
+            processes.append(details)
+        desktops.append({"name": name, "processes": processes})
+    return {
+        "schema": "srhd-modkit-process-audit-v1",
+        "status": "issues" if desktops else "passed",
+        "desktop_prefix": _HIDDEN_DESKTOP_PREFIX,
+        "desktop_count": len(desktops),
+        "process_count": len(all_process_ids),
+        "desktops": desktops,
+    }
+
+
+def terminate_hidden_processes() -> dict[str, object]:
+    """Terminate known legacy tools found on SRHD private desktops."""
+
+    before = inspect_hidden_processes()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    allowed = {
+        "rscript.exe",
+        "blockpareditor.exe",
+        "blockpareditor.legacy.exe",
+        "reseditor_hai128.exe",
+    }
+    targets: set[int] = set()
+    for desktop in before["desktops"]:
+        for process in desktop["processes"]:
+            targets.add(int(process["pid"]))
+
+    actions: list[dict[str, object]] = []
+    for process_id in sorted(targets):
+        handle = kernel32.OpenProcess(
+            _PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE,
+            False,
+            process_id,
+        )
+        if not handle:
+            actions.append(
+                {"pid": process_id, "status": "failed", "error": str(ctypes.WinError(ctypes.get_last_error()))}
+            )
+            continue
+        try:
+            executable = _query_process_image(kernel32, handle)
+            executable_name = Path(executable).name.casefold() if executable else None
+            if executable_name not in allowed:
+                actions.append(
+                    {
+                        "pid": process_id,
+                        "status": "skipped",
+                        "executable": executable,
+                        "reason": "Процесс на служебном desktop не является известным редактором SRHD",
+                    }
+                )
+                continue
+            if not kernel32.TerminateProcess(handle, 125):
+                actions.append(
+                    {
+                        "pid": process_id,
+                        "status": "failed",
+                        "executable": executable,
+                        "error": str(ctypes.WinError(ctypes.get_last_error())),
+                    }
+                )
+                continue
+            kernel32.WaitForSingleObject(handle, 5000)
+            actions.append({"pid": process_id, "status": "terminated", "executable": executable})
+        finally:
+            kernel32.CloseHandle(handle)
+
+    if targets:
+        time.sleep(0.2)
+    remaining = inspect_hidden_processes()
+    return {
+        "schema": "srhd-modkit-process-cleanup-v1",
+        "status": "passed" if remaining["desktop_count"] == 0 else "issues",
+        "before": before,
+        "actions": actions,
+        "remaining": remaining,
+    }
+
+
+def _configure_snapshot_api(kernel32: ctypes.WinDLL) -> None:
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
+    kernel32.Thread32First.restype = wintypes.BOOL
+    kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
+    kernel32.Thread32Next.restype = wintypes.BOOL
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+def _user_object_name(user32: ctypes.WinDLL, handle: wintypes.HANDLE) -> str | None:
+    needed = wintypes.DWORD()
+    user32.GetUserObjectInformationW(handle, 2, None, 0, ctypes.byref(needed))  # UOI_NAME
+    if not needed.value:
+        return None
+    characters = max(1, (needed.value + ctypes.sizeof(ctypes.c_wchar) - 1) // ctypes.sizeof(ctypes.c_wchar))
+    buffer = ctypes.create_unicode_buffer(characters)
+    if not user32.GetUserObjectInformationW(handle, 2, buffer, needed.value, ctypes.byref(needed)):
+        return None
+    return buffer.value
+
+
+def _snapshot_processes(kernel32: ctypes.WinDLL) -> dict[int, dict[str, object]]:
+    result: dict[int, dict[str, object]] = {}
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+        return result
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        available = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
+        while available:
+            process_id = int(entry.th32ProcessID)
+            handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, process_id)
+            executable = None
+            if handle:
+                try:
+                    executable = _query_process_image(kernel32, handle)
+                finally:
+                    kernel32.CloseHandle(handle)
+            result[process_id] = {
+                "pid": process_id,
+                "parent_pid": int(entry.th32ParentProcessID),
+                "name": entry.szExeFile,
+                "executable": executable,
+            }
+            entry.dwSize = ctypes.sizeof(entry)
+            available = bool(kernel32.Process32NextW(snapshot, ctypes.byref(entry)))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return result
+
+
+def _query_process_image(kernel32: ctypes.WinDLL, handle: wintypes.HANDLE) -> str | None:
+    size = wintypes.DWORD(32768)
+    buffer = ctypes.create_unicode_buffer(size.value)
+    if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+        return None
+    return buffer.value
 
 
 def _read_desktop_window_text(user32: ctypes.WinDLL, desktop: wintypes.HANDLE) -> tuple[str, ...]:

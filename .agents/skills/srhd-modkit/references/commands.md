@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.8.4
+# Команды SRHD ModKit 0.8.5
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -78,10 +78,12 @@ python -B srhd.py modcfg "<GAME>/Mods/ModCFG.txt" --mods-root "<GAME>/Mods" --js
 python -B srhd.py stage "<MODS>/Original" "<WORK>/Copy" --json
 python -B srhd.py compare "<MODS>/Old" "<MODS>/New" --json
 python -B srhd.py manifest "<MOD>" -o "<OUT>/MyMod.manifest.json"
+python -B srhd.py doctor processes --json
+python -B srhd.py doctor processes --terminate --json
 ```
 
 `stage` требует отсутствующую папку назначения и проверяет каждый скопированный файл по SHA-256.
 
 ## Python API
 
-Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `RgbaImage`, `inspect_gi`, `read_gi`, `write_gi`, `read_png`, `write_png`, `verify_gi`, `inspect_gai`, `inspect_hai`, `inspect_pkg`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1`.
+Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `RgbaImage`, `inspect_gi`, `read_gi`, `write_gi`, `read_png`, `write_png`, `verify_gi`, `inspect_gai`, `inspect_hai`, `inspect_pkg`, `inspect_hidden_processes`, `terminate_hidden_processes`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1`, `srhd-modkit-process-audit-v1`, `srhd-modkit-process-cleanup-v1`.

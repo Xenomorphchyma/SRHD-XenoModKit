@@ -1,6 +1,6 @@
-# Аудит полноты SRHD ModKit 0.8.4
+# Аудит полноты SRHD ModKit 0.8.5
 
-Проверено 16 июля 2026 года без видимого GUI и без изменения файлов игры.
+Проверено 17 июля 2026 года без видимого GUI и без изменения файлов игры.
 
 ## Универсальный контур
 
@@ -48,10 +48,15 @@
 - Структура релиза: ModuleInfo, небезопасные ссылки, коллизии регистра, мусорные
   файлы, воспроизводимый ZIP, staging и внешние JSON-схемы
   `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`,
-  `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1` и
-  `srhd-modkit-scr-compare-v1`.
+  `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`,
+  `srhd-modkit-scr-compare-v1`, `srhd-modkit-process-audit-v1` и
+  `srhd-modkit-process-cleanup-v1`.
 - Видимый GUI по умолчанию запрещён двумя подтверждениями. Наследуемые формы
   RScript при декомпиляции работают только на отдельном невидимом desktop.
+- Все старые GUI-subsystem кодеки запускаются в Job Object с
+  `KILL_ON_JOB_CLOSE`; аварийное завершение Python уничтожает корневой процесс и
+  потомков. Именованный mutex сериализует запуски разных агентов, а
+  `doctor processes` находит служебные desktop и известные редакторы.
 
 ## Частично поддерживается
 

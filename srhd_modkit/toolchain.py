@@ -525,6 +525,7 @@ class Toolchain:
             "compiler_exit_code": process_result.exit_code,
             "compiler_was_waiting_after_output": process_result.forced_after_outputs,
             "compiler_seconds": round(process_result.elapsed_seconds, 3),
+            "compiler_queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
             "compiler_timeout": timeout_policy,
             "runtime_warnings": [
                 issue.as_dict() for issue in runtime_issues if issue.severity == "warning"
@@ -737,6 +738,7 @@ class Toolchain:
                         "status": "passed",
                         "seconds": round(time.monotonic() - phase_started, 3),
                         "exit_code": process_result.exit_code,
+                        "queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
                     }
                 )
             except Exception as exc:
@@ -950,11 +952,13 @@ class Toolchain:
                 "event_signatures_match": True,
                 "compiler_exit_code": rebuild_result.exit_code,
                 "compiler_seconds": round(rebuild_result.elapsed_seconds, 3),
+                "compiler_queue_seconds": round(getattr(rebuild_result, "queue_seconds", 0.0), 3),
             },
             "deep_roundtrip": deep_result,
             "decompiler_exit_code": process_result.exit_code,
             "decompiler_was_waiting_after_output": process_result.forced_after_outputs,
             "decompiler_seconds": round(process_result.elapsed_seconds, 3),
+            "decompiler_queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
             "timeouts": {
                 "decompile": decompile_policy,
                 "roundtrip": roundtrip_policy,
@@ -1180,4 +1184,5 @@ class Toolchain:
             "sha256": sha256_file(destination),
             "compiler_exit_code": process_result.exit_code,
             "compiler_was_waiting_after_output": process_result.forced_after_outputs,
+            "compiler_queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
         }

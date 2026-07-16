@@ -73,6 +73,7 @@ from .image_codec import (
     write_gi,
     write_png,
 )
+from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
 
 __all__ = [
     "build_manifest",
@@ -156,6 +157,8 @@ __all__ = [
     "encode_png",
     "read_png",
     "write_png",
+    "inspect_hidden_processes",
+    "terminate_hidden_processes",
 ]
 
-__version__ = "0.8.4"
+__version__ = "0.8.5"

@@ -30,6 +30,7 @@ from .validation import validate_collection
 from .audit import AuditProfile, AuditReport, audit_collection, audit_mod
 from .release import ReleaseBlockedError, build_release
 from .compat import analyze_modset
+from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
 
 
 def human_size(value: int) -> str:
@@ -472,6 +473,40 @@ def cmd_tools(args: argparse.Namespace) -> int:
             print(f"{mark:3} {item['name']:12} {mode:16} {item['path']}")
             print(f"    {item['purpose']}")
     return 2 if any(not item["available"] for item in status) else 0
+
+
+def cmd_doctor_processes(args: argparse.Namespace) -> int:
+    result = terminate_hidden_processes() if args.terminate else inspect_hidden_processes()
+    current = result["remaining"] if args.terminate else result
+    if args.json:
+        print_json(result)
+    else:
+        if args.terminate:
+            for action in result["actions"]:
+                suffix = f" ({action.get('executable')})" if action.get("executable") else ""
+                print(f"{action['status'].upper():10} PID {action['pid']}{suffix}")
+                if action.get("error"):
+                    print(f"           {action['error']}")
+                if action.get("reason"):
+                    print(f"           {action['reason']}")
+        if current["desktop_count"] == 0:
+            print("Скрытых процессов SRHD ModKit не найдено.")
+        else:
+            print(
+                f"Скрытых desktop: {current['desktop_count']}; "
+                f"процессов: {current['process_count']}."
+            )
+            for desktop in current["desktops"]:
+                print(desktop["name"])
+                if not desktop["processes"]:
+                    print("  PID не обнаружен; desktop всё ещё занят или завершается")
+                for process in desktop["processes"]:
+                    executable = process.get("executable") or process.get("name") or "неизвестно"
+                    print(
+                        f"  PID {process['pid']} (родитель {process.get('parent_pid')}): "
+                        f"{executable}"
+                    )
+    return 0 if current["desktop_count"] == 0 else 2
 
 
 def cmd_convert(args: argparse.Namespace) -> int:
@@ -1524,7 +1559,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.4")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.5")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -1676,6 +1711,17 @@ def build_parser() -> argparse.ArgumentParser:
     tools.add_argument("--tools-root")
     tools.add_argument("--json", action="store_true")
     tools.set_defaults(func=cmd_tools)
+
+    doctor = sub.add_parser("doctor", help="Диагностировать служебные процессы ModKit")
+    doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
+    doctor_processes = doctor_sub.add_parser("processes", help="Найти скрытые редакторы на desktop SRHDModKit_*")
+    doctor_processes.add_argument(
+        "--terminate",
+        action="store_true",
+        help="Завершить только известные RScript/BlockParEditor/ResEditor на служебных desktop",
+    )
+    doctor_processes.add_argument("--json", action="store_true")
+    doctor_processes.set_defaults(func=cmd_doctor_processes)
 
     convert = sub.add_parser("convert", help="Безопасно преобразовать GI <-> PNG")
     convert.add_argument("direction", choices=("gi-png", "png-gi"))
