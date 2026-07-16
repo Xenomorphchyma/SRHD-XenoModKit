@@ -52,6 +52,7 @@ from .release import (
     build_release,
     verify_release_archive,
 )
+from .compat import ModSetReport, OverlayCollision, OverlayOwner, analyze_modset
 
 __all__ = [
     "build_manifest",
@@ -110,6 +111,10 @@ __all__ = [
     "ReleaseResult",
     "build_release",
     "verify_release_archive",
+    "ModSetReport",
+    "OverlayCollision",
+    "OverlayOwner",
+    "analyze_modset",
     "validate_collection",
     "validate_mod",
     "validate_modcfg",

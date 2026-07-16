@@ -29,6 +29,7 @@ from .runtime_lint import (
 from .validation import validate_collection
 from .audit import AuditProfile, AuditReport, audit_collection, audit_mod
 from .release import ReleaseBlockedError, build_release
+from .compat import analyze_modset
 
 
 def human_size(value: int) -> str:
@@ -255,6 +256,27 @@ def cmd_collisions(args: argparse.Namespace) -> int:
         suffix = " — одинаковые" if item["identical"] is True else " — разные" if item["identical"] is False else ""
         print(f"{item['path']}: {', '.join(item['mods'])}{suffix}")
     return 0
+
+
+def cmd_compat(args: argparse.Namespace) -> int:
+    report = analyze_modset(args.config, args.mods_root, tools_root=args.tools_root)
+    if args.json:
+        print_json(report.as_dict())
+    else:
+        print(f"Включено модов: {len(report.load_order)}")
+        for item in report.load_order:
+            priority = item["priority"] if item["priority"] is not None else "—"
+            print(f"  [{item['order']}] Priority={priority} {item['name']} ({item['path']})")
+        print(f"Циклов зависимостей: {len(report.cycles)}")
+        for cycle in report.cycles:
+            print("  " + " -> ".join(cycle))
+        print(f"Пересечений игровых путей: {len(report.collisions)}")
+        for collision in report.collisions:
+            mods = ", ".join(owner.mod for owner in collision.owners)
+            print(f"  {collision.kind:24} {collision.path}: {mods}; resolution={collision.resolution}")
+        for issue in report.issues:
+            print(f"{issue.severity.upper():7} {issue.code}: {issue.message}")
+    return 2 if any(issue.severity == "error" for issue in report.issues) else 0
 
 
 def cmd_pack(args: argparse.Namespace) -> int:
@@ -1472,6 +1494,13 @@ def build_parser() -> argparse.ArgumentParser:
     collisions.add_argument("--hash", action="store_true", help="Проверить, одинаково ли содержимое")
     collisions.add_argument("--json", action="store_true")
     collisions.set_defaults(func=cmd_collisions)
+
+    compat = sub.add_parser("compat", help="Проверить совместимость активного набора модов")
+    compat.add_argument("config", help="Путь к Mods/ModCFG.txt")
+    compat.add_argument("--mods-root", required=True)
+    compat.add_argument("--tools-root")
+    compat.add_argument("--json", action="store_true")
+    compat.set_defaults(func=cmd_compat)
 
     pack = sub.add_parser("pack", help="Собрать воспроизводимый ZIP-релиз")
     pack.add_argument("mod")
