@@ -222,12 +222,27 @@ if(current_cargo) ItemExist(current_cargo);
 
 1. хранить отдельный общий числовой ID через `Id(object)`;
 2. при миграции сначала безусловно присвоить старой ссылке `0`;
-3. условно восстановить текущий объект через `IdToPlanet`, `IdToStar` или
-   `IdToShip`;
+3. условно восстановить `Planet`/`Ship` через `IdToPlanet`/`IdToShip`, а `Star`
+   — через локальный ограниченный обход `GalaxyStars()` и `GalaxyStar(i)`;
 4. вызывать функцию восстановления из исполняемого кода RSON до использования
    ссылки.
 
 ```text
+function IdToStar(int star_id)
+{
+    result = 0;
+    if(!star_id) exit;
+    for(int cursor = 0; cursor < GalaxyStars(); cursor = cursor + 1)
+    {
+        dword star = GalaxyStar(cursor);
+        if(star && Id(star) == star_id)
+        {
+            result = star;
+            exit;
+        }
+    }
+}
+
 function RestoreWorldRefs()
 {
     destination = 0;
@@ -240,6 +255,14 @@ RestoreWorldRefs();
 destination_id = Id(destination);
 target_star_id = Id(target_star);
 ```
+
+`IdToStar` не является функцией игрового API SRHD 2.1.2500. RScript способен
+записать неизвестное имя в SCR, но игра остановит ход с
+`Not link var :IdToStar`. Поэтому голый вызов без локального определения
+блокируется кодом `runtime-unsupported-engine-call`. Одноимённая локальная
+функция считается восстановителем только когда ModKit доказывает полный
+ограниченный проход от нулевого индекса, получение через `GalaxyStar(i)`,
+сравнение `Id(star)` и нулевой результат при отсутствии объекта.
 
 Проверка распространяет типы аргументов через локальные вспомогательные функции.
 При этом общий `TVar`, который доказуемо получает свежий объект непосредственно

@@ -62,6 +62,15 @@ CONTROL_CALLS = {
     "function",
 }
 
+_KNOWN_UNAVAILABLE_ENGINE_CALLS = {
+    "idtostar": (
+        "IdToStar отсутствует в игровом API SRHD 2.1.2500; "
+        "RScript может собрать такое имя, но игра завершит ход с Not link var :IdToStar. "
+        "Определите локальную ограниченную функцию восстановления через "
+        "GalaxyStars()/GalaxyStar(i) или храните ID планеты"
+    ),
+}
+
 
 @dataclass(frozen=True)
 class RuntimeIssue:
@@ -270,6 +279,57 @@ def _lint_cross_block_calls(
                             "error",
                             "runtime-cross-block-function-call",
                             f"Вызов {target.name} не слинкуется: функция определена в другом RSON code object; перенесите код или определение в один {field}",
+                            path,
+                            f"object #{object_id} {field}:{line_number}",
+                            line.strip(),
+                        )
+                    )
+                    reported.add(call)
+    return issues
+
+
+def _lint_unavailable_engine_calls(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject engine-like calls proven unavailable at runtime.
+
+    RScript serializes unknown external call names without resolving them
+    against the game executable.  A same-project function with that name is
+    still valid and is checked separately for code-object scope.
+    """
+
+    known = set(functions)
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for item in project.iter_objects():
+        object_id = item.get("#") if isinstance(item.get("#"), int) else None
+        containers: list[tuple[str, list[str]]] = []
+        for field, value in item.items():
+            if field in {"Code", "ActCode", "LinkCode"} and isinstance(value, list):
+                containers.append((field, [str(line) for line in value]))
+            elif field.casefold().endswith("code") and isinstance(value, str):
+                containers.append((field, value.splitlines()))
+        for field, lines in containers:
+            local = _local_function_names(lines)
+            reported: set[str] = set()
+            for line_number, line in enumerate(lines, start=1):
+                declaration = FUNCTION_RE.match(_mask_non_code(line))
+                declared = declaration.group(1).casefold() if declaration else None
+                for call in sorted(value.casefold() for value in _calls(line)):
+                    if (
+                        call == declared
+                        or call not in _KNOWN_UNAVAILABLE_ENGINE_CALLS
+                        or call in local
+                        or call in known
+                        or call in reported
+                    ):
+                        continue
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "runtime-unsupported-engine-call",
+                            _KNOWN_UNAVAILABLE_ENGINE_CALLS[call],
                             path,
                             f"object #{object_id} {field}:{line_number}",
                             line.strip(),
@@ -918,9 +978,14 @@ _WORLD_OBJECT_ARGUMENT_TYPES: dict[str, dict[int, str]] = {
     "shipgetbad": {0: "ship"},
 }
 
-_WORLD_OBJECT_RESOLVERS = {
+_WORLD_OBJECT_DIRECT_RESOLVERS = {
+    "idtoplanet": "planet",
+    "idtoship": "ship",
+}
+
+_WORLD_OBJECT_RESOLVER_GUIDANCE = {
     "planet": "IdToPlanet",
-    "star": "IdToStar",
+    "star": "локальную ограниченную функцию через GalaxyStars()/GalaxyStar(i)",
     "ship": "IdToShip",
 }
 
@@ -932,9 +997,8 @@ _WORLD_OBJECT_RETURN_TYPES: dict[str, tuple[str, int]] = {
     "shipstar": ("star", 1),
     "planettostar": ("star", 1),
     "constar": ("star", 2),
-    "galaxystars": ("star", 1),
+    "galaxystar": ("star", 1),
     "starnearbystars": ("star", 2),
-    "idtostar": ("star", 1),
     "starships": ("ship", 2),
     "groupship": ("ship", 2),
     "idtoship": ("ship", 1),
@@ -952,6 +1016,83 @@ def _line_call_sites(masked: str) -> list[tuple[int, str, list[str]]]:
         if parsed:
             calls.append((match.start(), name.casefold(), parsed[0][1]))
     return sorted(calls)
+
+
+def _proven_star_id_resolver(block: FunctionBlock) -> bool:
+    """Prove a bounded local replacement for the unavailable IdToStar call."""
+
+    parameters = _function_parameters(block)
+    if len(parameters) != 1:
+        return False
+    identifier = re.escape(parameters[0])
+    body = _mask_non_code(block.body_text)
+    loop_pattern = re.compile(
+        r"\bfor\s*\(\s*(?:int\s+)?(?P<cursor>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*0\s*;"
+        r"\s*(?P=cursor)\s*<\s*GalaxyStars\s*\(\s*\)\s*;\s*"
+        r"(?:(?P=cursor)\s*=\s*(?P=cursor)\s*\+\s*1|(?P=cursor)\s*\+\+|\+\+\s*(?P=cursor))\s*\)",
+        re.IGNORECASE,
+    )
+    loop = loop_pattern.search(body)
+    if not loop:
+        return False
+    open_brace = body.find("{", loop.end())
+    if open_brace < 0:
+        return False
+    depth = 0
+    close_brace = -1
+    for position in range(open_brace, len(body)):
+        if body[position] == "{":
+            depth += 1
+        elif body[position] == "}":
+            depth -= 1
+            if depth == 0:
+                close_brace = position
+                break
+    if close_brace < 0:
+        return False
+    loop_body = body[open_brace + 1:close_brace]
+    cursor = re.escape(loop.group("cursor"))
+    candidate_pattern = re.compile(
+        rf"\b(?:dword\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*GalaxyStar\s*\(\s*{cursor}\s*\)",
+        re.IGNORECASE,
+    )
+    candidate_match = candidate_pattern.search(loop_body)
+    if not candidate_match:
+        return False
+    candidate = re.escape(candidate_match.group(1))
+    comparison = re.search(
+        rf"(?:Id\s*\(\s*{candidate}\s*\)\s*==\s*{identifier}\b|"
+        rf"\b{identifier}\s*==\s*Id\s*\(\s*{candidate}\s*\))",
+        loop_body[candidate_match.end():],
+        re.IGNORECASE,
+    )
+    result_match = re.search(
+        rf"\bresult\s*=(?!=)\s*{candidate}\s*;",
+        loop_body[candidate_match.end():],
+        re.IGNORECASE,
+    )
+    zero_match = re.search(r"\bresult\s*=(?!=)\s*0\s*;", body, re.IGNORECASE)
+    return bool(
+        comparison
+        and result_match
+        and comparison.start() <= result_match.start()
+        and zero_match
+        and zero_match.start() < loop.start()
+    )
+
+
+def _world_object_resolver_kinds(
+    functions: dict[str, FunctionBlock],
+) -> dict[str, str]:
+    resolvers = dict(_WORLD_OBJECT_DIRECT_RESOLVERS)
+    resolvers.update(
+        {
+            name: "star"
+            for name, block in functions.items()
+            if _proven_star_id_resolver(block)
+        }
+    )
+    return resolvers
 
 
 def _code_line_contexts(lines: list[str]) -> tuple[list[int], list[str | None]]:
@@ -1137,8 +1278,8 @@ def _lint_persistent_world_object_handles(
 
     Planet/Star/Ship references stored in TVars can survive in a save while the
     underlying engine object does not.  The safe migration pattern clears the
-    old reference first, resolves a persistent ID through IdTo*, and stores the
-    ID whenever a new reference is selected.
+    old reference first, resolves a persistent ID through a proven resolver,
+    and stores the ID whenever a new reference is selected.
     """
 
     shared = _shared_tvars(project)
@@ -1170,9 +1311,14 @@ def _lint_persistent_world_object_handles(
     }
     reachable_restorers = _reachable(top_level_calls, graph)
     restorations: dict[tuple[str, str], list[tuple[str, bool, bool, bool]]] = {}
+    resolver_kinds = _world_object_resolver_kinds(functions)
+    resolver_names = "|".join(
+        re.escape(functions[name].name if name in functions else name)
+        for name in sorted(resolver_kinds, key=len, reverse=True)
+    )
     resolver_pattern = re.compile(
         r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*"
-        r"(IdToPlanet|IdToStar|IdToShip)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)"
+        rf"({resolver_names})\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)"
         r"\s*(?:,[^()]*)?\)",
         re.IGNORECASE,
     )
@@ -1190,14 +1336,7 @@ def _lint_persistent_world_object_handles(
                 identifier = match.group(3).casefold()
                 if target not in shared:
                     continue
-                kind = next(
-                    (
-                        value
-                        for value, name in _WORLD_OBJECT_RESOLVERS.items()
-                        if name.casefold() == resolver
-                    ),
-                    "",
-                )
+                kind = resolver_kinds.get(resolver, "")
                 if not kind:
                     continue
                 cleared = False
@@ -1236,7 +1375,7 @@ def _lint_persistent_world_object_handles(
         if valid:
             continue
         if not candidates:
-            reason = f"нет восстановления через {_WORLD_OBJECT_RESOLVERS[kind]}"
+            reason = f"нет восстановления через {_WORLD_OBJECT_RESOLVER_GUIDANCE[kind]}"
         elif not any(cleared for _id, cleared, _stored, _reachable in candidates):
             reason = "старая ссылка не обнуляется до условного восстановления"
         elif not any(stored for _id, _cleared, stored, _reachable in candidates):
@@ -1247,7 +1386,7 @@ def _lint_persistent_world_object_handles(
             RuntimeIssue(
                 "error",
                 "runtime-persistent-world-object-handle",
-                f"Общий TVar {variable} используется как {labels[kind]}, но небезопасен для сохранений: {reason}; храните числовой ID, сначала обнуляйте старую ссылку и восстанавливайте её через {_WORLD_OBJECT_RESOLVERS[kind]}",
+                f"Общий TVar {variable} используется как {labels[kind]}, но небезопасен для сохранений: {reason}; храните числовой ID, сначала обнуляйте старую ссылку и используйте доказанный восстановитель ({_WORLD_OBJECT_RESOLVER_GUIDANCE[kind]})",
                 path,
                 location,
                 evidence,
@@ -1733,6 +1872,7 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     path = str(project.path) if project.path else None
     functions, issues = _extract_functions(project)
     issues.extend(_lint_cross_block_calls(project, functions))
+    issues.extend(_lint_unavailable_engine_calls(project, functions))
     issues.extend(_lint_runtime_cross_block_variables(project))
     issues.extend(_lint_linked_empty_runtime_code(project))
     issues.extend(_lint_persistent_item_handles(project, functions))

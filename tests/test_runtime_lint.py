@@ -623,6 +623,20 @@ class RuntimeLintTests(unittest.TestCase):
         ]
         group["Operations"][0]["Code"].extend(
             [
+                "function IdToStar(int star_id)",
+                "{",
+                "    result = 0;",
+                "    if(!star_id) exit;",
+                "    for(int cursor = 0; cursor < GalaxyStars(); cursor = cursor + 1)",
+                "    {",
+                "        dword star = GalaxyStar(cursor);",
+                "        if(star && Id(star) == star_id)",
+                "        {",
+                "            result = star;",
+                "            exit;",
+                "        }",
+                "    }",
+                "}",
                 "function RestoreWorldRefs()",
                 "{",
                 "    destination = 0;",
@@ -646,6 +660,58 @@ class RuntimeLintTests(unittest.TestCase):
             for issue in lint_rson_runtime(RsonProject(data, Path("stable-world-ids.rson")))
         }
         self.assertNotIn("runtime-persistent-world-object-handle", codes)
+        self.assertNotIn("runtime-unsupported-engine-call", codes)
+
+    def test_unavailable_engine_id_to_star_is_rejected(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].append(
+            "dword star = IdToStar(42);"
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("missing-id-to-star.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-unsupported-engine-call"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("Not link var :IdToStar", matching[0].message)
+        self.assertEqual(matching[0].evidence, "dword star = IdToStar(42);")
+
+    def test_unproven_local_star_resolver_does_not_protect_saved_handle(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "target_star", "Parent": -1, "#": 10},
+            {"Type": "TVar", "Name": "target_star_id", "Parent": -1, "#": 11},
+        ]
+        group["Operations"][0]["Code"].extend(
+            [
+                "function IdToStar(int star_id)",
+                "{",
+                "    result = 0;",
+                "    for(int cursor = 0; cursor < GalaxyStars(); cursor = cursor + 1)",
+                "    {",
+                "        result = result;",
+                "    }",
+                "    dword star = GalaxyStar(0);",
+                "    if(Id(star) == star_id) result = star;",
+                "}",
+                "function RestoreWorldRefs()",
+                "{",
+                "    target_star = 0;",
+                "    if(target_star_id) target_star = IdToStar(target_star_id);",
+                "}",
+                "RestoreWorldRefs();",
+                "target_star_id = Id(target_star);",
+                "StarName(target_star);",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("bad-star-resolver.rson")))
+        }
+        self.assertNotIn("runtime-unsupported-engine-call", codes)
+        self.assertIn("runtime-persistent-world-object-handle", codes)
 
     def test_tvar_world_object_scratch_assigned_before_use_is_safe(self) -> None:
         data = deepcopy(SAFE_RSON)
@@ -656,7 +722,7 @@ class RuntimeLintTests(unittest.TestCase):
         ]
         group["Operations"][0]["Code"].extend(
             [
-                "system = ShipStar(Player());",
+                "system = GalaxyStar(0);",
                 "for(int cursor = 0; cursor < StarShips(system); cursor = cursor + 1)",
                 "{",
                 "    ship = StarShips(system, cursor);",
