@@ -556,6 +556,120 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-persistent-raw-item-handle", codes)
 
+    def test_persistent_planet_reference_requires_stable_id_restore(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "destination", "Parent": -1, "#": 10}
+        ]
+        group["Operations"][0]["Code"].extend(
+            [
+                "function SendShip(dword planet)",
+                "{",
+                "    PlanetToStar(planet);",
+                "}",
+                "SendShip(destination);",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("stale-planet.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-persistent-world-object-handle"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("IdToPlanet", matching[0].message)
+        self.assertEqual(matching[0].evidence, "SendShip(destination);")
+
+    def test_world_reference_migration_clears_legacy_handle_first(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "destination", "Parent": -1, "#": 10},
+            {"Type": "TVar", "Name": "destination_id", "Parent": -1, "#": 11},
+        ]
+        group["Operations"][0]["Code"].extend(
+            [
+                "function RestoreWorldRefs()",
+                "{",
+                "    if(destination_id) destination = IdToPlanet(destination_id);",
+                "}",
+                "function UseDestination(dword planet)",
+                "{",
+                "    PlanetToStar(planet);",
+                "}",
+                "RestoreWorldRefs();",
+                "destination_id = Id(destination);",
+                "UseDestination(destination);",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("legacy-planet.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-persistent-world-object-handle"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("не обнуляется", matching[0].message)
+
+    def test_world_reference_restored_from_shared_id_is_safe(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "destination", "Parent": -1, "#": 10},
+            {"Type": "TVar", "Name": "destination_id", "Parent": -1, "#": 11},
+            {"Type": "TVar", "Name": "target_star", "Parent": -1, "#": 12},
+            {"Type": "TVar", "Name": "target_star_id", "Parent": -1, "#": 13},
+        ]
+        group["Operations"][0]["Code"].extend(
+            [
+                "function RestoreWorldRefs()",
+                "{",
+                "    destination = 0;",
+                "    target_star = 0;",
+                "    if(destination_id) destination = IdToPlanet(destination_id);",
+                "    if(target_star_id) target_star = IdToStar(target_star_id);",
+                "}",
+                "function UseWorld(dword planet, dword star)",
+                "{",
+                "    PlanetToStar(planet);",
+                "    StarName(star);",
+                "}",
+                "RestoreWorldRefs();",
+                "destination_id = Id(destination);",
+                "target_star_id = Id(target_star);",
+                "UseWorld(destination, target_star);",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("stable-world-ids.rson")))
+        }
+        self.assertNotIn("runtime-persistent-world-object-handle", codes)
+
+    def test_tvar_world_object_scratch_assigned_before_use_is_safe(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "system", "Parent": -1, "#": 10},
+            {"Type": "TVar", "Name": "ship", "Parent": -1, "#": 11},
+        ]
+        group["Operations"][0]["Code"].extend(
+            [
+                "system = ShipStar(Player());",
+                "for(int cursor = 0; cursor < StarShips(system); cursor = cursor + 1)",
+                "{",
+                "    ship = StarShips(system, cursor);",
+                "    if(ShipInHyperSpace(ship)) continue;",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("world-scratch.rson")))
+        }
+        self.assertNotIn("runtime-persistent-world-object-handle", codes)
+
     def test_unload_then_shipout_in_same_handler_is_rejected(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
@@ -599,7 +713,7 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-landed-shipout-after-mutation", codes)
 
-    def test_forward_group_iteration_must_compensate_for_shipout(self) -> None:
+    def test_forward_group_iteration_rejects_shipout(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
             [
@@ -623,40 +737,77 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertIn("runtime-group-mutated-during-iteration", codes)
 
-    def test_group_iteration_allows_reverse_or_compensated_index(self) -> None:
-        for name, loop in (
-            (
-                "reverse",
-                [
-                    "    for(int cursor = GroupCount(group) - 1; cursor >= 0; cursor = cursor - 1)",
-                    "    {",
-                    "        dword ship = GroupShip(group, cursor);",
-                    "        ShipOut(ship);",
-                    "    }",
-                ],
-            ),
-            (
-                "compensated",
-                [
-                    "    for(int cursor = 0; cursor < GroupCount(group); cursor = cursor + 1)",
-                    "    {",
-                    "        dword ship = GroupShip(group, cursor);",
-                    "        ShipOut(ship);",
-                    "        cursor = cursor - 1;",
-                    "    }",
-                ],
-            ),
+    def test_forward_group_iteration_rejects_index_compensation(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function Cleanup(dword group)",
+                "{",
+                "    for(int cursor = 0; cursor < GroupCount(group); cursor = cursor + 1)",
+                "    {",
+                "        dword ship = GroupShip(group, cursor);",
+                "        ShipOut(ship);",
+                "        cursor = cursor - 1;",
+                "    }",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("compensated-group.rson")))
+        }
+        self.assertIn("runtime-group-mutated-during-iteration", codes)
+
+    def test_group_iteration_allows_reverse_order(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function Cleanup(dword group)",
+                "{",
+                "    for(int cursor = GroupCount(group) - 1; cursor >= 0; cursor = cursor - 1)",
+                "    {",
+                "        dword ship = GroupShip(group, cursor);",
+                "        ShipOut(ship);",
+                "    }",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("reverse-group.rson")))
+        }
+        self.assertNotIn("runtime-group-mutated-during-iteration", codes)
+
+    def test_reverse_group_mutation_requires_exit_before_recount(self) -> None:
+        for name, barrier, expected in (
+            ("unsafe", [], True),
+            ("safe", ["    if(removed) exit;"], False),
         ):
             with self.subTest(name=name):
                 data = deepcopy(SAFE_RSON)
                 data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
-                    ["function Cleanup(dword group)", "{", *loop, "}"]
+                    [
+                        "function Cleanup(dword group)",
+                        "{",
+                        "    for(int cursor = GroupCount(group) - 1; cursor >= 0; cursor = cursor - 1)",
+                        "    {",
+                        "        dword ship = GroupShip(group, cursor);",
+                        "        ShipOut(ship);",
+                        "        removed = 1;",
+                        "    }",
+                        *barrier,
+                        "    if(GroupCount(group) == 0) result = 1;",
+                        "}",
+                    ]
                 )
                 codes = {
                     issue.code
-                    for issue in lint_rson_runtime(RsonProject(data, Path(f"{name}-group.rson")))
+                    for issue in lint_rson_runtime(RsonProject(data, Path(f"{name}-recount.rson")))
                 }
-                self.assertNotIn("runtime-group-mutated-during-iteration", codes)
+                if expected:
+                    self.assertIn("runtime-group-recount-after-mutation", codes)
+                else:
+                    self.assertNotIn("runtime-group-recount-after-mutation", codes)
 
     def test_one_step_base_case_recursion_is_proven_bounded(self) -> None:
         data = deepcopy(SAFE_RSON)

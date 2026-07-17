@@ -895,6 +895,367 @@ def _lint_persistent_item_handles(
     return issues
 
 
+_WORLD_OBJECT_ARGUMENT_TYPES: dict[str, dict[int, str]] = {
+    "planettostar": {0: "planet"},
+    "planetrace": {0: "planet"},
+    "planeteco": {0: "planet"},
+    "planetowner": {0: "planet"},
+    "buywarrior": {0: "planet"},
+    "starname": {0: "star"},
+    "starowner": {0: "star"},
+    "starbattle": {0: "star"},
+    "starenemythreatlevel": {0: "star"},
+    "starplanets": {0: "star"},
+    "starships": {0: "star"},
+    "starruins": {0: "star"},
+    "starnearbystars": {0: "star"},
+    "shipstar": {0: "ship"},
+    "getshipplanet": {0: "ship"},
+    "getshipruins": {0: "ship"},
+    "shipout": {0: "ship"},
+    "shipinhyperspace": {0: "ship"},
+    "shipinnormalspace": {0: "ship"},
+    "shipgetbad": {0: "ship"},
+}
+
+_WORLD_OBJECT_RESOLVERS = {
+    "planet": "IdToPlanet",
+    "star": "IdToStar",
+    "ship": "IdToShip",
+}
+
+_WORLD_OBJECT_RETURN_TYPES: dict[str, tuple[str, int]] = {
+    "getshipplanet": ("planet", 1),
+    "starplanets": ("planet", 2),
+    "planetpirateclan": ("planet", 0),
+    "idtoplanet": ("planet", 1),
+    "shipstar": ("star", 1),
+    "planettostar": ("star", 1),
+    "constar": ("star", 2),
+    "galaxystars": ("star", 1),
+    "starnearbystars": ("star", 2),
+    "idtostar": ("star", 1),
+    "starships": ("ship", 2),
+    "groupship": ("ship", 2),
+    "idtoship": ("ship", 1),
+    "player": ("ship", 0),
+}
+
+
+def _line_call_sites(masked: str) -> list[tuple[int, str, list[str]]]:
+    calls: list[tuple[int, str, list[str]]] = []
+    for match in CALL_RE.finditer(masked):
+        name = match.group(1)
+        if name.casefold() in CONTROL_CALLS:
+            continue
+        parsed = _call_arguments(masked[match.start():], name)
+        if parsed:
+            calls.append((match.start(), name.casefold(), parsed[0][1]))
+    return sorted(calls)
+
+
+def _code_line_contexts(lines: list[str]) -> tuple[list[int], list[str | None]]:
+    depths: list[int] = []
+    contexts: list[str | None] = []
+    depth = 0
+    function_name: str | None = None
+    function_opened = False
+    function_depth = 0
+    for line in lines:
+        masked = _mask_non_code(line)
+        match = FUNCTION_RE.match(masked) if function_name is None else None
+        if match:
+            function_name = match.group(1).casefold()
+            function_opened = False
+            function_depth = 0
+        depths.append(depth)
+        contexts.append(function_name)
+        delta = masked.count("{") - masked.count("}")
+        depth += delta
+        if function_name is not None:
+            function_opened |= "{" in masked
+            function_depth += delta
+            if function_opened and function_depth <= 0:
+                function_name = None
+    return depths, contexts
+
+
+def _has_fresh_world_assignment(
+    lines: list[str],
+    line_index: int,
+    variable: str,
+    kind: str,
+    depths: list[int],
+    contexts: list[str | None],
+) -> bool:
+    """Prove a same-invocation scratch assignment before a typed object use."""
+
+    assignment = re.compile(rf"\b{re.escape(variable)}\s*=(?!=)", re.IGNORECASE)
+    for previous_index in range(line_index - 1, -1, -1):
+        if contexts[previous_index] != contexts[line_index]:
+            continue
+        masked = _mask_non_code(lines[previous_index])
+        match = assignment.search(masked)
+        if not match:
+            continue
+        if depths[previous_index] > depths[line_index]:
+            return False
+        prefix = masked[:match.start()].strip().casefold()
+        if prefix.startswith(("if", "while", "for", "switch")):
+            return False
+        rhs = masked[match.end():].lstrip()
+        call_match = CALL_RE.match(rhs)
+        if not call_match:
+            return False
+        call = call_match.group(1)
+        return_type = _WORLD_OBJECT_RETURN_TYPES.get(call.casefold())
+        if not return_type or return_type[0] != kind:
+            return False
+        parsed = _call_arguments(rhs, call)
+        return bool(parsed and len(parsed[0][1]) >= return_type[1])
+    return False
+
+
+def _world_object_parameter_requirements(
+    functions: dict[str, FunctionBlock],
+) -> dict[str, dict[int, set[str]]]:
+    """Infer Planet/Star/Ship parameter roles through local helper calls."""
+
+    requirements: dict[str, dict[int, set[str]]] = {name: {} for name in functions}
+    sites = {name: _function_call_sites(block) for name, block in functions.items()}
+    changed = True
+    while changed:
+        changed = False
+        for name, block in functions.items():
+            parameters = _function_parameters(block)
+            if not parameters:
+                continue
+            for _line, _depth, call, arguments in sites[name]:
+                constraints: dict[int, set[str]] = {}
+                for index, value in _WORLD_OBJECT_ARGUMENT_TYPES.get(call, {}).items():
+                    constraints.setdefault(index, set()).add(value)
+                for index, values in requirements.get(call, {}).items():
+                    constraints.setdefault(index, set()).update(values)
+                for argument_index, kinds in constraints.items():
+                    if argument_index >= len(arguments):
+                        continue
+                    actual = _simple_identifier(arguments[argument_index])
+                    if actual not in parameters:
+                        continue
+                    parameter_index = parameters.index(actual)
+                    current = requirements[name].setdefault(parameter_index, set())
+                    before = len(current)
+                    current.update(kinds)
+                    changed |= len(current) != before
+    return requirements
+
+
+def _top_level_code_lines(
+    project: RsonProject,
+) -> list[tuple[int | None, str, int, str]]:
+    result: list[tuple[int | None, str, int, str]] = []
+    for item in project.iter_objects():
+        object_id = item.get("#") if isinstance(item.get("#"), int) else None
+        for field in ("Code", "ActCode", "LinkCode"):
+            value = item.get(field)
+            if not isinstance(value, list):
+                continue
+            in_function = False
+            opened = False
+            depth = 0
+            for line_number, raw_line in enumerate(value, start=1):
+                line = str(raw_line)
+                masked = _mask_non_code(line)
+                if not in_function and FUNCTION_RE.match(masked):
+                    in_function = True
+                    opened = False
+                    depth = 0
+                if in_function:
+                    if "{" in masked:
+                        opened = True
+                    depth += masked.count("{") - masked.count("}")
+                    if opened and depth <= 0:
+                        in_function = False
+                    continue
+                result.append((object_id, field, line_number, line))
+    return result
+
+
+def _world_object_uses(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+    requirements: dict[str, dict[int, set[str]]],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    shared = _shared_tvars(project)
+    uses: dict[tuple[str, str], tuple[str, str]] = {}
+    for item in project.iter_objects():
+        object_id = item.get("#") if isinstance(item.get("#"), int) else None
+        containers: list[tuple[str, list[str]]] = []
+        for field, value in item.items():
+            if field in {"Code", "ActCode", "LinkCode"} and isinstance(value, list):
+                containers.append((field, [str(line) for line in value]))
+            elif field.casefold().endswith("code") and isinstance(value, str):
+                containers.append((field, value.splitlines()))
+        for field, lines in containers:
+            depths, contexts = _code_line_contexts(lines)
+            for line_number, line in enumerate(lines, start=1):
+                masked = _mask_non_code(line)
+                for _position, call, arguments in _line_call_sites(masked):
+                    constraints: dict[int, set[str]] = {}
+                    for index, value in _WORLD_OBJECT_ARGUMENT_TYPES.get(call, {}).items():
+                        constraints.setdefault(index, set()).add(value)
+                    for index, values in requirements.get(call, {}).items():
+                        constraints.setdefault(index, set()).update(values)
+                    for argument_index, kinds in constraints.items():
+                        if argument_index >= len(arguments):
+                            continue
+                        actual = _simple_identifier(arguments[argument_index])
+                        if actual not in shared:
+                            continue
+                        for kind in kinds:
+                            if _has_fresh_world_assignment(
+                                lines,
+                                line_number - 1,
+                                actual,
+                                kind,
+                                depths,
+                                contexts,
+                            ):
+                                continue
+                            uses.setdefault(
+                                (actual, kind),
+                                (f"object #{object_id} {field}:{line_number}", line.strip()),
+                            )
+    return uses
+
+
+def _lint_persistent_world_object_handles(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Require persistent world objects to be refreshed from stable IDs.
+
+    Planet/Star/Ship references stored in TVars can survive in a save while the
+    underlying engine object does not.  The safe migration pattern clears the
+    old reference first, resolves a persistent ID through IdTo*, and stores the
+    ID whenever a new reference is selected.
+    """
+
+    shared = _shared_tvars(project)
+    if not shared:
+        return []
+    requirements = _world_object_parameter_requirements(functions)
+    uses = _world_object_uses(project, functions, requirements)
+    if not uses:
+        return []
+
+    all_code = "\n".join(
+        _mask_non_code(str(line))
+        for item in project.iter_objects()
+        for field, value in item.items()
+        for line in (
+            value
+            if field in {"Code", "ActCode", "LinkCode"} and isinstance(value, list)
+            else value.splitlines()
+            if field.casefold().endswith("code") and isinstance(value, str)
+            else []
+        )
+    )
+    graph = _call_graph(functions)
+    top_level_calls = {
+        call.casefold()
+        for _object_id, _field, _line_number, line in _top_level_code_lines(project)
+        for call in _calls(line)
+        if call.casefold() in functions
+    }
+    reachable_restorers = _reachable(top_level_calls, graph)
+    restorations: dict[tuple[str, str], list[tuple[str, bool, bool, bool]]] = {}
+    resolver_pattern = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*"
+        r"(IdToPlanet|IdToStar|IdToShip)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)"
+        r"\s*(?:,[^()]*)?\)",
+        re.IGNORECASE,
+    )
+    for function_name, block in functions.items():
+        depth = 0
+        depths: list[int] = []
+        for line in block.lines:
+            depths.append(depth)
+            depth += _brace_delta(line)
+        for line_offset, line in enumerate(block.lines[1:], start=1):
+            masked = _mask_non_code(line)
+            for match in resolver_pattern.finditer(masked):
+                target = match.group(1).casefold()
+                resolver = match.group(2).casefold()
+                identifier = match.group(3).casefold()
+                if target not in shared:
+                    continue
+                kind = next(
+                    (
+                        value
+                        for value, name in _WORLD_OBJECT_RESOLVERS.items()
+                        if name.casefold() == resolver
+                    ),
+                    "",
+                )
+                if not kind:
+                    continue
+                cleared = False
+                for previous_offset, previous in enumerate(block.lines[1:line_offset], start=1):
+                    if depths[previous_offset] != 1:
+                        continue
+                    if target in {
+                        value.casefold()
+                        for value in ASSIGN_ZERO_RE.findall(_mask_non_code(previous))
+                    }:
+                        cleared = True
+                prefix = masked[:match.start()]
+                if depths[line_offset] == 1 and target in {
+                    value.casefold() for value in ASSIGN_ZERO_RE.findall(prefix)
+                }:
+                    cleared = True
+                id_is_shared = identifier in shared
+                id_is_stored = bool(
+                    re.search(
+                        rf"\b{re.escape(identifier)}\s*=(?!=)\s*Id\s*\(\s*{re.escape(target)}\s*\)",
+                        all_code,
+                        re.IGNORECASE,
+                    )
+                )
+                restorations.setdefault((target, kind), []).append(
+                    (identifier, cleared, id_is_shared and id_is_stored, function_name in reachable_restorers)
+                )
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    labels = {"planet": "Planet", "star": "Star", "ship": "Ship"}
+    for key, (location, evidence) in sorted(uses.items()):
+        variable, kind = key
+        candidates = restorations.get(key, [])
+        valid = any(cleared and stored and reachable for _id, cleared, stored, reachable in candidates)
+        if valid:
+            continue
+        if not candidates:
+            reason = f"нет восстановления через {_WORLD_OBJECT_RESOLVERS[kind]}"
+        elif not any(cleared for _id, cleared, _stored, _reachable in candidates):
+            reason = "старая ссылка не обнуляется до условного восстановления"
+        elif not any(stored for _id, _cleared, stored, _reachable in candidates):
+            reason = "ID не хранится в общем TVar через Id(object)"
+        else:
+            reason = "функция восстановления не вызывается из исполняемого кода объекта"
+        issues.append(
+            RuntimeIssue(
+                "error",
+                "runtime-persistent-world-object-handle",
+                f"Общий TVar {variable} используется как {labels[kind]}, но небезопасен для сохранений: {reason}; храните числовой ID, сначала обнуляйте старую ссылку и восстанавливайте её через {_WORLD_OBJECT_RESOLVERS[kind]}",
+                path,
+                location,
+                evidence,
+            )
+        )
+    return issues
+
+
 _SHIP_EFFECT_CALLS = {
     "getitemfromship": "mutates",
     "ordertakeoff": "takes_off",
@@ -910,15 +1271,7 @@ def _function_call_sites(block: FunctionBlock) -> list[tuple[int, int, str, list
     for line_offset, line in enumerate(block.lines):
         masked = _mask_non_code(line)
         depth_before = depth
-        calls: list[tuple[int, str, list[str]]] = []
-        for match in CALL_RE.finditer(masked):
-            name = match.group(1)
-            if name.casefold() in CONTROL_CALLS:
-                continue
-            parsed = _call_arguments(masked[match.start():], name)
-            if parsed:
-                calls.append((match.start(), name.casefold(), parsed[0][1]))
-        for _position, name, arguments in sorted(calls):
+        for _position, name, arguments in _line_call_sites(masked):
             result.append((line_offset, depth_before, name, arguments))
         depth += masked.count("{") - masked.count("}")
     return result
@@ -1032,6 +1385,7 @@ def _lint_group_shipout_iteration(
             if not isinstance(value, list):
                 continue
             lines = [str(line) for line in value]
+            _depths, contexts = _code_line_contexts(lines)
             index = 0
             while index < len(lines):
                 header = _mask_non_code(lines[index])
@@ -1043,6 +1397,16 @@ def _lint_group_shipout_iteration(
                 if len(clauses) != 3:
                     index += 1
                     continue
+                group_arguments = [
+                    arguments[0]
+                    for _position, arguments in _call_arguments(loop.group(1), "GroupCount")
+                    if arguments
+                ]
+                group_keys = {
+                    _simple_identifier(argument)
+                    or re.sub(r"\s+", "", argument).casefold()
+                    for argument in group_arguments
+                }
                 iterator_match = re.search(
                     r"(?:\bint\s+)?\b([A-Za-z_][A-Za-z0-9_]*)\s*=",
                     clauses[0],
@@ -1052,8 +1416,12 @@ def _lint_group_shipout_iteration(
                     index += 1
                     continue
                 iterator = iterator_match.group(1).casefold()
-                reverse = "groupcount" in clauses[0].casefold() or bool(
-                    re.search(rf"(?:--\s*{re.escape(iterator)}|{re.escape(iterator)}\s*--|{re.escape(iterator)}\s*=.*-)", clauses[2], re.IGNORECASE)
+                reverse = "groupcount" in clauses[0].casefold() and bool(
+                    re.search(
+                        rf"(?:--\s*{re.escape(iterator)}|{re.escape(iterator)}\s*--|{re.escape(iterator)}\s*=\s*{re.escape(iterator)}\s*-)",
+                        clauses[2],
+                        re.IGNORECASE,
+                    )
                 )
 
                 cursor = index
@@ -1097,29 +1465,54 @@ def _lint_group_shipout_iteration(
                                 for parameter_index in summary["ships_out"]
                             ):
                                 removal_positions.append(position)
-                compensation_positions = [
-                    match.start()
-                    for match in re.finditer(
-                        rf"(?:--\s*{re.escape(iterator)}|{re.escape(iterator)}\s*--|\b{re.escape(iterator)}\s*=\s*{re.escape(iterator)}\s*-\s*1\b)",
-                        folded_body,
-                        re.IGNORECASE,
-                    )
-                ]
-                compensated = bool(removal_positions) and all(
-                    any(position > removal for position in compensation_positions)
-                    for removal in removal_positions
-                )
-                if removal_positions and not reverse and not compensated:
+                if removal_positions and not reverse:
                     issues.append(
                         RuntimeIssue(
                             "error",
                             "runtime-group-mutated-during-iteration",
-                            f"Прямой обход GroupShip удаляет текущий корабль через ShipOut без коррекции {iterator}; используйте обратный обход, уменьшите индекс или завершите обработчик",
+                            f"Прямой обход GroupShip удаляет текущий корабль через ShipOut, после чего условие цикла повторно вызывает GroupCount; коррекция {iterator} не защищает итератор — вынесите удаление в обратный обход и завершите обработчик до следующего GroupCount",
                             path,
                             f"object #{object_id} {field}:{index + 1}",
                             lines[index].strip(),
                         )
                     )
+                elif removal_positions:
+                    recount_index = next(
+                        (
+                            candidate
+                            for candidate in range(cursor, len(lines))
+                            if contexts[candidate] == contexts[index]
+                            and any(
+                                (
+                                    _simple_identifier(arguments[0])
+                                    or re.sub(r"\s+", "", arguments[0]).casefold()
+                                )
+                                in group_keys
+                                for _position, arguments in _call_arguments(
+                                    _mask_non_code(lines[candidate]), "GroupCount"
+                                )
+                                if arguments
+                            )
+                        ),
+                        None,
+                    )
+                    if recount_index is not None:
+                        barrier = any(
+                            re.search(r"\b(?:exit|return)\b", _mask_non_code(lines[candidate]), re.IGNORECASE)
+                            for candidate in range(cursor, recount_index)
+                            if contexts[candidate] == contexts[index]
+                        )
+                        if not barrier:
+                            issues.append(
+                                RuntimeIssue(
+                                    "error",
+                                    "runtime-group-recount-after-mutation",
+                                    "После ShipOut код снова вызывает GroupCount в том же обработчике без exit/return; завершите обработчик сразу после обратного прохода и продолжите на следующем ходу",
+                                    path,
+                                    f"object #{object_id} {field}:{recount_index + 1}",
+                                    lines[recount_index].strip(),
+                                )
+                            )
                 index = max(cursor, index + 1)
     return issues
 
@@ -1343,6 +1736,7 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     issues.extend(_lint_runtime_cross_block_variables(project))
     issues.extend(_lint_linked_empty_runtime_code(project))
     issues.extend(_lint_persistent_item_handles(project, functions))
+    issues.extend(_lint_persistent_world_object_handles(project, functions))
     ship_effects = _ship_effect_summaries(functions)
     issues.extend(_lint_landed_shipout_after_mutation(project, functions, ship_effects))
     issues.extend(_lint_group_shipout_iteration(project, functions, ship_effects))
