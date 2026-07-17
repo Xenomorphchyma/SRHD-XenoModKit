@@ -74,7 +74,23 @@ from .image_codec import (
     write_png,
 )
 from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
-
+from .quest_formula import FormulaNode, QuestFormulaError, parse_quest_formula, validate_quest_formula
+from .quests import (
+    QuestDocument,
+    QuestFormatError,
+    QuestIssue,
+    build_quest,
+    build_quest_from_json,
+    export_quest_json,
+    inspect_quest,
+    load_quest,
+    load_quest_json,
+    parse_quest,
+    quest_media,
+    validate_quest,
+    verify_quest,
+    write_qmm,
+)
 __all__ = [
     "build_manifest",
     "compare_trees",
@@ -159,6 +175,24 @@ __all__ = [
     "write_png",
     "inspect_hidden_processes",
     "terminate_hidden_processes",
+    "FormulaNode",
+    "QuestFormulaError",
+    "parse_quest_formula",
+    "validate_quest_formula",
+    "QuestDocument",
+    "QuestFormatError",
+    "QuestIssue",
+    "parse_quest",
+    "load_quest",
+    "write_qmm",
+    "validate_quest",
+    "inspect_quest",
+    "verify_quest",
+    "quest_media",
+    "export_quest_json",
+    "load_quest_json",
+    "build_quest",
+    "build_quest_from_json",
 ]
 
-__version__ = "0.8.5"
+__version__ = "0.9.0"

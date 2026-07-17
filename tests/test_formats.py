@@ -31,6 +31,17 @@ class FormatTests(unittest.TestCase):
             scan = scan_formats(name)
             self.assertEqual(scan["file_count"], 1)
 
+    def test_map_extensions_remain_unknown_passthrough(self) -> None:
+        samples = {".raw": b"RABW", ".map": b"abwm", ".opt": b"ZL01"}
+        with tempfile.TemporaryDirectory() as name:
+            for extension, signature in samples.items():
+                with self.subTest(extension=extension):
+                    path = Path(name) / f"arena{extension}"
+                    path.write_bytes(signature + b"opaque data")
+                    info = inspect_file(path)
+                    self.assertEqual(info["format"], "unknown")
+                    self.assertEqual(info["handling"], "passthrough")
+
 
 if __name__ == "__main__":
     unittest.main()

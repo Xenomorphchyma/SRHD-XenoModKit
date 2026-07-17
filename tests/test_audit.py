@@ -104,6 +104,19 @@ class AuditTests(unittest.TestCase):
             self.assertFalse(check.complete)
             self.assertFalse(any(item.code == "resource-invalid" for item in report.issues))
 
+    def test_broken_text_quest_is_connected_to_unified_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            quest = root / "DATA" / "Quest" / "broken.qmm"
+            quest.parent.mkdir(parents=True)
+            quest.write_bytes(b"not-a-qmm")
+
+            report = audit_mod(root, profile="release")
+            check = next(item for item in report.checks if item.name == "text-quests")
+            self.assertEqual(check.status, "issues")
+            self.assertTrue(any(item.code == "quest-invalid" for item in check.issues))
+
 
 if __name__ == "__main__":
     unittest.main()

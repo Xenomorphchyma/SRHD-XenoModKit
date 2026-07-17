@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.8.5
+# Команды SRHD ModKit 0.9.0
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -70,6 +70,21 @@ GI типов `1/3/4` и нулевой холст остаются read-only/pa
 
 HAI поддерживает только `info`, `list` и `verify`. Альтернативный PKG может получить `unsupported`; не преобразовывать его автоматически.
 
+## Текстовые квесты
+
+```powershell
+python -B srhd.py quest info "<WORK>/Quest.qmm" --json
+python -B srhd.py quest validate "<WORK>/Quest.qmm" --json
+python -B srhd.py quest roundtrip "<WORK>/Quest.qmm" --json
+python -B srhd.py quest export-json "<WORK>/Quest.qmm" "<OUT>/Quest.json"
+python -B srhd.py quest build "<OUT>/Quest.json" "<OUT>/Quest.edited.qmm" --json
+```
+
+QM 2/3/4 и QMM 6/7 читаются нативно. `quest build` пишет QMM 7 во временный
+файл, перечитывает его и публикует только при смысловом совпадении. Не заменять
+существующий output без явного разрешения. Форматная проверка не заменяет
+прохождение квеста в игре.
+
 ## Совместимость и служебные операции
 
 ```powershell
@@ -86,4 +101,4 @@ python -B srhd.py doctor processes --terminate --json
 
 ## Python API
 
-Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `RgbaImage`, `inspect_gi`, `read_gi`, `write_gi`, `read_png`, `write_png`, `verify_gi`, `inspect_gai`, `inspect_hai`, `inspect_pkg`, `inspect_hidden_processes`, `terminate_hidden_processes`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1`, `srhd-modkit-process-audit-v1`, `srhd-modkit-process-cleanup-v1`.
+Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `RgbaImage`, `inspect_gi`, `read_gi`, `write_gi`, `read_png`, `write_png`, `verify_gi`, `inspect_gai`, `inspect_hai`, `inspect_pkg`, `inspect_quest`, `verify_quest`, `export_quest_json`, `build_quest_from_json`, `inspect_hidden_processes`, `terminate_hidden_processes`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1`, `srhd-modkit-quest-v1`, `srhd-modkit-quest-report-v1`, `srhd-modkit-process-audit-v1`, `srhd-modkit-process-cleanup-v1`.

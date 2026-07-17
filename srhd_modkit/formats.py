@@ -44,6 +44,7 @@ FORMAT_SPECS: tuple[FormatSpec, ...] = (
     FormatSpec("compiled Ranger script", (".scr",), "script-binary", "headless", "SRHD ModKit + RScript", "rson"),
     FormatSpec("RSON script project", (".rson",), "structured-text", "headless", "SRHD ModKit + RScript", "scr/svr"),
     FormatSpec("SVR script project", (".svr",), "script-project", "headless", "RScript", "rson"),
+    FormatSpec("text quest QM/QMM", (".qm", ".qmm"), "text-quest", "headless", "SRHD ModKit", "json/qmm"),
     FormatSpec("PNG image", (".png",), "image", "headless", "SRHD ModKit", "gi", b"\x89PNG\r\n\x1a\n"),
     FormatSpec("JPEG image", (".jpg", ".jpeg"), "image", "standard", signature=b"\xff\xd8\xff"),
     FormatSpec("BMP image", (".bmp",), "image", "standard", signature=b"BM"),
@@ -98,7 +99,21 @@ def inspect_file(path: str | Path, *, include_hash: bool = False) -> dict[str, A
     spec = get_format_spec(path)
     signature_valid: bool | None = None
     signature_reason: str | None = None
-    if spec and spec.signature is not None:
+    if spec and spec.name == "text quest QM/QMM":
+        with path.open("rb") as stream:
+            actual = stream.read(4)
+        known = {
+            b"\xd2\x35\x3a\x42",
+            b"\xd3\x35\x3a\x42",
+            b"\xd4\x35\x3a\x42",
+            b"\xd6\x35\x3a\x42",
+            b"\xd7\x35\x3a\x42",
+            b"\xd7\x6b\x9f\x06",
+        }
+        signature_valid = actual in known
+        if not signature_valid:
+            signature_reason = f"unknown-qm-header={actual.hex()}"
+    elif spec and spec.signature is not None:
         with path.open("rb") as stream:
             stream.seek(spec.signature_offset)
             actual = stream.read(max(len(spec.signature), 32))

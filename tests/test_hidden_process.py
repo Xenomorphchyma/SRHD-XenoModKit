@@ -93,7 +93,9 @@ class HiddenProcessTests(unittest.TestCase):
                 parent.kill()
                 parent.wait(timeout=5)
                 deadline = time.monotonic() + 5
-                while time.monotonic() < deadline and _process_alive(child_pid):
+                while time.monotonic() < deadline and (
+                    _process_alive(child_pid) or _process_alive(grandchild_pid)
+                ):
                     time.sleep(0.05)
                 self.assertFalse(_process_alive(child_pid), f"child PID {child_pid} survived its parent")
                 self.assertFalse(

@@ -1,6 +1,6 @@
 ---
 name: srhd-modkit
-description: Headless inspection, editing, validation, compatibility analysis, and release packaging for Space Rangers HD mods with SRHD ModKit. Use for SRHD mod folders, ModuleInfo or ModCFG, BlockPar DAT/TXT, SCR/RSON/SVR scripts, GI/GAI/HAI/PKG resources, Russian CP1251 problems, CacheData/Main registration mismatches, runtime-lint hangs such as «Проходит время», mod-set collisions, staging, manifests, or reproducible ZIP releases.
+description: Headless inspection, editing, validation, compatibility analysis, and release packaging for Space Rangers HD mods with SRHD ModKit. Use for SRHD mod folders, ModuleInfo or ModCFG, BlockPar DAT/TXT, SCR/RSON/SVR scripts, QM/QMM text quests, GI/GAI/HAI/PKG resources, Russian CP1251 problems, CacheData/Main registration mismatches, runtime-lint hangs such as «Проходит время», mod-set collisions, staging, manifests, or reproducible ZIP releases.
 ---
 
 # SRHD ModKit
@@ -11,7 +11,7 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 
 1. Найти корень репозитория, содержащий `srhd.py`, `pyproject.toml` и каталог `srhd_modkit`. Обозначать его как `<MODKIT_ROOT>`.
 2. Если этот скилл загружен прямо из репозитория, `<MODKIT_ROOT>` находится на три уровня выше `SKILL.md`: `.agents/skills/srhd-modkit/../../..`.
-3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.8.5` или новее.
+3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.9.0` или новее.
 4. При другой версии сначала прочитать локальные `README_RU.md`, `AUDIT_RU.md` и вывод `python -B srhd.py --help`; не предполагать наличие `script decompile`.
 5. Если корень найти нельзя, запросить путь к клону ModKit. Не использовать каталог установленной игры вместо инструментария.
 6. Для точного синтаксиса читать [references/commands.md](references/commands.md).
@@ -23,6 +23,7 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 - Для DAT использовать только `dat`-команды. Сначала читать дерево или значение, затем писать в новый DAT и повторно запускать `dat validate` или релизный аудит.
 - Для скриптов сначала выполнять `script audit-mod` и `script lint-runtime`; если исходника нет, восстанавливать его через `script decompile`, затем изменять RSON headless-командами и собирать через `script build`. Для доказательства различий двух бинарников использовать `script compare-scr`, а не ручный поиск байтов.
 - Для GI/PNG использовать нативные `convert gi-png` и `convert png-gi`; RangerTools и GUI не нужны. Для остальных ресурсов использовать `resource info/list/verify/extract/build-gai/build-pkg`. Не пытаться записывать HAI.
+- Для текстового квеста сначала выполнять `quest info` и `quest validate`. Редактировать через `quest export-json`, собирать новым путём через `quest build`, затем выполнять `quest roundtrip`. TGE и GUI не нужны.
 - Для активного набора модов использовать `compat` с существующим ModCFG только для чтения.
 - Для публикации использовать `release check`, затем `release build`. Не считать низкоуровневый `pack` полноценной релизной проверкой.
 - При подозрении на оставшиеся RScript/BlockParEditor сначала выполнять `doctor processes`; `--terminate` использовать только после просмотра отчёта.
@@ -54,7 +55,8 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 - Не обещать реальное runtime-поведение без запуска игры.
 - Не обещать совместимость с сохранениями и любой комбинацией сторонних модов.
 - Не считать SCR без RSON полностью семантически проверенным.
-- Не создавать writer HAI и не декодировать неизвестные VDO, CMAP, VO, QMM, MAP или OPT.
+- Не считать структурный round-trip QM/QMM доказательством фактического прохождения квеста в игре.
+- Не создавать writer HAI и не декодировать неизвестные VDO, CMAP, VO, MAP, OPT или RAW.
 - Считать круговой проход GAI/PKG доказательством структуры, но не визуальной корректности в игре.
 
 ## Завершать задачу

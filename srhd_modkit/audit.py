@@ -15,6 +15,7 @@ from .formats import get_format_spec, inspect_file
 from .game_text import lint_game_text
 from .module_info import find_module_info, parse_module_info
 from .resources import UnsupportedResourceFormat, verify_resource
+from .quests import inspect_quest, verify_quest
 from .runtime_lint import (
     has_onstart_script_run,
     lint_main_runtime,
@@ -608,6 +609,51 @@ def _resource_integrity_check(context: AuditContext) -> AuditCheck:
     )
 
 
+def _quest_check(context: AuditContext) -> AuditCheck:
+    name = "text-quests"
+    paths = [
+        path
+        for path in iter_files(context.root)
+        if path.suffix.casefold() in {".qm", ".qmm"}
+    ]
+    if not paths:
+        return AuditCheck(name, "skipped", details={"reason": "QM/QMM не найдены"})
+    issues: list[AuditIssue] = []
+    checked: list[str] = []
+    roundtripped = 0
+    for path in paths:
+        try:
+            result = verify_quest(path) if context.profile is AuditProfile.RELEASE else inspect_quest(path)
+            checked.append(str(path))
+            roundtripped += int(bool(result.get("roundtrip")))
+            for value in result.get("issues", []):
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        str(value.get("severity", "warning")),
+                        str(value.get("code", "quest-issue")),
+                        str(value.get("message", "Проблема текстового квеста")),
+                        path,
+                        location=value.get("location"),
+                        evidence=value.get("evidence"),
+                    )
+                )
+        except Exception as exc:
+            issues.append(_issue(context, name, "error", "quest-invalid", str(exc), path))
+    return AuditCheck(
+        name,
+        _status(issues),
+        tuple(issues),
+        tuple(checked),
+        details={
+            "files": len(paths),
+            "roundtripped": roundtripped,
+            "scope": "parse-validate-roundtrip" if context.profile is AuditProfile.RELEASE else "parse-validate",
+        },
+    )
+
+
 def _registrations(document: BlockParDocument) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
     try:
@@ -795,6 +841,7 @@ def default_registry() -> AuditRegistry:
     registry.register("blockpar-dat", _dat_check)
     registry.register("game-text", _text_check)
     registry.register("scripts", _script_check)
+    registry.register("text-quests", _quest_check)
     registry.register(
         "resource-integrity",
         _resource_integrity_check,

@@ -16,6 +16,14 @@ from .toolchain import Toolchain, is_empty_rscript_lang_dat
 from .blockpar import BlockParDocument, BlockParNode, load_blockpar
 from .scripts import inspect_scr, load_rson
 from .resources import build_gai, build_pkg, extract_resource, inspect_resource, verify_resource
+from .quests import (
+    build_quest_from_json,
+    export_quest_json,
+    inspect_quest,
+    load_quest,
+    quest_media,
+    verify_quest,
+)
 from .game_text import GameTextIssue, lint_game_text
 from .script_artifacts import ScriptArtifactIssue, lint_script_cache
 from .textio import DecodedText, read_text
@@ -457,6 +465,84 @@ def cmd_resource_build_pkg(args: argparse.Namespace) -> int:
         print(f"PKG: {result['output']}")
         print(f"Файлов: {result['files']}; после распаковки: {human_size(result['uncompressed_size'])}")
         print(f"SHA-256: {result['sha256']}; проверен: {'да' if result['verified'] else 'НЕТ'}")
+    return 0
+
+
+def _print_quest_issues(result: dict[str, Any]) -> None:
+    for issue in result.get("issues", []):
+        suffix = f" [{issue['location']}]" if issue.get("location") else ""
+        print(f"{issue['severity'].upper():7} {issue['code']}: {issue['message']}{suffix}")
+        if issue.get("evidence"):
+            print(f"         {issue['evidence']}")
+
+
+def cmd_quest_info(args: argparse.Namespace) -> int:
+    result = inspect_quest(args.source)
+    document = load_quest(args.source)
+    result["media"] = {key: list(value) for key, value in quest_media(document).items()}
+    if args.json:
+        print_json(result)
+    else:
+        print(
+            f"{result['format']} {result['header_hex']}: параметров {result['parameters']}, "
+            f"локаций {result['locations']}, переходов {result['jumps']}"
+        )
+        print(f"Поведение старого TGE: {'да' if result['old_tge_behaviour'] else 'нет'}")
+        for kind, values in result["media"].items():
+            print(f"{kind}: {len(values)}")
+        _print_quest_issues(result)
+    return 2 if not result["valid"] else 0
+
+
+def cmd_quest_validate(args: argparse.Namespace) -> int:
+    result = inspect_quest(args.source)
+    if args.json:
+        print_json(result)
+    else:
+        _print_quest_issues(result)
+        if result["valid"]:
+            print(
+                f"Квест корректен: {result['parameters']} параметров, "
+                f"{result['locations']} локаций, {result['jumps']} переходов."
+            )
+    return 2 if not result["valid"] else 0
+
+
+def cmd_quest_roundtrip(args: argparse.Namespace) -> int:
+    result = verify_quest(args.source)
+    if args.json:
+        print_json(result)
+    else:
+        _print_quest_issues(result)
+        print(
+            "Round-trip: "
+            + ("пройден, сборка детерминирована" if result["roundtrip"] else "НЕ ПРОЙДЕН")
+        )
+        print(f"SHA-256 контрольного QMM: {result['rebuilt_sha256']}")
+    return 2 if not result["verified"] else 0
+
+
+def cmd_quest_export_json(args: argparse.Namespace) -> int:
+    result = export_quest_json(args.source, args.output, overwrite=args.overwrite)
+    if args.json:
+        print_json(result)
+    else:
+        print(f"JSON квеста: {result['output']}")
+        print(
+            f"Параметров {result['parameters']}, локаций {result['locations']}, "
+            f"переходов {result['jumps']}"
+        )
+    return 0
+
+
+def cmd_quest_build(args: argparse.Namespace) -> int:
+    result = build_quest_from_json(args.source, args.output, overwrite=args.overwrite)
+    if args.json:
+        print_json(result)
+    else:
+        print(f"QMM: {result['output']}")
+        print(f"SHA-256: {result['sha256']}")
+        print("Контрольная загрузка и повторная сборка: пройдены")
     return 0
 
 
@@ -1559,7 +1645,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.8.5")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.0")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -1661,6 +1747,38 @@ def build_parser() -> argparse.ArgumentParser:
     formats.add_argument("--hash", action="store_true", help="Добавить SHA-256 для одиночного файла")
     formats.add_argument("--json", action="store_true")
     formats.set_defaults(func=cmd_formats)
+
+    quest = sub.add_parser("quest", help="Нативная headless-работа с текстовыми квестами QM/QMM")
+    quest_sub = quest.add_subparsers(dest="quest_command", required=True)
+
+    quest_info = quest_sub.add_parser("info", help="Показать структуру и ресурсы квеста")
+    quest_info.add_argument("source")
+    quest_info.add_argument("--json", action="store_true")
+    quest_info.set_defaults(func=cmd_quest_info)
+
+    quest_validate = quest_sub.add_parser("validate", help="Проверить граф, формулы и параметры квеста")
+    quest_validate.add_argument("source")
+    quest_validate.add_argument("--json", action="store_true")
+    quest_validate.set_defaults(func=cmd_quest_validate)
+
+    quest_roundtrip = quest_sub.add_parser("roundtrip", help="Доказать семантический QM/QMM -> QMM цикл")
+    quest_roundtrip.add_argument("source")
+    quest_roundtrip.add_argument("--json", action="store_true")
+    quest_roundtrip.set_defaults(func=cmd_quest_roundtrip)
+
+    quest_export = quest_sub.add_parser("export-json", help="Экспортировать редактируемую модель квеста в JSON")
+    quest_export.add_argument("source")
+    quest_export.add_argument("output")
+    quest_export.add_argument("--overwrite", action="store_true")
+    quest_export.add_argument("--json", action="store_true")
+    quest_export.set_defaults(func=cmd_quest_export_json)
+
+    quest_build = quest_sub.add_parser("build", help="Собрать и повторно проверить QMM из JSON")
+    quest_build.add_argument("source", help="JSON схемы srhd-modkit-quest-v1")
+    quest_build.add_argument("output")
+    quest_build.add_argument("--overwrite", action="store_true")
+    quest_build.add_argument("--json", action="store_true")
+    quest_build.set_defaults(func=cmd_quest_build)
 
     resource = sub.add_parser("resource", help="Headless-анализ GI, GAI, HAI и PKG")
     resource_sub = resource.add_subparsers(dest="resource_command", required=True)
