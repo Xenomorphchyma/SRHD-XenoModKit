@@ -701,6 +701,429 @@ def _call_arguments(text: str, function_name: str) -> list[tuple[int, list[str]]
     return result
 
 
+def _function_parameters(block: FunctionBlock) -> tuple[str, ...]:
+    """Return normalized parameter names, accepting decompiler type prefixes."""
+
+    header = FUNCTION_HEADER_RE.match(_mask_non_code(block.lines[0])) if block.lines else None
+    if not header or not header.group(2).strip():
+        return ()
+    parameters: list[str] = []
+    for declaration in header.group(2).split(","):
+        names = IDENTIFIER_RE.findall(declaration)
+        if not names:
+            return ()
+        parameters.append(names[-1].casefold())
+    return tuple(parameters)
+
+
+def _simple_identifier(expression: str) -> str | None:
+    value = expression.strip().casefold()
+    return value if IDENTIFIER_RE.fullmatch(value) else None
+
+
+def _shared_tvars(project: RsonProject) -> set[str]:
+    return {
+        str(item.get("Name", "")).casefold()
+        for item in project.iter_objects()
+        if str(item.get("Type", "")).casefold() == "tvar" and str(item.get("Name", "")).strip()
+    }
+
+
+def _persistent_item_parameter_sinks(
+    functions: dict[str, FunctionBlock],
+    shared: set[str],
+) -> dict[str, dict[int, set[str]]]:
+    """Find helper parameters copied into shared TVars/arrays."""
+
+    result: dict[str, dict[int, set[str]]] = {}
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    indexed_assignment = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[[^]]+\]\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    for name, block in functions.items():
+        parameters = _function_parameters(block)
+        if not parameters:
+            continue
+        sinks: dict[int, set[str]] = {}
+        for line in block.lines[1:]:
+            masked = _mask_non_code(line)
+            for match in assignment.finditer(masked):
+                target = match.group(1).casefold()
+                source = _simple_identifier(match.group(2))
+                if target not in shared or source not in parameters:
+                    continue
+                sinks.setdefault(parameters.index(source), set()).add(target)
+            for match in indexed_assignment.finditer(masked):
+                target = match.group(1).casefold()
+                source = _simple_identifier(match.group(2))
+                if target in shared and source in parameters:
+                    sinks.setdefault(parameters.index(source), set()).add(target)
+            for _position, arguments in _call_arguments(masked, "ArrayAdd"):
+                if len(arguments) < 2:
+                    continue
+                target = _simple_identifier(arguments[0])
+                source = _simple_identifier(arguments[1])
+                if target in shared and source in parameters:
+                    sinks.setdefault(parameters.index(source), set()).add(target)
+        if sinks:
+            result[name] = sinks
+    changed = True
+    while changed:
+        changed = False
+        for name, block in functions.items():
+            parameters = _function_parameters(block)
+            if not parameters:
+                continue
+            for callee_name, callee_sinks in tuple(result.items()):
+                for line in block.lines[1:]:
+                    for _position, arguments in _call_arguments(
+                        _mask_non_code(line), functions[callee_name].name
+                    ):
+                        for callee_index, targets in callee_sinks.items():
+                            if callee_index >= len(arguments):
+                                continue
+                            actual = _simple_identifier(arguments[callee_index])
+                            if actual not in parameters:
+                                continue
+                            caller_index = parameters.index(actual)
+                            current = result.setdefault(name, {}).setdefault(caller_index, set())
+                            before = len(current)
+                            current.update(targets)
+                            changed |= len(current) != before
+    return result
+
+
+def _raw_item_expression(expression: str, tainted: set[str]) -> bool:
+    folded = _mask_non_code(expression).casefold()
+    if re.search(r"\bid\s*\(", folded):
+        return False
+    if re.search(r"\b(?:createquestitem|idtoitem)\s*\(", folded):
+        return True
+    return any(re.search(rf"\b{re.escape(value)}\b", folded) for value in tainted)
+
+
+def _lint_persistent_item_handles(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject transient Item references persisted beyond their current turn.
+
+    RScript exposes Item values as engine objects.  Persisting the raw dword in
+    a TVar/array keeps an address that can become invalid on a later turn.  A
+    stable project must persist ``Id(item)`` and resolve it with ``IdToItem``.
+    """
+
+    shared = _shared_tvars(project)
+    if not shared:
+        return []
+    helper_sinks = _persistent_item_parameter_sinks(functions, shared)
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[str, int, str]] = set()
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    indexed_assignment = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[[^]]+\]\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+
+    def report(block: FunctionBlock, line_offset: int, target: str, evidence: str) -> None:
+        key = (block.name.casefold(), line_offset, target)
+        if key in reported:
+            return
+        reported.add(key)
+        issues.append(
+            RuntimeIssue(
+                "error",
+                "runtime-persistent-raw-item-handle",
+                f"Сырая ссылка Item сохраняется в {target} между ходами; сохраните Id(item), затем восстанавливайте Item через IdToItem",
+                path,
+                f"{block.location} line {block.start_line + line_offset}",
+                evidence.strip(),
+            )
+        )
+
+    for block in functions.values():
+        tainted: set[str] = set()
+        for line_offset, line in enumerate(block.lines[1:], start=1):
+            masked = _mask_non_code(line)
+            matches = list(assignment.finditer(masked))
+            for match in matches:
+                target = match.group(1).casefold()
+                expression = match.group(2).strip()
+                raw = _raw_item_expression(expression, tainted)
+                if target in shared and raw:
+                    report(block, line_offset, target, line)
+                if raw:
+                    tainted.add(target)
+                else:
+                    tainted.discard(target)
+
+            for match in indexed_assignment.finditer(masked):
+                target = match.group(1).casefold()
+                if target in shared and _raw_item_expression(match.group(2), tainted):
+                    report(block, line_offset, target, line)
+
+            for _position, arguments in _call_arguments(masked, "LinkItemToScript"):
+                if arguments and (linked := _simple_identifier(arguments[0])):
+                    tainted.discard(linked)
+
+            for _position, arguments in _call_arguments(masked, "ArrayAdd"):
+                if len(arguments) < 2:
+                    continue
+                target = _simple_identifier(arguments[0])
+                if target in shared and _raw_item_expression(arguments[1], tainted):
+                    report(block, line_offset, target, line)
+
+            for helper_name, sinks in helper_sinks.items():
+                for _position, arguments in _call_arguments(masked, functions[helper_name].name):
+                    for parameter_index, targets in sinks.items():
+                        if parameter_index >= len(arguments) or not _raw_item_expression(
+                            arguments[parameter_index], tainted
+                        ):
+                            continue
+                        for target in targets:
+                            report(block, line_offset, target, line)
+    return issues
+
+
+_SHIP_EFFECT_CALLS = {
+    "getitemfromship": "mutates",
+    "ordertakeoff": "takes_off",
+    "shipout": "ships_out",
+}
+
+
+def _function_call_sites(block: FunctionBlock) -> list[tuple[int, int, str, list[str]]]:
+    """Return line/depth/call/args records in source order."""
+
+    result: list[tuple[int, int, str, list[str]]] = []
+    depth = 0
+    for line_offset, line in enumerate(block.lines):
+        masked = _mask_non_code(line)
+        depth_before = depth
+        calls: list[tuple[int, str, list[str]]] = []
+        for match in CALL_RE.finditer(masked):
+            name = match.group(1)
+            if name.casefold() in CONTROL_CALLS:
+                continue
+            parsed = _call_arguments(masked[match.start():], name)
+            if parsed:
+                calls.append((match.start(), name.casefold(), parsed[0][1]))
+        for _position, name, arguments in sorted(calls):
+            result.append((line_offset, depth_before, name, arguments))
+        depth += masked.count("{") - masked.count("}")
+    return result
+
+
+def _ship_effect_summaries(
+    functions: dict[str, FunctionBlock],
+) -> dict[str, dict[str, set[int]]]:
+    summaries = {
+        name: {"mutates": set(), "takes_off": set(), "ships_out": set()}
+        for name in functions
+    }
+    sites = {name: _function_call_sites(block) for name, block in functions.items()}
+    changed = True
+    while changed:
+        changed = False
+        for name, block in functions.items():
+            parameters = _function_parameters(block)
+            if not parameters:
+                continue
+            for _line, _depth, call, arguments in sites[name]:
+                direct_effect = _SHIP_EFFECT_CALLS.get(call)
+                if direct_effect and arguments:
+                    actual = _simple_identifier(arguments[0])
+                    if actual in parameters:
+                        index = parameters.index(actual)
+                        if index not in summaries[name][direct_effect]:
+                            summaries[name][direct_effect].add(index)
+                            changed = True
+                callee = summaries.get(call)
+                if callee is None:
+                    continue
+                for effect, parameter_indexes in callee.items():
+                    for parameter_index in parameter_indexes:
+                        if parameter_index >= len(arguments):
+                            continue
+                        actual = _simple_identifier(arguments[parameter_index])
+                        if actual not in parameters:
+                            continue
+                        index = parameters.index(actual)
+                        if index not in summaries[name][effect]:
+                            summaries[name][effect].add(index)
+                            changed = True
+    return summaries
+
+
+def _lint_landed_shipout_after_mutation(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+    summaries: dict[str, dict[str, set[int]]],
+) -> list[RuntimeIssue]:
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for name, block in functions.items():
+        states: dict[str, set[str]] = {}
+        reported: set[str] = set()
+        # Only straight-line statements in the outer function body are joined.
+        # Branch-local ShipOut calls are handled conservatively to avoid claiming
+        # that mutually exclusive landed/space branches execute together.
+        for line_offset, depth, call, arguments in _function_call_sites(block):
+            if line_offset == 0 or depth != 1 or not arguments:
+                continue
+            effects_by_actual: dict[str, set[str]] = {}
+            effect = _SHIP_EFFECT_CALLS.get(call)
+            direct_actual = _simple_identifier(arguments[0])
+            if effect and direct_actual:
+                effects_by_actual.setdefault(direct_actual, set()).add(effect)
+            callee = summaries.get(call)
+            if callee is not None:
+                for callee_effect, parameter_indexes in callee.items():
+                    for parameter_index in parameter_indexes:
+                        if parameter_index >= len(arguments):
+                            continue
+                        actual = _simple_identifier(arguments[parameter_index])
+                        if actual:
+                            effects_by_actual.setdefault(actual, set()).add(callee_effect)
+            for actual, call_effects in effects_by_actual.items():
+                before = set(states.get(actual, set()))
+                if "ships_out" in call_effects and before & {"mutated", "takeoff"} and actual not in reported:
+                    reported.add(actual)
+                    reason = "разгрузки/изменения груза" if "mutated" in before else "OrderTakeOff"
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "runtime-landed-shipout-after-mutation",
+                            f"{block.name} передаёт {actual} в ShipOut в том же прямом пути после {reason}; завершите обработчик и проверяйте выход в космос на следующем ходу",
+                            path,
+                            f"{block.location} line {block.start_line + line_offset}",
+                            block.lines[line_offset].strip(),
+                        )
+                    )
+                state = states.setdefault(actual, set())
+                if "mutates" in call_effects:
+                    state.add("mutated")
+                if "takes_off" in call_effects:
+                    state.add("takeoff")
+    return issues
+
+
+def _lint_group_shipout_iteration(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+    summaries: dict[str, dict[str, set[int]]],
+) -> list[RuntimeIssue]:
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for item in project.iter_objects():
+        object_id = item.get("#") if isinstance(item.get("#"), int) else None
+        for field in ("Code", "ActCode", "LinkCode"):
+            value = item.get(field)
+            if not isinstance(value, list):
+                continue
+            lines = [str(line) for line in value]
+            index = 0
+            while index < len(lines):
+                header = _mask_non_code(lines[index])
+                loop = re.search(r"\bfor\s*\((.*)\)", header, re.IGNORECASE)
+                if not loop or "groupcount" not in loop.group(1).casefold():
+                    index += 1
+                    continue
+                clauses = loop.group(1).split(";")
+                if len(clauses) != 3:
+                    index += 1
+                    continue
+                iterator_match = re.search(
+                    r"(?:\bint\s+)?\b([A-Za-z_][A-Za-z0-9_]*)\s*=",
+                    clauses[0],
+                    re.IGNORECASE,
+                )
+                if not iterator_match:
+                    index += 1
+                    continue
+                iterator = iterator_match.group(1).casefold()
+                reverse = "groupcount" in clauses[0].casefold() or bool(
+                    re.search(rf"(?:--\s*{re.escape(iterator)}|{re.escape(iterator)}\s*--|{re.escape(iterator)}\s*=.*-)", clauses[2], re.IGNORECASE)
+                )
+
+                cursor = index
+                depth = 0
+                opened = False
+                while cursor < len(lines):
+                    masked_line = _mask_non_code(lines[cursor])
+                    if "{" in masked_line:
+                        opened = True
+                    depth += masked_line.count("{") - masked_line.count("}")
+                    cursor += 1
+                    if opened and depth <= 0:
+                        break
+                if not opened:
+                    index += 1
+                    continue
+                body = lines[index:cursor]
+                folded_body = _mask_non_code("\n".join(body))
+                aliases = {
+                    match.group(1).casefold()
+                    for match in re.finditer(
+                        rf"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*GroupShip\s*\([^,]+,\s*{re.escape(iterator)}\s*\)",
+                        folded_body,
+                        re.IGNORECASE,
+                    )
+                }
+                removal_positions: list[int] = []
+                for alias in aliases:
+                    removal_positions.extend(
+                        position
+                        for position, arguments in _call_arguments(folded_body, "ShipOut")
+                        if arguments and _simple_identifier(arguments[0]) == alias
+                    )
+                    for function_name, summary in summaries.items():
+                        for position, arguments in _call_arguments(
+                            folded_body, functions[function_name].name
+                        ):
+                            if any(
+                                parameter_index < len(arguments)
+                                and _simple_identifier(arguments[parameter_index]) == alias
+                                for parameter_index in summary["ships_out"]
+                            ):
+                                removal_positions.append(position)
+                compensation_positions = [
+                    match.start()
+                    for match in re.finditer(
+                        rf"(?:--\s*{re.escape(iterator)}|{re.escape(iterator)}\s*--|\b{re.escape(iterator)}\s*=\s*{re.escape(iterator)}\s*-\s*1\b)",
+                        folded_body,
+                        re.IGNORECASE,
+                    )
+                ]
+                compensated = bool(removal_positions) and all(
+                    any(position > removal for position in compensation_positions)
+                    for removal in removal_positions
+                )
+                if removal_positions and not reverse and not compensated:
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "runtime-group-mutated-during-iteration",
+                            f"Прямой обход GroupShip удаляет текущий корабль через ShipOut без коррекции {iterator}; используйте обратный обход, уменьшите индекс или завершите обработчик",
+                            path,
+                            f"object #{object_id} {field}:{index + 1}",
+                            lines[index].strip(),
+                        )
+                    )
+                index = max(cursor, index + 1)
+    return issues
+
+
 def _proven_bounded_self_recursion(block: FunctionBlock) -> bool:
     """Prove a narrow one-step base-case normalization used by old mods."""
 
@@ -919,6 +1342,10 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     issues.extend(_lint_cross_block_calls(project, functions))
     issues.extend(_lint_runtime_cross_block_variables(project))
     issues.extend(_lint_linked_empty_runtime_code(project))
+    issues.extend(_lint_persistent_item_handles(project, functions))
+    ship_effects = _ship_effect_summaries(functions)
+    issues.extend(_lint_landed_shipout_after_mutation(project, functions, ship_effects))
+    issues.extend(_lint_group_shipout_iteration(project, functions, ship_effects))
     graph = _call_graph(functions)
     risky = _risky_functions(functions, graph)
 

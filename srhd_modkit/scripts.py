@@ -308,6 +308,64 @@ class RsonProject:
         if not isinstance(self.data.get("Visual.Links"), list):
             issues.append(ScriptIssue("error", "rson-links", "Visual.Links должен быть массивом"))
 
+        groups = self.data.get("Visual.Objects", [])
+        if isinstance(groups, list):
+            for group_index, group in enumerate(groups):
+                if not isinstance(group, dict):
+                    continue
+                group_location = f"Visual.Objects[{group_index}]"
+                if "Items" in group and not isinstance(group["Items"], list):
+                    issues.append(
+                        ScriptIssue(
+                            "error",
+                            "rson-items-collection",
+                            "Items должен быть массивом объектов TItem",
+                            f"{group_location}.Items",
+                        )
+                    )
+                items = group.get("Items", [])
+                item_count = len(items) if isinstance(items, list) else 0
+                if "Items.Count" in group:
+                    declared_count = group["Items.Count"]
+                    if (
+                        not isinstance(declared_count, int)
+                        or isinstance(declared_count, bool)
+                        or declared_count != item_count
+                    ):
+                        issues.append(
+                            ScriptIssue(
+                                "error",
+                                "rson-items-count",
+                                f"Items.Count должен совпадать с числом объектов Items ({item_count})",
+                                f"{group_location}.Items.Count",
+                            )
+                        )
+                for collection_name, collection in group.items():
+                    if not isinstance(collection, list):
+                        continue
+                    for item_index, value in enumerate(collection):
+                        if not isinstance(value, dict) or value.get("Type") != "TItem":
+                            continue
+                        location = f"{group_location}.{collection_name}[{item_index}]"
+                        if collection_name != "Items":
+                            issues.append(
+                                ScriptIssue(
+                                    "error",
+                                    "rson-titem-collection",
+                                    "TItem должен находиться в коллекции Items; иначе RScript может зависнуть при сборке",
+                                    location,
+                                )
+                            )
+                        if "+Place" not in value or not isinstance(value.get("+Place"), str):
+                            issues.append(
+                                ScriptIssue(
+                                    "error",
+                                    "rson-titem-place",
+                                    "У TItem обязательно строковое поле +Place (пустая строка допустима)",
+                                    location,
+                                )
+                            )
+
         objects = list(self.iter_objects())
         identifiers: list[int] = []
         for index, item in enumerate(objects):

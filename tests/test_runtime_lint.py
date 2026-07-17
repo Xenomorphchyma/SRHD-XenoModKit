@@ -502,6 +502,162 @@ class RuntimeLintTests(unittest.TestCase):
         self.assertIn("runtime-recursion-cycle", codes)
         self.assertIn("runtime-unbounded-loop", codes)
 
+    def test_raw_item_handle_cannot_be_persisted_through_helper(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "cargo_slot", "Parent": -1, "#": 10},
+            {"Type": "TVar", "Name": "cargo_registry", "Parent": -1, "#": 11},
+        ]
+        group["Operations"][0]["Code"].extend(
+            [
+                "function StoreCargo(int index, dword cargo)",
+                "{",
+                "    cargo_slot = cargo;",
+                "    ArrayAdd(cargo_registry, cargo);",
+                "}",
+                "function CreateCargo()",
+                "{",
+                "    dword cargo = CreateQuestItem(0, 1, 1, 1, 0, 0, 0, 0);",
+                "    StoreCargo(0, cargo);",
+                "}",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("raw-item.rson")))
+        matching = [issue for issue in issues if issue.code == "runtime-persistent-raw-item-handle"]
+        self.assertEqual({issue.evidence for issue in matching}, {"StoreCargo(0, cargo);"})
+        self.assertTrue(all(issue.severity == "error" for issue in matching))
+
+    def test_item_id_can_be_persisted_and_resolved_each_turn(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "cargo_slot", "Parent": -1, "#": 10}
+        ]
+        group["Operations"][0]["Code"].extend(
+            [
+                "function StoreCargo(int cargo_id)",
+                "{",
+                "    cargo_slot = cargo_id;",
+                "}",
+                "function CreateCargo()",
+                "{",
+                "    dword cargo = CreateQuestItem(0, 1, 1, 1, 0, 0, 0, 0);",
+                "    int cargo_id = Id(cargo);",
+                "    StoreCargo(cargo_id);",
+                "    dword current_cargo = IdToItem(cargo_slot);",
+                "    if(current_cargo) ItemExist(current_cargo);",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("stable-item-id.rson")))
+        }
+        self.assertNotIn("runtime-persistent-raw-item-handle", codes)
+
+    def test_unload_then_shipout_in_same_handler_is_rejected(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function TakeCargo(int convoy_index, dword ship, dword cargo)",
+                "{",
+                "    GetItemFromShip(ship, cargo);",
+                "}",
+                "function DeliverTransport(int convoy_index, dword ship, dword cargo)",
+                "{",
+                "    TakeCargo(convoy_index, ship, cargo);",
+                "    FreeItem(cargo);",
+                "    ShipOut(ship);",
+                "}",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("unsafe-shipout.rson")))
+        matching = [issue for issue in issues if issue.code == "runtime-landed-shipout-after-mutation"]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].evidence, "ShipOut(ship);")
+
+    def test_takeoff_boundary_without_same_turn_shipout_is_safe(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function TakeCargo(int convoy_index, dword ship, dword cargo)",
+                "{",
+                "    GetItemFromShip(ship, cargo);",
+                "}",
+                "function DeliverTransport(int convoy_index, dword ship, dword cargo)",
+                "{",
+                "    TakeCargo(convoy_index, ship, cargo);",
+                "    FreeItem(cargo);",
+                "    OrderTakeOff(ship);",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("safe-takeoff.rson")))
+        }
+        self.assertNotIn("runtime-landed-shipout-after-mutation", codes)
+
+    def test_forward_group_iteration_must_compensate_for_shipout(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function RemoveTransport(dword ship)",
+                "{",
+                "    ShipOut(ship);",
+                "}",
+                "function Cleanup(dword group)",
+                "{",
+                "    for(int cursor = 0; cursor < GroupCount(group); cursor = cursor + 1)",
+                "    {",
+                "        dword ship = GroupShip(group, cursor);",
+                "        RemoveTransport(ship);",
+                "    }",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("unsafe-group.rson")))
+        }
+        self.assertIn("runtime-group-mutated-during-iteration", codes)
+
+    def test_group_iteration_allows_reverse_or_compensated_index(self) -> None:
+        for name, loop in (
+            (
+                "reverse",
+                [
+                    "    for(int cursor = GroupCount(group) - 1; cursor >= 0; cursor = cursor - 1)",
+                    "    {",
+                    "        dword ship = GroupShip(group, cursor);",
+                    "        ShipOut(ship);",
+                    "    }",
+                ],
+            ),
+            (
+                "compensated",
+                [
+                    "    for(int cursor = 0; cursor < GroupCount(group); cursor = cursor + 1)",
+                    "    {",
+                    "        dword ship = GroupShip(group, cursor);",
+                    "        ShipOut(ship);",
+                    "        cursor = cursor - 1;",
+                    "    }",
+                ],
+            ),
+        ):
+            with self.subTest(name=name):
+                data = deepcopy(SAFE_RSON)
+                data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+                    ["function Cleanup(dword group)", "{", *loop, "}"]
+                )
+                codes = {
+                    issue.code
+                    for issue in lint_rson_runtime(RsonProject(data, Path(f"{name}-group.rson")))
+                }
+                self.assertNotIn("runtime-group-mutated-during-iteration", codes)
+
     def test_one_step_base_case_recursion_is_proven_bounded(self) -> None:
         data = deepcopy(SAFE_RSON)
         init = data["Visual.Objects"][0]["Operations"][0]

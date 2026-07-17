@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.9.0
+# Команды SRHD ModKit 0.9.1
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -48,6 +48,13 @@ python -B srhd.py script inspect-scr "<OUT>/Script.scr" --json
 Также доступны `set-field`, `clone-object`, `add-link`, `delete-link`, `delete-object`, `register` и `convert`. Перед точечным изменением смотреть `python -B srhd.py script <command> --help`.
 
 RScript использует адаптивный лимит без верхнего потолка. Ноль у `build --timeout`, `decompile --decompile-timeout`, `decompile --roundtrip-timeout` и одноимённых параметров `compare-scr` отключает общий дедлайн. Непроверенный RSON сохранять только отдельным явным `--keep-unverified`; штатный output остаётся fail-closed.
+
+`script validate` блокирует неправильную форму `TItem` до запуска RScript.
+`script lint-runtime` дополнительно блокирует сырые `Item` в общих TVar/массивах,
+разгрузку с `ShipOut` в одном прямом пути и удаление текущего `GroupShip` при
+прямом обходе без коррекции индекса. Исправлять код сохранением `Id(item)` с
+последующим `IdToItem`, границей хода после `OrderTakeOff` и обратным обходом
+изменяемой группы.
 
 ## Ресурсы
 

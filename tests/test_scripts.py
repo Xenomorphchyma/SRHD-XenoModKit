@@ -4,11 +4,12 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from copy import deepcopy
 from io import StringIO
 from pathlib import Path
 
 from srhd_modkit.cli import main
-from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, inspect_scr, load_rson
+from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, RsonProject, inspect_scr, load_rson
 
 
 SAMPLE = {
@@ -44,6 +45,54 @@ class RsonTests(unittest.TestCase):
             self.assertEqual(project.summary()["objects"], 2)
             result = project.search_code("HullHP")
             self.assertEqual(result[0]["object_id"], 2)
+
+    def test_titem_requires_items_collection_and_place_field(self) -> None:
+        valid = deepcopy(SAMPLE)
+        valid["Visual.Objects"][0]["Items"] = [
+            {
+                "Type": "TItem",
+                "Name": "Cargo",
+                "Parent": -1,
+                "#": 3,
+                "Class": 5,
+                "Item.Type": 0,
+                "Owner": 6,
+                "+Place": "",
+            }
+        ]
+        self.assertEqual(RsonProject(valid, Path("valid-item.rson")).validate(), [])
+
+        wrong_collection = deepcopy(valid)
+        item = wrong_collection["Visual.Objects"][0].pop("Items")[0]
+        wrong_collection["Visual.Objects"][0]["Operations"].append(item)
+        codes = {
+            issue.code
+            for issue in RsonProject(wrong_collection, Path("wrong-item.rson")).validate()
+        }
+        self.assertIn("rson-titem-collection", codes)
+
+        missing_place = deepcopy(valid)
+        del missing_place["Visual.Objects"][0]["Items"][0]["+Place"]
+        codes = {
+            issue.code
+            for issue in RsonProject(missing_place, Path("missing-place.rson")).validate()
+        }
+        self.assertIn("rson-titem-place", codes)
+
+    def test_optional_items_count_must_match_when_serialized(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0]["Items"] = [
+            {"Type": "TItem", "Name": "Cargo", "Parent": -1, "#": 3, "+Place": ""}
+        ]
+        self.assertNotIn(
+            "rson-items-count",
+            {issue.code for issue in RsonProject(data, Path("implicit-count.rson")).validate()},
+        )
+        data["Visual.Objects"][0]["Items.Count"] = 0
+        self.assertIn(
+            "rson-items-count",
+            {issue.code for issue in RsonProject(data, Path("bad-count.rson")).validate()},
+        )
 
     def test_set_code_updates_line_count_and_survives_json(self) -> None:
         with tempfile.TemporaryDirectory() as name:
