@@ -339,6 +339,127 @@ def _lint_unavailable_engine_calls(
     return issues
 
 
+_PROVEN_NON_STRING_STATE_RE = re.compile(
+    r"(?:[-+]?\d+(?:\.\d+)?|true|false|null)",
+    re.IGNORECASE,
+)
+
+
+def _has_id_to_ship_guard(prefix: str, variable: str) -> bool:
+    """Prove that a simple IdToShip argument is greater than reserved IDs.
+
+    SRHD 2.1.2500 does not return a safe null handle for ``IdToShip(0)``.
+    The scripting reference also explicitly requires an ID greater than 1.
+    Accept only an enclosing positive check or an early-exit negative guard;
+    a plain ``if(id)`` still permits the reserved ID 1.
+    """
+
+    escaped = re.escape(variable)
+    positive = re.compile(
+        rf"\bif\s*\(\s*(?:{escaped}\s*>\s*1|{escaped}\s*>=\s*2)\s*\)",
+        re.IGNORECASE,
+    )
+    negative_exit = re.compile(
+        rf"\bif\s*\(\s*(?:{escaped}\s*<=\s*1|{escaped}\s*<\s*2)\s*\)"
+        rf"\s*(?:\{{\s*)?(?:exit|return)\b",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return bool(positive.search(prefix) or negative_exit.search(prefix))
+
+
+def _lint_id_to_ship_guards(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject IdToShip calls that can receive the reserved IDs 0 or 1."""
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for block in functions.values():
+        masked_lines = [_mask_non_code(line) for line in block.lines]
+        for line_offset, masked in enumerate(masked_lines):
+            for _position, arguments in _call_arguments(masked, "IdToShip"):
+                if not arguments:
+                    continue
+                argument = arguments[0].strip()
+                literal = re.fullmatch(r"[-+]?\d+", argument)
+                if literal:
+                    if int(argument) > 1:
+                        continue
+                else:
+                    variable = _simple_identifier(argument)
+                    if variable is None:
+                        # Expressions such as Id(ship) carry their own object
+                        # provenance and are outside this simple guard proof.
+                        continue
+                    prefix = "\n".join(masked_lines[: line_offset + 1])
+                    if _has_id_to_ship_guard(prefix, variable):
+                        continue
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-id-to-ship-reserved-id",
+                        "IdToShip требует доказанный ID больше 1; при ID 0 движок может вернуть непригодный указатель, а следующий ShipInScript/ShipStar аварийно завершит ход",
+                        path,
+                        f"{block.location} line {block.start_line + line_offset}",
+                        block.lines[line_offset].strip(),
+                    )
+                )
+    return issues
+
+
+def _lint_suppressed_shipjoin_state(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject locked joined ships whose automatic initial state is disabled.
+
+    A non-string third ShipJoin argument explicitly suppresses automatic state
+    entry.  Locking such an NPC without a subsequent ChangeState leaves the
+    engine warrior without valid AI state and can crash TWarrior.NextDay.
+    """
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for block in functions.values():
+        sites = _function_call_sites(block)
+        for line_offset, _depth, call, arguments in sites:
+            if call != "shipjoin" or len(arguments) < 3:
+                continue
+            if not _PROVEN_NON_STRING_STATE_RE.fullmatch(arguments[2].strip()):
+                continue
+            ship = _simple_identifier(arguments[1])
+            if ship is None:
+                continue
+            later_sites = [site for site in sites if site[0] >= line_offset]
+            locks_ship = any(
+                later_call == "orderlock"
+                and len(later_arguments) >= 2
+                and _simple_identifier(later_arguments[0]) == ship
+                and later_arguments[1].strip() == "1"
+                for _later_line, _later_depth, later_call, later_arguments in later_sites
+            )
+            changes_state = any(
+                later_call == "changestate"
+                and len(later_arguments) >= 2
+                and _simple_identifier(later_arguments[1]) == ship
+                for _later_line, _later_depth, later_call, later_arguments in later_sites
+            )
+            if not locks_ship or changes_state:
+                continue
+            issues.append(
+                RuntimeIssue(
+                    "error",
+                    "runtime-shipjoin-state-suppressed",
+                    "ShipJoin получает нестроковый третий аргумент и отключает начальное State, после чего корабль блокируется через OrderLock без ChangeState; используйте ShipJoin(group, ship), строковое имя State или явно вызовите ChangeState",
+                    path,
+                    f"{block.location} line {block.start_line + line_offset}",
+                    block.lines[line_offset].strip(),
+                )
+            )
+    return issues
+
+
 def _variable_definitions(lines: list[str]) -> set[str]:
     masked = _mask_non_code("\n".join(lines))
     return {
@@ -1873,6 +1994,8 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     functions, issues = _extract_functions(project)
     issues.extend(_lint_cross_block_calls(project, functions))
     issues.extend(_lint_unavailable_engine_calls(project, functions))
+    issues.extend(_lint_id_to_ship_guards(project, functions))
+    issues.extend(_lint_suppressed_shipjoin_state(project, functions))
     issues.extend(_lint_runtime_cross_block_variables(project))
     issues.extend(_lint_linked_empty_runtime_code(project))
     issues.extend(_lint_persistent_item_handles(project, functions))

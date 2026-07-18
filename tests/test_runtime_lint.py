@@ -677,6 +677,95 @@ class RuntimeLintTests(unittest.TestCase):
         self.assertIn("Not link var :IdToStar", matching[0].message)
         self.assertEqual(matching[0].evidence, "dword star = IdToStar(42);")
 
+    def test_id_to_ship_requires_guard_above_reserved_ids(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function RestoreShip(int ship_id)",
+                "{",
+                "    dword ship = IdToShip(ship_id);",
+                "    if(ship) ShipInScript(ship, 0);",
+                "}",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("unsafe-id-to-ship.rson")))
+        matching = [
+            issue for issue in issues if issue.code == "runtime-id-to-ship-reserved-id"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].evidence, "dword ship = IdToShip(ship_id);")
+
+    def test_id_to_ship_guard_above_one_is_safe(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function RestoreShip(int ship_id)",
+                "{",
+                "    if(ship_id <= 1) exit;",
+                "    dword ship = IdToShip(ship_id);",
+                "    if(ship) ShipInScript(ship, 0);",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("safe-id-to-ship.rson")))
+        }
+        self.assertNotIn("runtime-id-to-ship-reserved-id", codes)
+
+    def test_locked_shipjoin_without_initial_state_is_rejected(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function SpawnEscort(dword group, dword ship)",
+                "{",
+                "    ShipJoin(group, ship, 1);",
+                "    OrderLock(ship, 1);",
+                "}",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("stateless-escort.rson")))
+        matching = [
+            issue for issue in issues if issue.code == "runtime-shipjoin-state-suppressed"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].evidence, "ShipJoin(group, ship, 1);")
+
+    def test_two_argument_shipjoin_keeps_initial_state(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function SpawnEscort(dword group, dword ship)",
+                "{",
+                "    ShipJoin(group, ship);",
+                "    OrderLock(ship, 1);",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("stateful-escort.rson")))
+        }
+        self.assertNotIn("runtime-shipjoin-state-suppressed", codes)
+
+    def test_explicit_change_state_allows_suppressed_shipjoin_default(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function SpawnEscort(dword group, dword ship)",
+                "{",
+                "    ShipJoin(group, ship, 1);",
+                "    ChangeState('Escort', ship);",
+                "    OrderLock(ship, 1);",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("explicit-state.rson")))
+        }
+        self.assertNotIn("runtime-shipjoin-state-suppressed", codes)
+
     def test_unproven_local_star_resolver_does_not_protect_saved_handle(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]
