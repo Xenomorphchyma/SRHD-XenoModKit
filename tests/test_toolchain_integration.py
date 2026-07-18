@@ -130,7 +130,10 @@ class ToolchainIntegrationTests(unittest.TestCase):
             self.chain.convert_script_project(source_svr, rson)
             project = load_rson(rson)
             state = next(item for item in project.iter_objects() if item.get("Type") == "TState")
-            state["OnActCode"] = "PlayerActCode();"
+            # Keep the event handler runtime-linkable as well as syntactically
+            # compilable: RScript accepts unknown call names that the game can
+            # later reject with Not link var.
+            state["OnActCode"] = "CurTurn();"
             project.set_state_events(state["#"], ["t_OnEnteringForm", "t_OnPlayerBuyEq"])
             project.save(rson)
             scr = root / "events.scr"

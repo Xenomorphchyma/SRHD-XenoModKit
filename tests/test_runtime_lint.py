@@ -1111,6 +1111,269 @@ class RuntimeLintTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "runtime-onstart-unguarded-world"):
                 cmd_script_build(args)
 
+    def test_unknown_call_is_rejected_against_runtime_api_registry(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "CurTurn();",
+            "MissingModHelper();",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("unresolved.rson")))
+        matching = [
+            issue for issue in issues if issue.code == "runtime-unresolved-user-function"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("MissingModHelper", matching[0].message)
+
+    def test_imported_tvar_is_accepted_as_callable(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "ExternalRoll", "Parent": -1, "#": 12}
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = ["ExternalRoll(1, 2);"]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("imported.rson")))
+        }
+        self.assertNotIn("runtime-unresolved-user-function", codes)
+
+    def test_apostrophe_in_on_act_line_comment_is_rejected(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["States"][0]["OnActCode"] = (
+            "[t_OnEnteringForm|]\n// user's route helper\nruntime_ready = 1;"
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("apostrophe.rson")))
+        }
+        self.assertIn("runtime-apostrophe-in-line-comment", codes)
+        data["Visual.Objects"][0]["States"][0]["OnActCode"] = (
+            "[t_OnEnteringForm|]\n// DebugCall('quoted value');\nruntime_ready = 1;"
+        )
+        balanced_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("quoted-comment.rson")))
+        }
+        self.assertNotIn("runtime-apostrophe-in-line-comment", balanced_codes)
+
+    def test_rscript_array_zero_index_and_zero_dimension_model_are_rejected(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "unknown queue = newarray(1);",
+            "ArrayClear(queue);",
+            "if(ArrayDim(queue) > 0 && queue[0] > 1) exit;",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("array-zero.rson")))
+        }
+        self.assertIn("runtime-rscript-array-service-index", codes)
+        self.assertIn("runtime-rscript-array-empty-dimension", codes)
+
+    def test_one_based_rscript_array_loop_is_safe(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "unknown queue = newarray(1);",
+            "ArrayClear(queue);",
+            "if(ArrayDim(queue) <= 1) exit;",
+            "for(int i = 1; i < ArrayDim(queue); i = i + 1)",
+            "{",
+            "    if(queue[i] > 1) exit;",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("array-safe.rson")))
+        }
+        self.assertNotIn("runtime-rscript-array-service-index", codes)
+        self.assertNotIn("runtime-rscript-array-empty-dimension", codes)
+
+    def test_fixed_size_rscript_array_remains_zero_based(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "unknown labels = newarray(5);",
+            "labels[0] = CT('First');",
+            "for(int i = 0; i < 5; i = i + 1)",
+            "{",
+            "    labels[i] = i;",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("fixed-array.rson")))
+        }
+        self.assertNotIn("runtime-rscript-array-service-index", codes)
+
+    def test_persistent_paired_arrays_need_dimension_proof(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "queue_ids", "Init": "newarray(1)", "#": 20},
+            {"Type": "TVar", "Name": "queue_turns", "Init": "newarray(1)", "#": 21},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "for(int i = 1; i < ArrayDim(queue_ids); i = i + 1)",
+            "{",
+            "    if(queue_ids[i] && queue_turns[i] <= CurTurn()) exit;",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("paired.rson")))
+        }
+        self.assertIn("runtime-rscript-paired-array-dimension", codes)
+
+    def test_rndobject_rejects_proven_item_anchor(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword cargo = CreateQuestItem('Cargo', 0);",
+            "RndObject(1, 100, cargo);",
+            "RndObject(1, 100, Player());",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("rnd-item.rson")))
+        matching = [issue for issue in issues if issue.code == "runtime-rndobject-anchor-type"]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("cargo", matching[0].evidence or "")
+
+    def test_repeated_detach_unlink_free_chain_is_rejected(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function RemoveCargo(ship, index)",
+            "{",
+            "    dword item = GetItemFromShip(ship, index);",
+            "    ReleaseItemFromScript(item);",
+            "    FreeItem(item);",
+            "}",
+            "function Deliver(ship)",
+            "{",
+            "    RemoveCargo(ship, 1);",
+            "    RemoveCargo(ship, 2);",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("mass-free.rson")))
+        }
+        self.assertIn("runtime-item-list-mutated-during-star-act", codes)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function RemoveOneCargo(ship, index)",
+            "{",
+            "    dword item = GetItemFromShip(ship, index);",
+            "    ReleaseItemFromScript(item);",
+            "    FreeItem(item);",
+            "}",
+        ]
+        single_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("single-free.rson")))
+        }
+        self.assertNotIn("runtime-item-list-mutated-during-star-act", single_codes)
+
+    def test_hyperspace_guard_must_precede_order_mutation(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function Reassign(ship)",
+            "{",
+            "    ShipSetBad(ship, 0);",
+            "    OrderNone(ship);",
+            "    if(ShipInHyperSpace(ship)) exit;",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("late-hyper.rson")))
+        }
+        self.assertIn("runtime-order-rewrite-in-hyperspace", codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function Reassign(ship)",
+            "{",
+            "    if(ShipInHyperSpace(ship)) exit;",
+            "    ShipSetBad(ship, 0);",
+            "    OrderNone(ship);",
+            "}",
+        ]
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("early-hyper.rson")))
+        }
+        self.assertNotIn("runtime-order-rewrite-in-hyperspace", safe_codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function SendShip(ship)",
+            "{",
+            "    if(GetShipPlanet(ship))",
+            "    {",
+            "        OrderTakeOff(ship);",
+            "        exit;",
+            "    }",
+            "    if(ShipInHyperSpace(ship)) exit;",
+            "    OrderNone(ship);",
+            "}",
+        ]
+        branch_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("branch-exit.rson")))
+        }
+        self.assertNotIn("runtime-order-rewrite-in-hyperspace", branch_codes)
+
+    def test_helper_group_mutation_cannot_be_reread_same_call(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function DropShip(ship)",
+            "{",
+            "    ShipOut(ship);",
+            "}",
+            "function Cleanup(group)",
+            "{",
+            "    dword ship = GroupShip(group, 0);",
+            "    DropShip(ship);",
+            "    GroupCount(group);",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("group-use-after.rson")))
+        }
+        self.assertIn("runtime-post-group-mutation-dereference", codes)
+
+    def test_turn_cleanup_gate_prevents_same_date_reentry_warning(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "if(CurTurn() < cleanup_turn) exit;",
+            "cleanup_turn = CurTurn() + 1;",
+            "dword ship = GroupShip(CleanupGroup, 0);",
+            "ShipDestroy(ship);",
+            "exit;",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("cleanup-gated.rson")))
+        }
+        self.assertNotIn("runtime-cleanup-without-turn-gate", codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword ship = GroupShip(CleanupGroup, 0);",
+            "ShipDestroy(ship);",
+            "exit;",
+        ]
+        unsafe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("cleanup-ungated.rson")))
+        }
+        self.assertIn("runtime-cleanup-without-turn-gate", unsafe_codes)
+
+    def test_shipgetbad_target_cannot_be_propagated_raw(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword attacker = ShipGetBad(transport);",
+            "if(attacker) GroupSetBad(Escorts, attacker);",
+            "OrderFollowShip(escort, attacker, 1, 1);",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("stale-bad.rson")))
+        }
+        self.assertIn("runtime-stale-shipgetbad-follow", codes)
+
 
 if __name__ == "__main__":
     unittest.main()

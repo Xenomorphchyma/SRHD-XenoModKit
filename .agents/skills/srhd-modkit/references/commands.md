@@ -62,6 +62,14 @@ TVar/массивах, сырые `Planet`/`Star`/`Ship` в долгоживущ
 защитой; после обратного удаления завершать обработчик до следующего
 `GroupCount` той же группы.
 
+Lint также сверяет имена вызовов с API SRHD 2.1.2500, локальными объявлениями и
+явными импортами; проверяет one-based динамические массивы после `newarray(1)`
+или `ArrayClear`, Item-anchor у `RndObject`, повторное detach/unlink/free,
+поздний hyperspace-guard после изменения приказа и повторное чтение изменённой
+группы. Предупреждения `runtime-cleanup-without-turn-gate` и
+`runtime-stale-shipgetbad-follow` являются intent-sensitive и блокируют только
+при `--strict`/`--warnings-as-errors`.
+
 ## Ресурсы
 
 ```powershell

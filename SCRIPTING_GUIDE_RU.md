@@ -157,6 +157,20 @@ Mod_Turn();
 `TVar` является общей переменной проекта и не считается несвязанным локальным
 присваиванием. Top без явного `Init` такого исключения не получает.
 
+Кроме расположения уже найденных функций проверяется само существование каждого
+вызова. `runtime-unresolved-user-function` сверяет имя с локальными объявлениями,
+явными `ImportedFunction`/глобальными `TVar` и переносимым реестром API
+SRHD 2.1.2500. Это важно, потому что RScript способен записать неизвестное имя в
+SCR без ошибки, а игра остановит ход только позже с `Not link var :Name`.
+Правило не использует префиксы конкретного мода.
+
+Непарный ASCII-апостроф в `//`-комментарии блокируется как
+`runtime-apostrophe-in-line-comment`: старый runtime-линкер способен продолжить
+разбор такого комментария как незакрытой строки и «спрятать» последующее
+объявление функции. Полностью закомментированный код с парными строковыми
+литералами допускается. В обычном тексте используйте `’`, дефис или другую
+формулировку.
+
 Флаг обязан быть изначально нулевым и устанавливаться только в обработчике
 `TState` с `t_OnEnteringForm` (он может одновременно обслуживать
 `t_OnPlayerBuyEq`). Inline-guard в начале Turn распознаётся как полноценный
@@ -209,6 +223,39 @@ if(current_cargo) ItemExist(current_cargo);
 
 Анализ межпроцедурный: передача сырого `cargo` в функцию-сеттер, которая пишет
 параметр в общий `TVar` или `ArrayAdd`, также считается ошибкой.
+
+### ABI динамических массивов RScript
+
+Фиксированный `newarray(N)`, где `N > 1`, остаётся обычным массивом с индексами
+`0..N-1`. Но динамический массив, созданный как `newarray(1)` и/или очищенный
+`ArrayClear`, сохраняет служебный элемент `0` типа `vtUnknown`. Его реальные
+записи лежат в `1..ArrayDim-1`, а пустой массив имеет `ArrayDim == 1`.
+
+Поэтому runtime-lint блокирует:
+
+- прямое чтение/запись `[0]` и циклы от `0`/до `>= 0` для доказанного
+  динамического массива — `runtime-rscript-array-service-index`;
+- проверки вроде `ArrayDim(queue) > 0` или `<= 0` —
+  `runtime-rscript-array-empty-dimension`;
+- общий индекс нескольких persistent-массивов без проверки равенства размеров —
+  предупреждение `runtime-rscript-paired-array-dimension`.
+
+Безопасный шаблон:
+
+```text
+unknown ids = newarray(1);
+ArrayClear(ids);
+if(ArrayDim(ids) <= 1) exit;
+for(int i = 1; i < ArrayDim(ids); i = i + 1) Use(ids[i]);
+```
+
+### Тип anchor у UtilityFunctions.RndObject
+
+Третий аргумент `RndObject(min, max, anchor)` не принимает `Item`. Если ModKit
+доказывает происхождение значения от `CreateQuestItem`, `GetItemFromShip`,
+`IdToItem` или другого Item-returning вызова, сборка блокируется как
+`runtime-rndobject-anchor-type`. Используйте `Player`/`Ship`/`Planet`/`Star` как
+подтверждённый anchor, а для независимого броска — встроенный `Rnd(min, max)`.
 
 ### Ссылки на Planet, Star и Ship в сохранениях
 
@@ -336,6 +383,47 @@ OrderLock(ship, 1);
 `GroupCount` той же группы после обратного прохода без промежуточного
 `exit`/`return` блокируется отдельно как
 `runtime-group-recount-after-mutation`.
+
+После `ShipOut`, `ShipDestroy`, `OrderTakeOff` или межпроцедурной разгрузки
+корабля, полученного через `GroupShip`, нельзя снова читать связанную группу или
+старый handle на том же живом пути. `runtime-post-group-mutation-dereference`
+распространяет эффект через helper-функции и требует `exit`/`return`/`continue`
+до следующего `GroupCount`, `GroupShip`, `GroupToShip` или разыменования.
+
+Повторяющаяся цепочка
+`GetItemFromShip → ReleaseItemFromScript → FreeItem` в одном вызове способна
+повредить текущий `TStar.ScriptShipsAndItemsAct`. Цикл либо несколько вызовов
+одного helper для того же корабля блокируются как
+`runtime-item-list-mutated-during-star-act`. В текущем ходе безопаснее только
+пометить предметы/корабль, завершить обработчик и удалить их после отдельной
+границы хода.
+
+### Приказы, гиперпространство и временные боевые цели
+
+`OrderNone`, `OrderFollowShip`, `OrderJump`, `OrderLanding`, setter-форма
+`OrderLock` и `ShipSetBad` могут отменить незавершённый переход. Если функция
+сначала меняет приказ, а ниже проверяет `ShipInHyperSpace` для того же корабля,
+`runtime-order-rewrite-in-hyperspace` блокирует поздний guard. Проверка должна
+доминировать над первым изменением:
+
+```text
+if(ShipInHyperSpace(ship) || ShipInHyperSpace(leader)) exit;
+ShipSetBad(ship, 0);
+OrderNone(ship);
+```
+
+Цель из `ShipGetBad` является временной: после разрыва систем она может остаться
+в старом состоянии. Перед `OrderFollowShip` нужны normal-space обоих кораблей и
+одинаковая `ShipStar`; сырое распространение через `GroupSetBad` даёт
+`runtime-stale-shipgetbad-follow`. Пока это предупреждение, потому что намерение
+боевого FSM нельзя полностью доказать статически.
+
+Глобальный Turn-код может войти несколько раз за одну игровую дату. Cleanup,
+который удаляет один корабль и делает только `exit`, получает предупреждение
+`runtime-cleanup-without-turn-gate`. Для гарантии «один объект за ход» используйте
+парный барьер `if(CurTurn() < next_cleanup_turn) exit;` и назначайте
+`next_cleanup_turn = CurTurn() + 1`. Предупреждение становится блокирующим в
+`--strict`/`--warnings-as-errors`.
 
 Дополнительная проверка ловит рекурсивные циклы вызовов и
 буквально неограниченные циклы `while(1)`/`for(;;)`.

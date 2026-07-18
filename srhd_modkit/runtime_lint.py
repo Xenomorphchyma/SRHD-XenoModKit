@@ -7,6 +7,7 @@ from typing import Any, Iterable
 
 from .blockpar import BlockParDocument, BlockParNode
 from .models import ModuleInfo
+from .rscript_api import RSCRIPT_RUNTIME_CALLS
 from .scripts import RsonProject
 
 
@@ -105,6 +106,36 @@ class FunctionBlock:
     @property
     def location(self) -> str:
         return f"object #{self.object_id} {self.field}:{self.start_line} function {self.name}"
+
+
+@dataclass(frozen=True)
+class CodeContainer:
+    object_id: int | None
+    field: str
+    lines: tuple[str, ...]
+    code_type: str = ""
+
+    @property
+    def location(self) -> str:
+        return f"object #{self.object_id} {self.field}"
+
+
+def _iter_code_containers(project: RsonProject) -> Iterable[CodeContainer]:
+    """Yield every executable RSON field, including string OnActCode handlers."""
+
+    for item in project.iter_objects():
+        object_id = item.get("#") if isinstance(item.get("#"), int) else None
+        code_type = str(item.get("Code.Type", "")).casefold()
+        for field, value in item.items():
+            if not field.casefold().endswith("code"):
+                continue
+            if isinstance(value, list):
+                lines = tuple(str(line) for line in value)
+            elif isinstance(value, str):
+                lines = tuple(value.splitlines())
+            else:
+                continue
+            yield CodeContainer(object_id, field, lines, code_type)
 
 
 def _mask_non_code(text: str) -> str:
@@ -336,6 +367,437 @@ def _lint_unavailable_engine_calls(
                         )
                     )
                     reported.add(call)
+    return issues
+
+
+def _line_comment_start(line: str) -> int | None:
+    """Return the first // outside an RScript string literal."""
+
+    quote = ""
+    escaped = False
+    for index, char in enumerate(line[:-1]):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "/" and line[index + 1] == "/":
+            return index
+    return None
+
+
+def _lint_apostrophes_in_line_comments(project: RsonProject) -> list[RuntimeIssue]:
+    """Reject apostrophes that old SRHD runtime linking can parse as quotes."""
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for container in _iter_code_containers(project):
+        for line_number, line in enumerate(container.lines, start=1):
+            comment_start = _line_comment_start(line)
+            comment = line[comment_start + 2 :] if comment_start is not None else ""
+            if comment_start is None or comment.count("'") % 2 == 0:
+                continue
+            issues.append(
+                RuntimeIssue(
+                    "error",
+                    "runtime-apostrophe-in-line-comment",
+                    "Непарный апостроф в //-комментарии может нарушить линковку старого runtime и завершить ход с Not link var; замените его типографским апострофом, дефисом или переформулируйте комментарий",
+                    path,
+                    f"{container.location}:{line_number}",
+                    line.strip(),
+                )
+            )
+    return issues
+
+
+def _callable_tvars(project: RsonProject) -> set[str]:
+    result = {
+        str(item.get("Name", "")).casefold()
+        for item in project.iter_objects()
+        if str(item.get("Type", "")).casefold() == "tvar" and str(item.get("Name", "")).strip()
+    }
+    imported_assignment = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*ImportedFunction\s*\(",
+        re.IGNORECASE,
+    )
+    for container in _iter_code_containers(project):
+        for line in container.lines:
+            result.update(
+                match.group(1).casefold()
+                for match in imported_assignment.finditer(_mask_non_code(line))
+            )
+    return result
+
+
+def _lint_unresolved_user_functions(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject calls absent from the local scope, imports and SRHD API registry."""
+
+    known_project = set(functions)
+    shared_init = {name for name, block in functions.items() if block.code_type == "init"}
+    callables = _callable_tvars(project)
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for container in _iter_code_containers(project):
+        local = _local_function_names(list(container.lines))
+        available = set(RSCRIPT_RUNTIME_CALLS) | callables | local
+        if container.field == "Code" and container.code_type == "turn":
+            available.update(shared_init)
+        reported: set[str] = set()
+        for line_number, line in enumerate(container.lines, start=1):
+            declaration = FUNCTION_RE.match(_mask_non_code(line))
+            declared = declaration.group(1).casefold() if declaration else None
+            for original in sorted(_calls(line), key=str.casefold):
+                call = original.casefold()
+                if call == declared or call in available or call in known_project or call in reported:
+                    continue
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-unresolved-user-function",
+                        f"Вызов {original} не определён в этом code object, не импортирован и отсутствует в реестре API SRHD 2.1.2500; игра может завершить ход с Not link var :{original}",
+                        path,
+                        f"{container.location}:{line_number}",
+                        line.strip(),
+                    )
+                )
+                reported.add(call)
+    return issues
+
+
+def _rscript_array_names(project: RsonProject) -> set[str]:
+    names: set[str] = set()
+    new_array = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*newarray\s*\(",
+        re.IGNORECASE,
+    )
+    for item in project.iter_objects():
+        if str(item.get("Type", "")).casefold() == "tvar":
+            init = str(item.get("Init", ""))
+            if re.search(r"\bnewarray\s*\(\s*1\s*\)", init, re.IGNORECASE):
+                name = str(item.get("Name", "")).strip()
+                if name:
+                    names.add(name.casefold())
+    for container in _iter_code_containers(project):
+        for line in container.lines:
+            masked = _mask_non_code(line)
+            for match in new_array.finditer(masked):
+                arguments = _call_arguments(match.group(0) + masked[match.end() :], "newarray")
+                if arguments and arguments[0][1] and arguments[0][1][0].strip() == "1":
+                    names.add(match.group(1).casefold())
+            for call in ("ArrayAdd", "ArrayClear", "ArrayDelete"):
+                for _position, arguments in _call_arguments(masked, call):
+                    if arguments and (name := _simple_identifier(arguments[0])):
+                        names.add(name)
+    return names
+
+
+def _brace_block_end(lines: tuple[str, ...], start: int) -> int:
+    depth = 0
+    opened = False
+    for index in range(start, len(lines)):
+        masked = _mask_non_code(lines[index])
+        opened |= "{" in masked
+        depth += masked.count("{") - masked.count("}")
+        if opened and depth <= 0:
+            return index
+    return start
+
+
+def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
+    """Enforce the one-based data ABI of RScript dynamic arrays."""
+
+    arrays = _rscript_array_names(project)
+    shared_tvars = _shared_tvars(project)
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[int | None, str, int, str]] = set()
+
+    def report(
+        container: CodeContainer,
+        line_number: int,
+        code: str,
+        severity: str,
+        message: str,
+        evidence: str,
+    ) -> None:
+        key = (container.object_id, container.field, line_number, code)
+        if key in reported:
+            return
+        reported.add(key)
+        issues.append(
+            RuntimeIssue(
+                severity,
+                code,
+                message,
+                path,
+                f"{container.location}:{line_number}",
+                evidence.strip(),
+            )
+        )
+
+    direct_zero = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*0+\s*\]",
+        re.IGNORECASE,
+    )
+    dim_compare = re.compile(
+        r"\bArrayDim\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*"
+        r"(<=|>=|==|!=|<|>)\s*([01])\b",
+        re.IGNORECASE,
+    )
+    reversed_dim_compare = re.compile(
+        r"\b([01])\s*(<=|>=|==|!=|<|>)\s*"
+        r"ArrayDim\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        re.IGNORECASE,
+    )
+    boolean_dim = re.compile(
+        r"\bif\s*\(\s*!?\s*ArrayDim\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\)",
+        re.IGNORECASE,
+    )
+    for_header = re.compile(r"\bfor\s*\((.*)\)", re.IGNORECASE)
+
+    for container in _iter_code_containers(project):
+        masked_lines = tuple(_mask_non_code(line) for line in container.lines)
+        for index, (line, masked) in enumerate(zip(container.lines, masked_lines)):
+            for match in direct_zero.finditer(masked):
+                if match.group(1).casefold() not in arrays:
+                    continue
+                report(
+                    container,
+                    index + 1,
+                    "runtime-rscript-array-service-index",
+                    "error",
+                    f"{match.group(1)}[0] обращается к служебному vtUnknown-элементу RScript; реальные записи массива начинаются с индекса 1",
+                    line,
+                )
+
+            for match in dim_compare.finditer(masked):
+                name, operator, constant = match.group(1).casefold(), match.group(2), match.group(3)
+                unsafe = constant == "0" and operator in {">", "<=", "==", "!=", "<"}
+                unsafe |= constant == "1" and operator == ">="
+                if name in arrays and unsafe:
+                    report(
+                        container,
+                        index + 1,
+                        "runtime-rscript-array-empty-dimension",
+                        "error",
+                        f"ArrayDim({match.group(1)}) сравнивается как у нулевого массива, но пустой newarray(1)/ArrayClear имеет размер 1; используйте > 1 для наличия записей и <= 1 для пустоты",
+                        line,
+                    )
+            for match in reversed_dim_compare.finditer(masked):
+                constant, operator, name = match.group(1), match.group(2), match.group(3).casefold()
+                # Reverse the operator to the ArrayDim-left form.
+                reverse = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
+                normalized = reverse[operator]
+                unsafe = constant == "0" and normalized in {">", "<=", "==", "!=", "<"}
+                unsafe |= constant == "1" and normalized == ">="
+                if name in arrays and unsafe:
+                    report(
+                        container,
+                        index + 1,
+                        "runtime-rscript-array-empty-dimension",
+                        "error",
+                        f"Проверка размера {match.group(3)} использует нулевую модель массива; у пустого RScript-массива ArrayDim равен 1",
+                        line,
+                    )
+            for match in boolean_dim.finditer(masked):
+                if match.group(1).casefold() in arrays:
+                    report(
+                        container,
+                        index + 1,
+                        "runtime-rscript-array-empty-dimension",
+                        "error",
+                        "ArrayDim используется как boolean, но пустой RScript-массив уже имеет истинный размер 1; сравните размер с 1 явно",
+                        line,
+                    )
+
+            loop = for_header.search(masked)
+            if not loop:
+                continue
+            clauses = loop.group(1).split(";")
+            if len(clauses) != 3:
+                continue
+            iterator_match = re.search(
+                r"(?:\bint\s+)?\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+                clauses[0],
+                re.IGNORECASE,
+            )
+            if not iterator_match:
+                continue
+            iterator = iterator_match.group(1).casefold()
+            initial = re.sub(r"\s+", "", iterator_match.group(2)).casefold()
+            condition = re.sub(r"\s+", "", clauses[1]).casefold()
+            end = _brace_block_end(container.lines, index)
+            body = _mask_non_code("\n".join(container.lines[index : end + 1]))
+            indexed = {
+                match.group(1).casefold()
+                for match in re.finditer(
+                    rf"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*{re.escape(iterator)}\s*\]",
+                    body,
+                    re.IGNORECASE,
+                )
+            }
+            indexed &= arrays
+            if indexed and (
+                initial in {"0", "+0"}
+                or re.search(rf"\b{re.escape(iterator)}>=0\b", condition)
+                or re.search(rf"\b{re.escape(iterator)}>-1\b", condition)
+            ):
+                report(
+                    container,
+                    index + 1,
+                    "runtime-rscript-array-service-index",
+                    "error",
+                    f"Цикл разыменовывает {', '.join(sorted(indexed))}[{iterator}] и допускает служебный индекс 0; начните прямой обход с 1, а обратный завершайте на >= 1",
+                    line,
+                )
+
+            shared_indexed = indexed & shared_tvars
+            if len(shared_indexed) < 2:
+                continue
+            prefix = _mask_non_code("\n".join(container.lines[: index + 1]))
+            pairs = {
+                frozenset((left.casefold(), right.casefold()))
+                for left, right in re.findall(
+                    r"ArrayDim\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*(?:==|!=)\s*"
+                    r"ArrayDim\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+                    prefix,
+                    re.IGNORECASE,
+                )
+            }
+            missing = [
+                (left, right)
+                for pos, left in enumerate(sorted(shared_indexed))
+                for right in sorted(shared_indexed)[pos + 1 :]
+                if frozenset((left, right)) not in pairs
+            ]
+            if missing:
+                left, right = missing[0]
+                report(
+                    container,
+                    index + 1,
+                    "runtime-rscript-paired-array-dimension",
+                    "warning",
+                    f"Один индекс читает persistent-массивы {left} и {right} без доказанного равенства ArrayDim; старое сохранение или частичное обновление может разъединить пары",
+                    line,
+                )
+    return issues
+
+
+_ITEM_RETURN_CALLS = {
+    "createequipment",
+    "createhull",
+    "createitem",
+    "createquestitem",
+    "getitemfromship",
+    "groupitem",
+    "idtoitem",
+    "planetitems",
+    "shipeqinslot",
+    "shopitems",
+    "staritems",
+    "storageitems",
+}
+
+
+def _item_returning_functions(functions: dict[str, FunctionBlock]) -> set[str]:
+    """Infer helpers whose result is a proven Item object."""
+
+    result: set[str] = set()
+    changed = True
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool|unknown)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    while changed:
+        changed = False
+        sources = _ITEM_RETURN_CALLS | result
+        for name, block in functions.items():
+            item_vars: set[str] = set()
+            returns_item = False
+            for line in block.lines[1:]:
+                masked = _mask_non_code(line)
+                for match in assignment.finditer(masked):
+                    target = match.group(1).casefold()
+                    expression = match.group(2)
+                    calls = {call.casefold() for call in _calls(expression)}
+                    identifiers = {value.casefold() for value in IDENTIFIER_RE.findall(expression)}
+                    is_item = bool(calls & sources or identifiers & item_vars)
+                    if target == "result" and is_item:
+                        returns_item = True
+                    elif target != "result":
+                        if is_item:
+                            item_vars.add(target)
+                        else:
+                            item_vars.discard(target)
+            if returns_item and name not in result:
+                result.add(name)
+                changed = True
+    return result
+
+
+def _lint_rndobject_anchor_types(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject an Item passed as UtilityFunctions.RndObject's object anchor."""
+
+    sources = _ITEM_RETURN_CALLS | _item_returning_functions(functions)
+    graph_items = {
+        str(item.get("Name", "")).casefold()
+        for item in project.iter_objects()
+        if str(item.get("Type", "")).casefold() == "titem" and str(item.get("Name", "")).strip()
+    }
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool|unknown)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    for container in _iter_code_containers(project):
+        item_vars = set(graph_items)
+        for line_number, line in enumerate(container.lines, start=1):
+            masked = _mask_non_code(line)
+            # Evaluate anchors before assignments on the same statement so a
+            # previous value is not accidentally replaced by the result lhs.
+            for _position, arguments in _call_arguments(masked, "RndObject"):
+                if len(arguments) < 3:
+                    continue
+                anchor = arguments[2]
+                anchor_calls = {call.casefold() for call in _calls(anchor)}
+                anchor_identifiers = {
+                    value.casefold() for value in IDENTIFIER_RE.findall(anchor)
+                }
+                if not (anchor_calls & sources or anchor_identifiers & item_vars):
+                    continue
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-rndobject-anchor-type",
+                        "Третий аргумент UtilityFunctions.RndObject доказан как Item, но DLL принимает только поддерживаемый мировой anchor (Player/Ship/Planet/Star); для независимого броска используйте Rnd",
+                        path,
+                        f"{container.location}:{line_number}",
+                        line.strip(),
+                    )
+                )
+            for match in assignment.finditer(masked):
+                target = match.group(1).casefold()
+                expression = match.group(2)
+                calls = {call.casefold() for call in _calls(expression)}
+                identifiers = {value.casefold() for value in IDENTIFIER_RE.findall(expression)}
+                if calls & sources or identifiers & item_vars:
+                    item_vars.add(target)
+                else:
+                    item_vars.discard(target)
     return issues
 
 
@@ -1560,6 +2022,7 @@ _SHIP_EFFECT_CALLS = {
     "getitemfromship": "mutates",
     "ordertakeoff": "takes_off",
     "shipout": "ships_out",
+    "shipdestroy": "ships_out",
 }
 
 
@@ -1616,6 +2079,650 @@ def _ship_effect_summaries(
                             summaries[name][effect].add(index)
                             changed = True
     return summaries
+
+
+def _direct_detached_item_free_sites(
+    block: FunctionBlock,
+) -> list[tuple[int, int, str]]:
+    """Return FreeItem sites for items detached and unlinked in this call."""
+
+    parameters = _function_parameters(block)
+    origins: dict[str, str] = {}
+    released: set[str] = set()
+    result: list[tuple[int, int, str]] = []
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|unknown)\s+)?\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    sites = _function_call_sites(block)
+    sites_by_line: dict[int, list[tuple[int, str, list[str]]]] = {}
+    for line_offset, depth, call, arguments in sites:
+        sites_by_line.setdefault(line_offset, []).append((depth, call, arguments))
+    for line_offset, line in enumerate(block.lines[1:], start=1):
+        masked = _mask_non_code(line)
+        for match in assignment.finditer(masked):
+            target = match.group(1).casefold()
+            get_calls = _call_arguments(match.group(2), "GetItemFromShip")
+            if get_calls and get_calls[0][1]:
+                ship = _simple_identifier(get_calls[0][1][0])
+                if ship:
+                    origins[target] = ship
+            else:
+                alias = _simple_identifier(match.group(2))
+                if alias in origins:
+                    origins[target] = origins[alias]
+                else:
+                    origins.pop(target, None)
+                    released.discard(target)
+        for depth, call, arguments in sites_by_line.get(line_offset, []):
+            if not arguments:
+                continue
+            item = _simple_identifier(arguments[0])
+            if call == "releaseitemfromscript" and item in origins:
+                released.add(item)
+            elif call == "freeitem" and item in origins and item in released:
+                result.append((line_offset, depth, origins[item]))
+    return result
+
+
+def _detached_item_free_summaries(
+    functions: dict[str, FunctionBlock],
+) -> dict[str, set[int]]:
+    summaries: dict[str, set[int]] = {name: set() for name in functions}
+    sites = {name: _function_call_sites(block) for name, block in functions.items()}
+    for name, block in functions.items():
+        parameters = _function_parameters(block)
+        for _line, _depth, ship in _direct_detached_item_free_sites(block):
+            if ship in parameters:
+                summaries[name].add(parameters.index(ship))
+    changed = True
+    while changed:
+        changed = False
+        for name, block in functions.items():
+            parameters = _function_parameters(block)
+            if not parameters:
+                continue
+            for _line, _depth, call, arguments in sites[name]:
+                for parameter_index in summaries.get(call, set()):
+                    if parameter_index >= len(arguments):
+                        continue
+                    actual = _simple_identifier(arguments[parameter_index])
+                    if actual not in parameters:
+                        continue
+                    caller_index = parameters.index(actual)
+                    if caller_index not in summaries[name]:
+                        summaries[name].add(caller_index)
+                        changed = True
+    return summaries
+
+
+def _lint_repeated_detached_item_free(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject repeated detach/unlink/free mutations in one runtime invocation."""
+
+    summaries = _detached_item_free_summaries(functions)
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[str, str]] = set()
+    for name, block in functions.items():
+        affected: dict[str, list[tuple[int, int, str]]] = {}
+        for line_offset, depth, ship in _direct_detached_item_free_sites(block):
+            affected.setdefault(ship, []).append((line_offset, depth, block.lines[line_offset]))
+        for line_offset, depth, call, arguments in _function_call_sites(block):
+            if line_offset == 0:
+                continue
+            for parameter_index in summaries.get(call, set()):
+                if parameter_index >= len(arguments):
+                    continue
+                actual = _simple_identifier(arguments[parameter_index])
+                if actual:
+                    affected.setdefault(actual, []).append(
+                        (line_offset, depth, block.lines[line_offset])
+                    )
+        for ship, sites in affected.items():
+            repeated = len(sites) > 1 or any(depth > 1 for _line, depth, _evidence in sites)
+            if not repeated or (name, ship) in reported:
+                continue
+            reported.add((name, ship))
+            line_offset, _depth, evidence = sites[1] if len(sites) > 1 else sites[0]
+            issues.append(
+                RuntimeIssue(
+                    "error",
+                    "runtime-item-list-mutated-during-star-act",
+                    f"{block.name} многократно отделяет, освобождает из скрипта и уничтожает предметы корабля {ship} в одном вызове; это может повредить текущий TStar.ScriptShipsAndItemsAct. Отложите массовое удаление за границу хода",
+                    path,
+                    f"{block.location} line {block.start_line + line_offset}",
+                    evidence.strip(),
+                )
+            )
+    return issues
+
+
+_ORDER_MUTATION_CALLS = {
+    "ordernone": 0,
+    "orderfollowship": 0,
+    "orderjump": 0,
+    "orderlanding": 0,
+    "shipsetbad": 0,
+    "orderlock": 0,
+}
+
+
+def _order_call_mutates(call: str, arguments: list[str]) -> bool:
+    if call == "orderlock" and len(arguments) < 2:
+        return False
+    if call == "shipsetbad" and len(arguments) < 2:
+        return False
+    return call in _ORDER_MUTATION_CALLS and bool(arguments)
+
+
+def _line_depths(lines: tuple[str, ...]) -> list[int]:
+    result: list[int] = []
+    depth = 0
+    for line in lines:
+        result.append(depth)
+        depth += _brace_delta(line)
+    return result
+
+
+def _variable_reassigned(
+    lines: tuple[str, ...],
+    variable: str,
+    start: int,
+    end: int,
+) -> bool:
+    assignment = re.compile(rf"\b{re.escape(variable)}\s*=(?!=)", re.IGNORECASE)
+    return any(assignment.search(_mask_non_code(lines[index])) for index in range(start, end))
+
+
+def _has_exit_transit_condition(text: str, variable: str) -> bool:
+    """Recognize one balanced if(condition) whose taken path exits."""
+
+    masked = _mask_non_code(text)
+    match = re.search(r"\bif\s*\(", masked, re.IGNORECASE)
+    if not match:
+        return False
+    start = match.end()
+    depth = 1
+    close = -1
+    for index in range(start, len(masked)):
+        if masked[index] == "(":
+            depth += 1
+        elif masked[index] == ")":
+            depth -= 1
+            if depth == 0:
+                close = index
+                break
+    if close < 0:
+        return False
+    condition = masked[start:close]
+    wanted = re.escape(variable)
+    positive_hyper = False
+    for hyper in re.finditer(
+        rf"\bShipInHyperSpace\s*\(\s*{wanted}\s*\)", condition, re.IGNORECASE
+    ):
+        prefix = condition[: hyper.start()].rstrip()
+        if not prefix.endswith("!"):
+            positive_hyper = True
+            break
+    non_normal = bool(
+        re.search(
+            rf"!\s*ShipInNormalSpace\s*\(\s*{wanted}\s*\)",
+            condition,
+            re.IGNORECASE,
+        )
+    )
+    if not (positive_hyper or non_normal):
+        return False
+    rest = masked[close + 1 :].lstrip()
+    if re.match(r"(?:exit|return|continue)\b", rest, re.IGNORECASE):
+        return True
+    if not rest.startswith("{"):
+        return False
+    depth = 0
+    block_close = -1
+    for index, char in enumerate(rest):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                block_close = index
+                break
+    if block_close < 0:
+        return False
+    body = rest[1:block_close].strip()
+    return bool(re.search(r"(?:exit|return|continue)\s*;?\s*$", body, re.IGNORECASE))
+
+
+def _has_transit_guard_before(
+    block: FunctionBlock,
+    line_offset: int,
+    variable: str,
+) -> bool:
+    """Prove a dominating early exit or enclosing normal-space branch."""
+
+    lines = block.lines
+    depths = _line_depths(lines)
+    wanted = re.escape(variable)
+    for index in range(1, line_offset):
+        window = "\n".join(lines[index:line_offset])
+        if (
+            _has_exit_transit_condition(window, variable)
+            and depths[index] <= depths[line_offset]
+            and not _variable_reassigned(lines, variable, index + 1, line_offset + 1)
+        ):
+            return True
+
+    for index in range(1, line_offset + 1):
+        masked = _mask_non_code(lines[index])
+        if "if" not in masked.casefold() or "{" not in masked:
+            continue
+        positive = re.search(
+            rf"!\s*ShipInHyperSpace\s*\(\s*{wanted}\s*\)", masked, re.IGNORECASE
+        ) or re.search(
+            rf"\bShipInNormalSpace\s*\(\s*{wanted}\s*\)", masked, re.IGNORECASE
+        )
+        if "||" in masked or not positive or _brace_block_end(lines, index) < line_offset:
+            continue
+        if not _variable_reassigned(lines, variable, index + 1, line_offset + 1):
+            return True
+
+    same_line_prefix = _mask_non_code(lines[line_offset])
+    direct_call_positions = [
+        position
+        for position, call, arguments in _line_call_sites(same_line_prefix)
+        if _order_call_mutates(call, arguments)
+        and arguments
+        and _simple_identifier(arguments[0]) == variable
+    ]
+    if direct_call_positions:
+        prefix = same_line_prefix[: min(direct_call_positions)]
+        if re.search(
+            rf"!\s*ShipInHyperSpace\s*\(\s*{wanted}\s*\)", prefix, re.IGNORECASE
+        ) or re.search(
+            rf"\bShipInNormalSpace\s*\(\s*{wanted}\s*\)", prefix, re.IGNORECASE
+        ):
+            return True
+    return False
+
+
+def _has_late_transit_guard(
+    block: FunctionBlock,
+    line_offset: int,
+    variable: str,
+) -> bool:
+    depths = _line_depths(block.lines)
+    origin_depth = depths[line_offset]
+    for index in range(line_offset + 1, len(block.lines)):
+        masked_line = _mask_non_code(block.lines[index])
+        if depths[index] <= origin_depth and re.fullmatch(
+            r"\s*(?:exit|return|continue)\s*;?\s*", masked_line, re.IGNORECASE
+        ):
+            return False
+        window = "\n".join(block.lines[index : min(len(block.lines), index + 8)])
+        if _has_exit_transit_condition(window, variable):
+            return True
+    return False
+
+
+def _unguarded_order_summaries(
+    functions: dict[str, FunctionBlock],
+) -> dict[str, set[int]]:
+    summaries: dict[str, set[int]] = {name: set() for name in functions}
+    sites = {name: _function_call_sites(block) for name, block in functions.items()}
+    changed = True
+    while changed:
+        changed = False
+        for name, block in functions.items():
+            parameters = _function_parameters(block)
+            if not parameters:
+                continue
+            for line_offset, _depth, call, arguments in sites[name]:
+                if line_offset == 0:
+                    continue
+                affected: list[str] = []
+                if _order_call_mutates(call, arguments):
+                    actual = _simple_identifier(arguments[_ORDER_MUTATION_CALLS[call]])
+                    if actual:
+                        affected.append(actual)
+                for parameter_index in summaries.get(call, set()):
+                    if parameter_index < len(arguments):
+                        actual = _simple_identifier(arguments[parameter_index])
+                        if actual:
+                            affected.append(actual)
+                for actual in affected:
+                    if actual not in parameters or _has_transit_guard_before(
+                        block, line_offset, actual
+                    ):
+                        continue
+                    caller_index = parameters.index(actual)
+                    if caller_index not in summaries[name]:
+                        summaries[name].add(caller_index)
+                        changed = True
+    return summaries
+
+
+def _lint_order_rewrite_before_hyperspace_guard(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject an order mutation placed before its own hyperspace barrier."""
+
+    summaries = _unguarded_order_summaries(functions)
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[str, str]] = set()
+    for name, block in functions.items():
+        for line_offset, _depth, call, arguments in _function_call_sites(block):
+            if line_offset == 0:
+                continue
+            affected: list[str] = []
+            if _order_call_mutates(call, arguments):
+                actual = _simple_identifier(arguments[_ORDER_MUTATION_CALLS[call]])
+                if actual:
+                    affected.append(actual)
+            for parameter_index in summaries.get(call, set()):
+                if parameter_index < len(arguments):
+                    actual = _simple_identifier(arguments[parameter_index])
+                    if actual:
+                        affected.append(actual)
+            for actual in affected:
+                if (name, actual) in reported or _has_transit_guard_before(
+                    block, line_offset, actual
+                ):
+                    continue
+                if not _has_late_transit_guard(block, line_offset, actual):
+                    continue
+                reported.add((name, actual))
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-order-rewrite-in-hyperspace",
+                        f"{block.name} меняет приказ/боевую цель корабля {actual} до проверки ShipInHyperSpace; поздний guard не предотвращает отмену незавершённого прыжка. Перенесите transit-barrier перед первым Order*/ShipSetBad",
+                        path,
+                        f"{block.location} line {block.start_line + line_offset}",
+                        block.lines[line_offset].strip(),
+                    )
+                )
+    return issues
+
+
+def _group_key(expression: str) -> str:
+    return _simple_identifier(expression) or re.sub(r"\s+", "", expression).casefold()
+
+
+def _lint_post_group_mutation_dereference(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+    summaries: dict[str, dict[str, set[int]]],
+) -> list[RuntimeIssue]:
+    """Reject group/ship reads after a helper mutates the same live member."""
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    assignment = re.compile(
+        r"(?:\b(?:int|dword)\s+)?\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    group_read_calls = {"groupcount", "groupship", "grouptoship"}
+    reported: set[tuple[str, str]] = set()
+    for name, block in functions.items():
+        aliases: dict[str, str] = {}
+        tainted_groups: dict[str, int] = {}
+        tainted_ships: dict[str, int] = {}
+        depth = 0
+        for line_offset, line in enumerate(block.lines):
+            masked = _mask_non_code(line)
+            depth_before = depth
+            depth += masked.count("{") - masked.count("}")
+            if line_offset and re.fullmatch(
+                r"\s*(?:exit|return|continue)\s*;?\s*", masked, re.IGNORECASE
+            ):
+                tainted_groups = {
+                    key: origin for key, origin in tainted_groups.items() if origin < depth_before
+                }
+                tainted_ships = {
+                    key: origin for key, origin in tainted_ships.items() if origin < depth_before
+                }
+                continue
+
+            for match in assignment.finditer(masked):
+                target = match.group(1).casefold()
+                expression = match.group(2)
+                group_calls = _call_arguments(expression, "GroupShip") or _call_arguments(
+                    expression, "GroupToShip"
+                )
+                if group_calls and group_calls[0][1]:
+                    aliases[target] = _group_key(group_calls[0][1][0])
+                else:
+                    alias = _simple_identifier(expression)
+                    if alias in aliases:
+                        aliases[target] = aliases[alias]
+
+            for _position, call, arguments in _line_call_sites(masked):
+                if call in group_read_calls and arguments:
+                    group = _group_key(arguments[0])
+                    if group in tainted_groups and (name, group) not in reported:
+                        reported.add((name, group))
+                        issues.append(
+                            RuntimeIssue(
+                                "error",
+                                "runtime-post-group-mutation-dereference",
+                                f"{block.name} повторно читает группу {group} после изменения её живого корабля в том же вызове; завершите внешний обработчик и продолжите на следующем Turn",
+                                path,
+                                f"{block.location} line {block.start_line + line_offset}",
+                                line.strip(),
+                            )
+                        )
+
+                if call in _WORLD_OBJECT_ARGUMENT_TYPES and arguments:
+                    ship = _simple_identifier(arguments[0])
+                    if (
+                        ship in tainted_ships
+                        and "ship" in _WORLD_OBJECT_ARGUMENT_TYPES[call].values()
+                        and (name, ship) not in reported
+                    ):
+                        reported.add((name, ship))
+                        issues.append(
+                            RuntimeIssue(
+                                "error",
+                                "runtime-post-group-mutation-dereference",
+                                f"{block.name} разыменовывает старый Ship handle {ship} после изменения/выхода корабля в том же вызове",
+                                path,
+                                f"{block.location} line {block.start_line + line_offset}",
+                                line.strip(),
+                            )
+                        )
+
+                effects_by_actual: dict[str, set[str]] = {}
+                direct_effect = _SHIP_EFFECT_CALLS.get(call)
+                if direct_effect and arguments:
+                    actual = _simple_identifier(arguments[0])
+                    if actual:
+                        effects_by_actual.setdefault(actual, set()).add(direct_effect)
+                for effect, parameter_indexes in summaries.get(call, {}).items():
+                    for parameter_index in parameter_indexes:
+                        if parameter_index >= len(arguments):
+                            continue
+                        actual = _simple_identifier(arguments[parameter_index])
+                        if actual:
+                            effects_by_actual.setdefault(actual, set()).add(effect)
+                for actual, effects in effects_by_actual.items():
+                    if effects & {"takes_off", "ships_out"}:
+                        tainted_ships[actual] = depth_before
+                    if effects & {"mutates", "takes_off", "ships_out"} and actual in aliases:
+                        tainted_groups[aliases[actual]] = depth_before
+    return issues
+
+
+def _lint_cleanup_without_turn_gate(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+    summaries: dict[str, dict[str, set[int]]],
+) -> list[RuntimeIssue]:
+    """Warn when a Turn cleanup relies on exit but has no date throttle."""
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for container in _iter_code_containers(project):
+        if container.field != "Code" or container.code_type != "turn":
+            continue
+        depths, contexts = _code_line_contexts(list(container.lines))
+        top_lines = [
+            _mask_non_code(line) if contexts[index] is None else ""
+            for index, line in enumerate(container.lines)
+        ]
+        text = "\n".join(top_lines)
+        timer_guard = re.compile(
+            r"\bif\s*\(\s*(?:"
+            r"CurTurn\s*\(\s*\)\s*<\s*(?P<right>[A-Za-z_][A-Za-z0-9_]*)|"
+            r"(?P<left>[A-Za-z_][A-Za-z0-9_]*)\s*>\s*CurTurn\s*\(\s*\)"
+            r")\s*\)\s*(?:\{\s*)?exit\b",
+            re.IGNORECASE,
+        )
+        timers = {
+            (match.group("right") or match.group("left")).casefold()
+            for match in timer_guard.finditer(text)
+        }
+
+        for index, line in enumerate(container.lines):
+            if contexts[index] is not None:
+                continue
+            masked = top_lines[index]
+            mutations: list[str] = []
+            for _position, call, arguments in _line_call_sites(masked):
+                if call in {"shipout", "shipdestroy"} and arguments:
+                    mutations.append(call)
+                elif summaries.get(call, {}).get("ships_out"):
+                    mutations.append(call)
+            if not mutations:
+                continue
+            following = "\n".join(top_lines[index : min(len(top_lines), index + 8)])
+            if not re.search(r"\b(?:exit|return)\b", following, re.IGNORECASE):
+                continue
+            gate_window = "\n".join(
+                top_lines[max(0, index - 24) : min(len(top_lines), index + 8)]
+            )
+            throttled = any(
+                re.search(
+                    rf"\b{re.escape(timer)}\s*=(?!=)\s*CurTurn\s*\(\s*\)\s*\+\s*(?:1\b|max\s*\(\s*1\b)",
+                    gate_window,
+                    re.IGNORECASE,
+                )
+                for timer in timers
+            )
+            if throttled:
+                continue
+            issues.append(
+                RuntimeIssue(
+                    "warning",
+                    "runtime-cleanup-without-turn-gate",
+                    "Turn-cleanup удаляет/выводит корабль и делает exit, но не имеет парного барьера CurTurn()<next_turn и next_turn=CurTurn()+1; глобальный обработчик может войти повторно в ту же игровую дату",
+                    path,
+                    f"{container.location}:{index + 1}",
+                    line.strip(),
+                )
+            )
+    return issues
+
+
+def _has_safe_follow_context(
+    lines: tuple[str, ...],
+    line_offset: int,
+    actor: str,
+    target: str,
+) -> bool:
+    prefix = _mask_non_code("\n".join(lines[: line_offset + 1]))
+    actor_re = re.escape(actor)
+    target_re = re.escape(target)
+    target_normal = re.search(
+        rf"\bShipInNormalSpace\s*\(\s*{target_re}\s*\)", prefix, re.IGNORECASE
+    )
+    actor_normal = re.search(
+        rf"\bShipInNormalSpace\s*\(\s*{actor_re}\s*\)", prefix, re.IGNORECASE
+    )
+    same_star = re.search(
+        rf"ShipStar\s*\(\s*{actor_re}\s*\)\s*==\s*ShipStar\s*\(\s*{target_re}\s*\)|"
+        rf"ShipStar\s*\(\s*{target_re}\s*\)\s*==\s*ShipStar\s*\(\s*{actor_re}\s*\)",
+        prefix,
+        re.IGNORECASE,
+    )
+    mismatch_exit = re.search(
+        rf"ShipStar\s*\(\s*{actor_re}\s*\)\s*!=\s*ShipStar\s*\(\s*{target_re}\s*\)[^;{{}}]*(?:\)|&&|\|\|)[^{{}}]*(?:exit|continue|return)|"
+        rf"ShipStar\s*\(\s*{target_re}\s*\)\s*!=\s*ShipStar\s*\(\s*{actor_re}\s*\)[^;{{}}]*(?:\)|&&|\|\|)[^{{}}]*(?:exit|continue|return)",
+        prefix,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return bool(target_normal and actor_normal and (same_star or mismatch_exit))
+
+
+def _lint_stale_shipgetbad_follow(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Warn when a transient ShipGetBad target is propagated without validation."""
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    assignment = re.compile(
+        r"(?:\b(?:int|dword)\s+)?\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    for container in _iter_code_containers(project):
+        _depths, contexts = _code_line_contexts(list(container.lines))
+        targets_by_scope: dict[str, dict[str, str]] = {}
+        reported: set[tuple[str, str]] = set()
+        for line_offset, line in enumerate(container.lines):
+            scope = contexts[line_offset] or "<top>"
+            targets = targets_by_scope.setdefault(scope, {})
+            masked = _mask_non_code(line)
+            for match in assignment.finditer(masked):
+                target = match.group(1).casefold()
+                calls = _call_arguments(match.group(2), "ShipGetBad")
+                if calls and calls[0][1] and (
+                    protected := _simple_identifier(calls[0][1][0])
+                ):
+                    targets[target] = protected
+                elif match.group(2).strip() == "0":
+                    targets.pop(target, None)
+            for _position, call, arguments in _line_call_sites(masked):
+                if call == "groupsetbad" and len(arguments) >= 2:
+                    target = _simple_identifier(arguments[1])
+                    if target in targets and (scope, target) not in reported:
+                        reported.add((scope, target))
+                        issues.append(
+                            RuntimeIssue(
+                                "warning",
+                                "runtime-stale-shipgetbad-follow",
+                                f"Цель {target} из ShipGetBad без проверки распространяется на всю группу через GroupSetBad; очистите stale target при разрыве систем и валидируйте normal-space/ShipStar перед follow",
+                                path,
+                                f"{container.location}:{line_offset + 1}",
+                                line.strip(),
+                            )
+                        )
+                if call != "orderfollowship" or len(arguments) < 2:
+                    continue
+                actor = _simple_identifier(arguments[0])
+                target = _simple_identifier(arguments[1])
+                if not actor or target not in targets or (scope, target) in reported:
+                    continue
+                if _has_safe_follow_context(container.lines, line_offset, actor, target):
+                    continue
+                reported.add((scope, target))
+                issues.append(
+                    RuntimeIssue(
+                        "warning",
+                        "runtime-stale-shipgetbad-follow",
+                        f"OrderFollowShip использует {target} из ShipGetBad без доказанных normal-space и общей ShipStar; цель может остаться stale после межсистемного разрыва",
+                        path,
+                        f"{container.location}:{line_offset + 1}",
+                        line.strip(),
+                    )
+                )
+    return issues
 
 
 def _lint_landed_shipout_after_mutation(
@@ -2032,8 +3139,12 @@ def _graph_guarded_turn_entries(
 def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     path = str(project.path) if project.path else None
     functions, issues = _extract_functions(project)
+    issues.extend(_lint_apostrophes_in_line_comments(project))
     issues.extend(_lint_cross_block_calls(project, functions))
     issues.extend(_lint_unavailable_engine_calls(project, functions))
+    issues.extend(_lint_unresolved_user_functions(project, functions))
+    issues.extend(_lint_rscript_arrays(project))
+    issues.extend(_lint_rndobject_anchor_types(project, functions))
     issues.extend(_lint_id_to_ship_guards(project, functions))
     issues.extend(_lint_suppressed_shipjoin_state(project, functions))
     issues.extend(_lint_shipjoin_guarded_by_script_membership(project, functions))
@@ -2042,6 +3153,11 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     issues.extend(_lint_persistent_item_handles(project, functions))
     issues.extend(_lint_persistent_world_object_handles(project, functions))
     ship_effects = _ship_effect_summaries(functions)
+    issues.extend(_lint_repeated_detached_item_free(project, functions))
+    issues.extend(_lint_order_rewrite_before_hyperspace_guard(project, functions))
+    issues.extend(_lint_post_group_mutation_dereference(project, functions, ship_effects))
+    issues.extend(_lint_cleanup_without_turn_gate(project, functions, ship_effects))
+    issues.extend(_lint_stale_shipgetbad_follow(project, functions))
     issues.extend(_lint_landed_shipout_after_mutation(project, functions, ship_effects))
     issues.extend(_lint_group_shipout_iteration(project, functions, ship_effects))
     graph = _call_graph(functions)
