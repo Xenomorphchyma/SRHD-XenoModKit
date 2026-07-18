@@ -36,7 +36,7 @@ PROJECT = {
 
 
 class ToolchainWorkflowTests(unittest.TestCase):
-    def test_adaptive_timeout_grows_and_zero_disables_deadline(self) -> None:
+    def test_progress_timeout_is_bounded_and_zero_disables_deadlines(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             small = root / "small.rson"
@@ -48,13 +48,19 @@ class ToolchainWorkflowTests(unittest.TestCase):
 
             small_timeout, small_policy = _rscript_timeout_policy(small, "compile", None)
             large_timeout, large_policy = _rscript_timeout_policy(large, "compile", None)
+            explicit, explicit_policy = _rscript_timeout_policy(large, "compile", 90)
             disabled, disabled_policy = _rscript_timeout_policy(large, "compile", 0)
 
-            self.assertGreater(large_timeout, small_timeout)
-            self.assertEqual(small_policy["mode"], "adaptive")
+            self.assertEqual(small_timeout, 300.0)
+            self.assertEqual(large_timeout, small_timeout)
+            self.assertEqual(small_policy["mode"], "progress-aware")
+            self.assertEqual(small_policy["progress_seconds"], 60.0)
+            self.assertEqual(large_policy["progress_seconds"], 60.0)
+            self.assertEqual(explicit, 90.0)
+            self.assertEqual(explicit_policy["progress_seconds"], 60.0)
             self.assertIsNone(disabled)
             self.assertEqual(disabled_policy["mode"], "disabled")
-            self.assertEqual(disabled_policy["adaptive_seconds"], large_policy["adaptive_seconds"])
+            self.assertIsNone(disabled_policy["progress_seconds"])
 
     def test_failed_validation_never_publishes_main_output(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -79,8 +85,9 @@ class ToolchainWorkflowTests(unittest.TestCase):
                 ]
                 recovered.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
                 return SimpleNamespace(exit_code=0, forced_after_outputs=False, elapsed_seconds=0.01), {
-                    "mode": "adaptive",
-                    "seconds": 600.0,
+                    "mode": "progress-aware",
+                    "seconds": 300.0,
+                    "progress_seconds": 60.0,
                 }
 
             with patch.object(chain, "_recover_scr_with_rscript", side_effect=fake_recover):

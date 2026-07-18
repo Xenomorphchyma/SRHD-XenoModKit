@@ -2061,7 +2061,7 @@ def build_parser() -> argparse.ArgumentParser:
     script_build.add_argument(
         "--timeout",
         type=float,
-        help="Лимит RScript в секундах; по умолчанию адаптивный, 0 отключает общий лимит",
+        help="Общий лимит RScript; по умолчанию 300 с и 60 с без прогресса, 0 отключает оба",
     )
     script_build.add_argument("--tools-root")
     script_build.add_argument("--json", action="store_true")
@@ -2085,12 +2085,12 @@ def build_parser() -> argparse.ArgumentParser:
     script_decompile.add_argument(
         "--decompile-timeout",
         type=float,
-        help="Лимит восстановления в секундах; по умолчанию адаптивный, 0 отключает общий лимит",
+        help="Общий лимит восстановления; по умолчанию 300 с и 60 с без прогресса, 0 отключает оба",
     )
     script_decompile.add_argument(
         "--roundtrip-timeout",
         type=float,
-        help="Лимит контрольной сборки в секундах; по умолчанию адаптивный, 0 отключает общий лимит",
+        help="Общий лимит контрольной сборки; по умолчанию 300 с и 60 с без прогресса, 0 отключает оба",
     )
     script_decompile.add_argument(
         "--keep-unverified",

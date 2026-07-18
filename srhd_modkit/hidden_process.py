@@ -37,6 +37,8 @@ class HiddenProcessResult:
     elapsed_seconds: float
     window_text: tuple[str, ...] = ()
     queue_seconds: float = 0.0
+    progress_updates: int = 0
+    last_progress_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -165,6 +167,7 @@ def run_on_hidden_desktop(
     cwd: str | Path,
     expected_outputs: Sequence[str | Path] = (),
     timeout: float | None = 120.0,
+    progress_timeout: float | None = None,
     settle_seconds: float = 1.5,
     abort_window_patterns: Sequence[str] = (),
     control_actions: Sequence[HiddenControlAction] = (),
@@ -174,12 +177,20 @@ def run_on_hidden_desktop(
     Some legacy tools display modal dialogs even in their documented CLI mode.
     Output files are watched until stable; a process waiting on a completion
     dialog is then terminated without ever exposing that dialog to the user.
+    ``timeout`` is a hard total deadline. ``progress_timeout`` is a sliding
+    inactivity window reset by output, process-I/O, or control-action progress.
     """
     if os.name != "nt":
         raise OSError("Скрытый desktop доступен только в Windows")
     application = Path(application).resolve()
     cwd = Path(cwd).resolve()
     outputs = [Path(path).resolve() for path in expected_outputs]
+    if timeout is not None and timeout < 0:
+        raise ValueError("Общий таймаут не может быть отрицательным")
+    if progress_timeout is not None and progress_timeout < 0:
+        raise ValueError("Таймаут прогресса не может быть отрицательным")
+    if progress_timeout == 0:
+        progress_timeout = None
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -226,6 +237,8 @@ def run_on_hidden_desktop(
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetProcessIoCounters.argtypes = [wintypes.HANDLE, ctypes.POINTER(IO_COUNTERS)]
+    kernel32.GetProcessIoCounters.restype = wintypes.BOOL
     kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     kernel32.TerminateProcess.restype = wintypes.BOOL
     kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
@@ -406,6 +419,46 @@ def run_on_hidden_desktop(
         )
         action_dispatched = False
         last_action_dispatch = started
+        last_progress_at = started
+        last_progress_probe = started
+        last_io_signature: tuple[int, int, int, int] | None = None
+        progress_updates = 0
+
+        def process_io_signature() -> tuple[int, int, int, int] | None:
+            counters = IO_COUNTERS()
+            if not kernel32.GetProcessIoCounters(process.hProcess, ctypes.byref(counters)):
+                return None
+            return (
+                int(counters.ReadOperationCount),
+                int(counters.WriteOperationCount),
+                int(counters.ReadTransferCount),
+                int(counters.WriteTransferCount),
+            )
+
+        def mark_progress(at: float) -> None:
+            nonlocal last_progress_at, progress_updates
+            last_progress_at = at
+            progress_updates += 1
+
+        def abort_for_timeout(message: str) -> None:
+            nonlocal captured_window_text
+            captured_window_text = _read_desktop_window_text(user32, desktop)
+            windows = "; ".join(_read_desktop_window_diagnostics(user32, desktop))
+            controls = "; ".join(_read_hidden_dialog_controls(user32, desktop))
+            terminate_process_tree(124)
+            details = "; ".join(captured_window_text)
+            suffix = f"; скрытое окно: {details}" if details else ""
+            window_suffix = f"; верхние окна: {windows}" if windows else ""
+            control_suffix = f"; контролы диалога: {controls}" if controls else ""
+            automation = (
+                f"; автоматизация контролов {next_button_action}/{len(control_actions)}: "
+                + " | ".join(button_diagnostics)
+                if control_actions
+                else ""
+            )
+            raise TimeoutError(
+                f"{message}{suffix}{window_suffix}{control_suffix}{automation}"
+            )
 
         while True:
             wait = kernel32.WaitForSingleObject(process.hProcess, 100)
@@ -414,6 +467,17 @@ def run_on_hidden_desktop(
                 break
             if wait == _WAIT_FAILED:
                 raise ctypes.WinError(ctypes.get_last_error())
+            if progress_timeout is not None and now - last_progress_probe >= 0.25:
+                last_progress_probe = now
+                io_signature = process_io_signature()
+                if (
+                    last_io_signature is not None
+                    and io_signature is not None
+                    and io_signature != last_io_signature
+                ):
+                    mark_progress(now)
+                if io_signature is not None:
+                    last_io_signature = io_signature
             if next_button_action < len(control_actions) and now >= button_action_ready_at:
                 action = control_actions[next_button_action]
                 confirmation_requested = (
@@ -429,6 +493,7 @@ def run_on_hidden_desktop(
                 )
                 if confirmed:
                     next_button_action += 1
+                    mark_progress(now)
                     action_dispatched = False
                     if next_button_action < len(control_actions):
                         button_action_ready_at = now + max(
@@ -436,6 +501,7 @@ def run_on_hidden_desktop(
                             control_actions[next_button_action].delay_seconds,
                         )
                 elif not action_dispatched or now - last_action_dispatch >= max(0.1, action.retry_seconds):
+                    was_action_dispatched = action_dispatched
                     applied, diagnostic = _apply_hidden_control_action(
                         user32,
                         desktop,
@@ -447,8 +513,11 @@ def run_on_hidden_desktop(
                     if applied:
                         last_action_dispatch = now
                         if confirmation_requested:
+                            if not was_action_dispatched:
+                                mark_progress(now)
                             action_dispatched = True
                         else:
+                            mark_progress(now)
                             next_button_action += 1
                             if next_button_action < len(control_actions):
                                 button_action_ready_at = now + max(
@@ -468,6 +537,7 @@ def run_on_hidden_desktop(
                 else:
                     last_signature = signature
                     stable_since = now
+                    mark_progress(now)
             # Some legacy tools show a bogus modal after successfully writing
             # their outputs. Once all expected files exist, settle and verify
             # those files instead of treating the post-success dialog as fatal.
@@ -479,24 +549,16 @@ def run_on_hidden_desktop(
                     terminate_process_tree(1)
                     details = "; ".join(window_text)
                     raise RuntimeError(f"Процесс показал окно ошибки: {details}")
-            if timeout is not None and now - started >= timeout:
-                captured_window_text = _read_desktop_window_text(user32, desktop)
-                windows = "; ".join(_read_desktop_window_diagnostics(user32, desktop))
-                controls = "; ".join(_read_hidden_dialog_controls(user32, desktop))
-                terminate_process_tree(124)
-                details = "; ".join(captured_window_text)
-                suffix = f"; скрытое окно: {details}" if details else ""
-                window_suffix = f"; верхние окна: {windows}" if windows else ""
-                control_suffix = f"; контролы диалога: {controls}" if controls else ""
-                automation = (
-                    f"; автоматизация контролов {next_button_action}/{len(control_actions)}: "
-                    + " | ".join(button_diagnostics)
-                    if control_actions
-                    else ""
+            if progress_timeout is not None and now - last_progress_at >= progress_timeout:
+                abort_for_timeout(
+                    f"Процесс не показал подтверждённого прогресса за "
+                    f"{progress_timeout:.0f} секунд (последний прогресс через "
+                    f"{last_progress_at - started:.1f} с после запуска)"
                 )
-                raise TimeoutError(
-                    f"Процесс не завершился за {timeout:.0f} секунд{suffix}{window_suffix}"
-                    f"{control_suffix}{automation}"
+            if timeout is not None and now - started >= timeout:
+                abort_for_timeout(
+                    f"Процесс превысил общий аварийный лимит {timeout:.0f} секунд, "
+                    f"несмотря на {progress_updates} обновлений прогресса"
                 )
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(process.hProcess, ctypes.byref(exit_code)):
@@ -507,6 +569,8 @@ def run_on_hidden_desktop(
             elapsed_seconds=time.monotonic() - started,
             window_text=captured_window_text,
             queue_seconds=queue_seconds,
+            progress_updates=progress_updates,
+            last_progress_seconds=max(0.0, last_progress_at - started),
         )
     finally:
         # Explicitly terminate the job even after the main process exits: a

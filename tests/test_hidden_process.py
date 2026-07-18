@@ -43,6 +43,58 @@ class HiddenProcessTests(unittest.TestCase):
             )
         self.assert_clean()
 
+    def test_progress_window_slides_but_hard_deadline_remains(self) -> None:
+        self.assert_clean()
+        with tempfile.TemporaryDirectory(prefix="srhd-progress-timeout-") as temp_name:
+            marker = Path(temp_name) / "progress.bin"
+            writer = (
+                "import time;from pathlib import Path;"
+                f"p=Path({str(marker)!r});"
+                "[(p.write_bytes(bytes([i])),time.sleep(.12)) for i in range(6)]"
+            )
+            completed = run_on_hidden_desktop(
+                sys.executable,
+                ["-B", "-c", writer],
+                cwd=ROOT,
+                expected_outputs=[marker],
+                timeout=2,
+                progress_timeout=0.2,
+                settle_seconds=0.3,
+            )
+            self.assertEqual(completed.exit_code, 0)
+            self.assertGreater(completed.elapsed_seconds, 0.5)
+            self.assertGreater(completed.progress_updates, 1)
+            self.assertGreater(completed.last_progress_seconds, 0.2)
+
+            stalled = Path(temp_name) / "stalled.bin"
+            with self.assertRaisesRegex(TimeoutError, "подтверждённого прогресса"):
+                run_on_hidden_desktop(
+                    sys.executable,
+                    ["-B", "-c", "import time;time.sleep(5)"],
+                    cwd=ROOT,
+                    expected_outputs=[stalled],
+                    timeout=2,
+                    progress_timeout=0.2,
+                )
+
+            endless = Path(temp_name) / "endless.bin"
+            endless_writer = (
+                "import time;from pathlib import Path;"
+                f"p=Path({str(endless)!r});i=0;"
+                "\nwhile True:\n p.write_text(str(i));i+=1;time.sleep(.04)"
+            )
+            with self.assertRaisesRegex(TimeoutError, "общий аварийный лимит"):
+                run_on_hidden_desktop(
+                    sys.executable,
+                    ["-B", "-c", endless_writer],
+                    cwd=ROOT,
+                    expected_outputs=[endless],
+                    timeout=0.4,
+                    progress_timeout=0.15,
+                    settle_seconds=0.25,
+                )
+        self.assert_clean()
+
     def test_parent_termination_closes_job_and_child(self) -> None:
         self.assert_clean()
         with tempfile.TemporaryDirectory(prefix="srhd-job-test-") as temp_name:

@@ -25,6 +25,8 @@ from .legacy_manifest import ensure_legacy_codepage_executable
 
 
 EMPTY_RSCRIPT_LANG_DAT = b"\xff\xfe"
+DEFAULT_RSCRIPT_PROGRESS_TIMEOUT = 60.0
+DEFAULT_RSCRIPT_HARD_TIMEOUT = 300.0
 
 
 def _rscript_timeout_policy(
@@ -32,17 +34,20 @@ def _rscript_timeout_policy(
     operation: str,
     requested: float | None,
 ) -> tuple[float | None, dict[str, Any]]:
-    """Choose a generous size-aware limit without imposing a maximum size.
+    """Choose a short progress window plus a bounded emergency deadline.
 
-    ``requested=None`` means adaptive, ``0`` disables the total deadline, and
-    a positive value is an explicit operator policy.  The adaptive formula is
-    intentionally uncapped: a large project receives more time instead of
-    becoming impossible to build merely because it crossed a fixed threshold.
+    The legacy size formula could select hundreds of seconds even when RScript
+    was completely stalled.  The process runner now resets a 60-second window
+    only after observable progress.  A separate five-minute hard deadline
+    contains a process that keeps producing misleading activity indefinitely.
+
+    ``requested=None`` selects the defaults, ``0`` disables both deadlines,
+    and a positive value remains an explicit total deadline.  Explicit totals
+    shorter than a minute also shorten the progress window.
     """
 
     if requested is not None and requested < 0:
-        raise ValueError("Таймаут не может быть отрицательным; 0 отключает общий лимит")
-    size_mib = source.stat().st_size / (1024 * 1024) if source.is_file() else 0.0
+        raise ValueError("Таймаут не может быть отрицательным; 0 отключает оба ограничения")
     code_lines = 0
     objects = 0
     if source.suffix.casefold() == ".rson" and source.is_file():
@@ -52,24 +57,25 @@ def _rscript_timeout_policy(
             objects = int(summary.get("objects", 0))
         except Exception:
             pass
-    if operation in {"compile", "roundtrip"}:
-        adaptive = max(600.0, 180.0 + code_lines * 0.35 + objects * 1.5 + size_mib * 30.0)
-    else:
-        adaptive = max(600.0, 300.0 + size_mib * 180.0)
-    adaptive = round(adaptive, 3)
     if requested is None:
-        selected = adaptive
-        mode = "adaptive"
+        selected = DEFAULT_RSCRIPT_HARD_TIMEOUT
+        progress_timeout = DEFAULT_RSCRIPT_PROGRESS_TIMEOUT
+        mode = "progress-aware"
     elif requested == 0:
         selected = None
+        progress_timeout = None
         mode = "disabled"
     else:
         selected = float(requested)
+        progress_timeout = min(DEFAULT_RSCRIPT_PROGRESS_TIMEOUT, selected)
         mode = "explicit"
     return selected, {
         "mode": mode,
         "seconds": selected,
-        "adaptive_seconds": adaptive,
+        "hard_seconds": selected,
+        "progress_seconds": progress_timeout,
+        "progress_resets_on": ["expected-output", "process-io", "control-action"],
+        "operation": operation,
         "source_size": source.stat().st_size if source.is_file() else None,
         "objects": objects or None,
         "code_lines": code_lines or None,
@@ -467,6 +473,7 @@ class Toolchain:
                 cwd=tool.path.parent,
                 timeout=timeout_seconds,
                 expected_outputs=[staged_scr, staged_lang],
+                progress_timeout=timeout_policy["progress_seconds"],
                 abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
             )
             if not staged_scr.is_file():
@@ -526,6 +533,10 @@ class Toolchain:
             "compiler_was_waiting_after_output": process_result.forced_after_outputs,
             "compiler_seconds": round(process_result.elapsed_seconds, 3),
             "compiler_queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
+            "compiler_progress_updates": getattr(process_result, "progress_updates", 0),
+            "compiler_last_progress_seconds": round(
+                getattr(process_result, "last_progress_seconds", 0.0), 3
+            ),
             "compiler_timeout": timeout_policy,
             "runtime_warnings": [
                 issue.as_dict() for issue in runtime_issues if issue.severity == "warning"
@@ -601,6 +612,7 @@ class Toolchain:
                 cwd=tool.path.parent,
                 expected_outputs=[recovered],
                 timeout=timeout_seconds,
+                progress_timeout=timeout_policy["progress_seconds"],
                 abort_window_patterns=(
                     "Run-time error",
                     "Runtime error",
@@ -887,6 +899,7 @@ class Toolchain:
                         "project": {**deep_summary, "path": None},
                         "canonical_graph_match": _project_graph_sha256(project) == _project_graph_sha256(deep_project),
                         "decompiler_exit_code": deep_process.exit_code,
+                        "decompiler_progress_updates": getattr(deep_process, "progress_updates", 0),
                         "timeout": deep_policy,
                     }
                     phases.append(
@@ -953,12 +966,17 @@ class Toolchain:
                 "compiler_exit_code": rebuild_result.exit_code,
                 "compiler_seconds": round(rebuild_result.elapsed_seconds, 3),
                 "compiler_queue_seconds": round(getattr(rebuild_result, "queue_seconds", 0.0), 3),
+                "compiler_progress_updates": getattr(rebuild_result, "progress_updates", 0),
             },
             "deep_roundtrip": deep_result,
             "decompiler_exit_code": process_result.exit_code,
             "decompiler_was_waiting_after_output": process_result.forced_after_outputs,
             "decompiler_seconds": round(process_result.elapsed_seconds, 3),
             "decompiler_queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
+            "decompiler_progress_updates": getattr(process_result, "progress_updates", 0),
+            "decompiler_last_progress_seconds": round(
+                getattr(process_result, "last_progress_seconds", 0.0), 3
+            ),
             "timeouts": {
                 "decompile": decompile_policy,
                 "roundtrip": roundtrip_policy,
@@ -1162,7 +1180,8 @@ class Toolchain:
                 ["--cli", "--convert", target[0], staged_source.name],
                 cwd=tool.path.parent,
                 expected_outputs=[generated],
-                timeout=120,
+                timeout=DEFAULT_RSCRIPT_HARD_TIMEOUT,
+                progress_timeout=DEFAULT_RSCRIPT_PROGRESS_TIMEOUT,
                 abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
             )
             if not generated.is_file():
@@ -1185,4 +1204,5 @@ class Toolchain:
             "compiler_exit_code": process_result.exit_code,
             "compiler_was_waiting_after_output": process_result.forced_after_outputs,
             "compiler_queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
+            "compiler_progress_updates": getattr(process_result, "progress_updates", 0),
         }

@@ -47,7 +47,7 @@ python -B srhd.py script inspect-scr "<OUT>/Script.scr" --json
 
 Также доступны `set-field`, `clone-object`, `add-link`, `delete-link`, `delete-object`, `register` и `convert`. Перед точечным изменением смотреть `python -B srhd.py script <command> --help`.
 
-RScript использует адаптивный лимит без верхнего потолка. Ноль у `build --timeout`, `decompile --decompile-timeout`, `decompile --roundtrip-timeout` и одноимённых параметров `compare-scr` отключает общий дедлайн. Непроверенный RSON сохранять только отдельным явным `--keep-unverified`; штатный output остаётся fail-closed.
+RScript использует 60-секундное скользящее окно без подтверждённого прогресса и общий аварийный потолок 300 секунд. Положительный параметр timeout заменяет общий потолок; ноль у `build --timeout`, обоих таймаутов `decompile` и одноимённых параметров `compare-scr` отключает оба ограничения. Непроверенный RSON сохранять только отдельным явным `--keep-unverified`; штатный output остаётся fail-closed.
 
 `script validate` блокирует неправильную форму `TItem` до запуска RScript.
 `script lint-runtime` дополнительно блокирует сырые `Item` в общих
