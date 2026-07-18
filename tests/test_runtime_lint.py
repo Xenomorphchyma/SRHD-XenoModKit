@@ -766,6 +766,44 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-shipjoin-state-suppressed", codes)
 
+    def test_shipjoin_guarded_by_script_membership_is_rejected(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function SpawnTransport(dword group, dword ship)",
+                "{",
+                "    if(!ShipInCurScript(ship)) ShipJoin(group, ship);",
+                "}",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("wrong-group-guard.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-shipjoin-script-membership-guard"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(
+            matching[0].evidence,
+            "if(!ShipInCurScript(ship)) ShipJoin(group, ship);",
+        )
+
+    def test_unconditional_shipjoin_is_not_a_script_membership_guard(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function SpawnTransport(dword group, dword ship)",
+                "{",
+                "    ShipJoin(group, ship);",
+                "}",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("explicit-join.rson")))
+        }
+        self.assertNotIn("runtime-shipjoin-script-membership-guard", codes)
+
     def test_unproven_local_star_resolver_does_not_protect_saved_handle(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]

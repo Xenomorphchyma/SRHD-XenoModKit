@@ -460,6 +460,46 @@ def _lint_suppressed_shipjoin_state(
     return issues
 
 
+_SHIP_IN_CURRENT_GUARD_RE = re.compile(
+    r"if\s*\(\s*!\s*ShipInCurScript\s*\(\s*"
+    r"(?P<ship>[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\)\s*"
+    r"ShipJoin\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*(?P=ship)\b",
+    re.IGNORECASE,
+)
+
+
+def _lint_shipjoin_guarded_by_script_membership(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject a script-ownership test used as a group-membership test.
+
+    ``ShipInCurScript(ship)`` only says that some object in the current script
+    owns the ship.  It does not prove that the ship belongs to the specific
+    group passed to ``ShipJoin``.  Guarding the join this way can leave a newly
+    bought transport/warrior under vanilla AI while the intended group remains
+    empty, so route setup and scripted orders silently never start.
+    """
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for block in functions.values():
+        masked = _mask_non_code(block.text)
+        for match in _SHIP_IN_CURRENT_GUARD_RE.finditer(masked):
+            line_offset = masked.count("\n", 0, match.start())
+            issues.append(
+                RuntimeIssue(
+                    "error",
+                    "runtime-shipjoin-script-membership-guard",
+                    "ShipInCurScript проверяет принадлежность всему скрипту, а не целевой TGroup; такой guard может пропустить обязательный ShipJoin и оставить корабль с ванильным грузом/ИИ. Для нового корабля вызывайте ShipJoin безусловно либо отдельно проверяйте GroupShip целевой группы",
+                    path,
+                    f"{block.location} line {block.start_line + line_offset}",
+                    block.lines[line_offset].strip(),
+                )
+            )
+    return issues
+
+
 def _variable_definitions(lines: list[str]) -> set[str]:
     masked = _mask_non_code("\n".join(lines))
     return {
@@ -1996,6 +2036,7 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     issues.extend(_lint_unavailable_engine_calls(project, functions))
     issues.extend(_lint_id_to_ship_guards(project, functions))
     issues.extend(_lint_suppressed_shipjoin_state(project, functions))
+    issues.extend(_lint_shipjoin_guarded_by_script_membership(project, functions))
     issues.extend(_lint_runtime_cross_block_variables(project))
     issues.extend(_lint_linked_empty_runtime_code(project))
     issues.extend(_lint_persistent_item_handles(project, functions))
