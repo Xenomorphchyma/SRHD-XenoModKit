@@ -250,6 +250,53 @@ def _extract_functions(project: RsonProject) -> tuple[dict[str, FunctionBlock], 
     return functions, issues
 
 
+def _runtime_analysis_blocks(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> dict[str, FunctionBlock]:
+    """Return declared functions plus executable handler segments.
+
+    Several RSON fields execute code directly outside a declared function.
+    They need the same data-flow checks, while function declarations embedded
+    in a Top object must not be scanned a second time as handler code.
+    """
+
+    blocks = dict(functions)
+    serial = 0
+    for container in _iter_code_containers(project):
+        covered: set[int] = set()
+        index = 0
+        while index < len(container.lines):
+            if not FUNCTION_RE.match(_mask_non_code(container.lines[index])):
+                index += 1
+                continue
+            end = _brace_block_end(container.lines, index)
+            covered.update(range(index, end + 1))
+            index = max(index + 1, end + 1)
+
+        index = 0
+        while index < len(container.lines):
+            while index < len(container.lines) and index in covered:
+                index += 1
+            start = index
+            while index < len(container.lines) and index not in covered:
+                index += 1
+            segment = container.lines[start:index]
+            if not segment or not any(_mask_non_code(line).strip() for line in segment):
+                continue
+            serial += 1
+            name = f"__handler_{serial}"
+            blocks[name] = FunctionBlock(
+                name,
+                container.object_id,
+                container.field,
+                start,
+                (f"function {name}()", *segment),
+                container.code_type,
+            )
+    return blocks
+
+
 def _call_graph(functions: dict[str, FunctionBlock]) -> dict[str, set[str]]:
     known = set(functions)
     return {
@@ -499,6 +546,43 @@ def _rscript_array_names(project: RsonProject) -> set[str]:
     return names
 
 
+_RSCRIPT_ARRAY_CALLS = {
+    "arrayadd",
+    "arraychange",
+    "arrayclear",
+    "arraydelete",
+    "arraydim",
+    "arrayfind",
+    "arrayfindinsorted",
+    "arrayrandomize",
+    "arraysort",
+    "arraysortpartial",
+}
+
+
+def _newarray_initialized_names(project: RsonProject) -> set[str]:
+    """Return variables that are initialized as arrays somewhere in the project."""
+
+    result: set[str] = set()
+    assignment = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*newarray\s*\(",
+        re.IGNORECASE,
+    )
+    for item in project.iter_objects():
+        if str(item.get("Type", "")).casefold() != "tvar":
+            continue
+        name = str(item.get("Name", "")).strip()
+        if name and re.search(r"\bnewarray\s*\(", str(item.get("Init", "")), re.IGNORECASE):
+            result.add(name.casefold())
+    for container in _iter_code_containers(project):
+        for line in container.lines:
+            result.update(
+                match.group(1).casefold()
+                for match in assignment.finditer(_mask_non_code(line))
+            )
+    return result
+
+
 def _brace_block_end(lines: tuple[str, ...], start: int) -> int:
     depth = 0
     opened = False
@@ -511,10 +595,89 @@ def _brace_block_end(lines: tuple[str, ...], start: int) -> int:
     return start
 
 
+_LOCAL_DECLARATION_RE = re.compile(
+    r"\b(?:int|dword|str|float|double|bool|unknown)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)\b",
+    re.IGNORECASE,
+)
+
+
+def _lint_duplicate_local_declarations(project: RsonProject) -> list[RuntimeIssue]:
+    """Reject repeated local names in one RScript runtime scope.
+
+    RScript 4.10f does not give nested ``if`` branches independent local
+    scopes.  Redeclaring a name in sibling branches can leave the compiler in a
+    modal loop instead of producing a syntax error.
+    """
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for container in _iter_code_containers(project):
+        function_ranges: list[tuple[int, int, str]] = []
+        index = 0
+        while index < len(container.lines):
+            match = FUNCTION_RE.match(_mask_non_code(container.lines[index]))
+            if not match:
+                index += 1
+                continue
+            end = _brace_block_end(container.lines, index)
+            function_ranges.append((index, end, match.group(1)))
+            index = max(index + 1, end + 1)
+
+        scopes: list[tuple[str, list[tuple[int, str]]]] = []
+        covered = {
+            line_index
+            for start, end, _name in function_ranges
+            for line_index in range(start, end + 1)
+        }
+        top_level = [
+            (line_index, container.lines[line_index])
+            for line_index in range(len(container.lines))
+            if line_index not in covered
+        ]
+        if top_level:
+            scopes.append(("handler", top_level))
+        scopes.extend(
+            (
+                f"function {name}",
+                [
+                    (line_index, container.lines[line_index])
+                    for line_index in range(start, end + 1)
+                ],
+            )
+            for start, end, name in function_ranges
+        )
+
+        for scope_name, lines in scopes:
+            declarations: dict[str, tuple[int, str]] = {}
+            for line_index, line in lines:
+                masked = _mask_non_code(line)
+                for match in _LOCAL_DECLARATION_RE.finditer(masked):
+                    name = match.group(1).casefold()
+                    previous = declarations.get(name)
+                    if previous is None:
+                        declarations[name] = (line_index, line.strip())
+                        continue
+                    first_line, _first_evidence = previous
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "runtime-duplicate-local-declaration",
+                            f"Локальное имя {match.group(1)} повторно объявлено в одном RScript scope ({scope_name}); "
+                            f"первое объявление находится на строке {first_line + 1}. Даже разные if-ветви не создают отдельный scope и могут повесить RScript 4.10f",
+                            path,
+                            f"{container.location}:{line_index + 1}",
+                            line.strip(),
+                        )
+                    )
+    return issues
+
+
 def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
     """Enforce the one-based data ABI of RScript dynamic arrays."""
 
     arrays = _rscript_array_names(project)
+    initialized_arrays = _newarray_initialized_names(project)
     shared_tvars = _shared_tvars(project)
     path = str(project.path) if project.path else None
     issues: list[RuntimeIssue] = []
@@ -566,6 +729,22 @@ def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
     for container in _iter_code_containers(project):
         masked_lines = tuple(_mask_non_code(line) for line in container.lines)
         for index, (line, masked) in enumerate(zip(container.lines, masked_lines)):
+            for _position, call, arguments in _line_call_sites(masked):
+                if call not in _RSCRIPT_ARRAY_CALLS or not arguments:
+                    continue
+                name = _simple_identifier(arguments[0])
+                if name not in shared_tvars or name in initialized_arrays:
+                    continue
+                report(
+                    container,
+                    index + 1,
+                    "runtime-persistent-array-use-without-newarray",
+                    "error",
+                    f"Persistent TVar {name} передаётся в {call} без единого присваивания newarray(...); "
+                    "движок завершит ход с 'not array'. Инициализируйте массив при первом запуске и на миграционной границе старого сохранения",
+                    line,
+                )
+
             for match in direct_zero.finditer(masked):
                 if match.group(1).casefold() not in arrays:
                     continue
@@ -2368,6 +2547,621 @@ def _has_late_transit_guard(
     return False
 
 
+_MOBILE_SHIP_SOURCES = {
+    "buyranger",
+    "buytransport",
+    "buywarrior",
+    "groupship",
+    "grouptoship",
+    "player",
+    "starships",
+}
+
+
+def _mobile_ship_returning_functions(
+    functions: dict[str, FunctionBlock],
+) -> set[str]:
+    """Infer helpers that return a mobile ship obtained from a proven source."""
+
+    result: set[str] = set()
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool|unknown)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    changed = True
+    while changed:
+        changed = False
+        sources = _MOBILE_SHIP_SOURCES | result
+        for name, block in functions.items():
+            mobile: set[str] = set()
+            returns_mobile = False
+            for line in block.lines[1:]:
+                for match in assignment.finditer(_mask_non_code(line)):
+                    target = match.group(1).casefold()
+                    expression = match.group(2)
+                    calls = {call.casefold() for call in _calls(expression)}
+                    identifiers = {
+                        value.casefold() for value in IDENTIFIER_RE.findall(expression)
+                    }
+                    proven = bool(calls & sources or (not calls and identifiers & mobile))
+                    if target == "result":
+                        returns_mobile |= proven
+                    elif proven:
+                        mobile.add(target)
+                    else:
+                        mobile.discard(target)
+            if returns_mobile and name not in result:
+                result.add(name)
+                changed = True
+    return result
+
+
+def _mobile_ship_variables(
+    block: FunctionBlock,
+    returning_functions: set[str],
+) -> set[str]:
+    """Find variables with evidence that they can denote a dockable mobile ship."""
+
+    body = _mask_non_code(block.body_text)
+    parameters = set(_function_parameters(block))
+    mobile = {
+        parameter
+        for parameter in parameters
+        if re.search(
+            rf"\b(?:GetShipPlanet|GetShipRuins|ShipIsTakeoff)\s*\(\s*{re.escape(parameter)}\s*\)",
+            body,
+            re.IGNORECASE,
+        )
+    }
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool|unknown)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    sources = _MOBILE_SHIP_SOURCES | returning_functions
+    changed = True
+    while changed:
+        changed = False
+        for line in block.lines[1:]:
+            for match in assignment.finditer(_mask_non_code(line)):
+                target = match.group(1).casefold()
+                expression = match.group(2)
+                calls = {call.casefold() for call in _calls(expression)}
+                identifiers = {
+                    value.casefold() for value in IDENTIFIER_RE.findall(expression)
+                }
+                if calls & sources or (not calls and identifiers & mobile):
+                    if target not in mobile:
+                        mobile.add(target)
+                        changed = True
+    return mobile
+
+
+def _exiting_if_condition(text: str) -> str | None:
+    """Return a balanced if-condition only when its taken branch exits."""
+
+    masked = _mask_non_code(text)
+    match = re.search(r"\bif\s*\(", masked, re.IGNORECASE)
+    if not match:
+        return None
+    start = match.end()
+    depth = 1
+    close = -1
+    for index in range(start, len(masked)):
+        if masked[index] == "(":
+            depth += 1
+        elif masked[index] == ")":
+            depth -= 1
+            if depth == 0:
+                close = index
+                break
+    if close < 0:
+        return None
+    rest = masked[close + 1 :].lstrip()
+    if re.match(r"(?:exit|return|continue)\b", rest, re.IGNORECASE):
+        return masked[start:close]
+    if not rest.startswith("{"):
+        return None
+    depth = 0
+    block_close = -1
+    for index, char in enumerate(rest):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                block_close = index
+                break
+    if block_close < 0:
+        return None
+    body = rest[1:block_close].strip()
+    if re.search(r"(?:exit|return|continue)\s*;?\s*$", body, re.IGNORECASE):
+        return masked[start:close]
+    return None
+
+
+def _first_if_condition(text: str) -> str | None:
+    masked = _mask_non_code(text)
+    match = re.search(r"\bif\s*\(", masked, re.IGNORECASE)
+    if not match:
+        return None
+    start = match.end()
+    depth = 1
+    for index in range(start, len(masked)):
+        if masked[index] == "(":
+            depth += 1
+        elif masked[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return masked[start:index]
+    return None
+
+
+def _condition_call_polarity(condition: str, call: str, variable: str) -> set[bool]:
+    """Return True for positive and False for directly negated call occurrences."""
+
+    result: set[bool] = set()
+    pattern = re.compile(
+        rf"\b{re.escape(call)}\s*\(\s*{re.escape(variable)}\s*(?:,|\))",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(condition):
+        prefix = condition[: match.start()].rstrip()
+        result.add(not prefix.endswith("!"))
+    return result
+
+
+def _ship_guard_flags_before(
+    block: FunctionBlock,
+    line_offset: int,
+    variable: str,
+) -> set[str]:
+    """Find booleans whose current value proves a ship is safe for ShipStar."""
+
+    flags: dict[str, bool] = {}
+    declaration = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool|unknown)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*(.*)$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    prefix = "\n".join(block.lines[1:line_offset])
+    for statement in prefix.split(";"):
+        matches = list(declaration.finditer(_mask_non_code(statement)))
+        if not matches:
+            continue
+        match = matches[-1]
+        name = match.group(1).casefold()
+        expression = match.group(2)
+        flags[name] = (
+            "&&" in expression
+            and "||" not in expression
+            and True
+            in _condition_call_polarity(expression, "ShipInNormalSpace", variable)
+            and False
+            in _condition_call_polarity(expression, "ShipIsTakeoff", variable)
+        )
+    return {name for name, proven in flags.items() if proven}
+
+
+def _condition_uses_positive_flag(condition: str, flags: set[str]) -> bool:
+    return any(
+        re.search(
+            rf"(?<![!A-Za-z0-9_]){re.escape(name)}\b(?!\s*(?:==|<=)\s*0\b)",
+            condition,
+            re.IGNORECASE,
+        )
+        for name in flags
+    )
+
+
+def _ship_placement_guards_before(
+    block: FunctionBlock,
+    line_offset: int,
+    call_position: int,
+    variable: str,
+) -> tuple[bool, bool]:
+    """Prove normal-space and completed-takeoff guards for one call site."""
+
+    lines = block.lines
+    depths = _line_depths(lines)
+    normal = False
+    completed_takeoff = False
+    guard_flags = _ship_guard_flags_before(block, line_offset, variable)
+
+    for index in range(1, line_offset + 1):
+        end = min(line_offset + 1, index + 8)
+        window_lines = list(lines[index:end])
+        if line_offset < end:
+            window_lines[line_offset - index] = window_lines[line_offset - index][
+                :call_position
+            ]
+        condition = _exiting_if_condition("\n".join(window_lines))
+        if condition is None or "&&" in condition:
+            continue
+        if depths[index] > depths[line_offset] or _variable_reassigned(
+            lines, variable, index + 1, line_offset + 1
+        ):
+            continue
+        normal |= False in _condition_call_polarity(
+            condition, "ShipInNormalSpace", variable
+        )
+        completed_takeoff |= True in _condition_call_polarity(
+            condition, "ShipIsTakeoff", variable
+        )
+
+    for index in range(1, line_offset + 1):
+        if _brace_block_end(lines, index) < line_offset:
+            continue
+        condition = _first_if_condition("\n".join(lines[index : min(line_offset + 1, index + 8)]))
+        if condition is None or "||" in condition:
+            continue
+        if _variable_reassigned(lines, variable, index + 1, line_offset + 1):
+            continue
+        normal |= True in _condition_call_polarity(
+            condition, "ShipInNormalSpace", variable
+        )
+        completed_takeoff |= False in _condition_call_polarity(
+            condition, "ShipIsTakeoff", variable
+        )
+        if _condition_uses_positive_flag(condition, guard_flags):
+            normal = True
+            completed_takeoff = True
+
+    same_line = _mask_non_code(lines[line_offset][:call_position])
+    condition = _first_if_condition(same_line)
+    if condition is not None and "||" not in condition:
+        normal |= True in _condition_call_polarity(
+            condition, "ShipInNormalSpace", variable
+        )
+        completed_takeoff |= False in _condition_call_polarity(
+            condition, "ShipIsTakeoff", variable
+        )
+        if _condition_uses_positive_flag(condition, guard_flags):
+            normal = True
+            completed_takeoff = True
+    # RScript boolean expressions short-circuit left to right.  Accept guards
+    # in the same ``&&`` chain only when they occur before ShipStar; a plain
+    # standalone query is not proof and a disjunction is ambiguous.
+    statement_window = "\n".join(
+        (*lines[max(1, line_offset - 6) : line_offset], same_line)
+    )
+    statement_prefix = statement_window.rsplit(";", 1)[-1]
+    if "&&" in statement_prefix and "||" not in statement_prefix:
+        normal |= True in _condition_call_polarity(
+            statement_prefix, "ShipInNormalSpace", variable
+        )
+        completed_takeoff |= False in _condition_call_polarity(
+            statement_prefix, "ShipIsTakeoff", variable
+        )
+    if line_offset > 1:
+        previous_line = _mask_non_code(lines[line_offset - 1])
+        previous_condition = _first_if_condition(previous_line)
+        if (
+            previous_condition is not None
+            and previous_line.rstrip().endswith(")")
+            and _condition_uses_positive_flag(previous_condition, guard_flags)
+        ):
+            normal = True
+            completed_takeoff = True
+    return normal, completed_takeoff
+
+
+def _lint_shipstar_on_unplaced_ship(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject ShipStar on a mobile ship before dock/takeoff state is excluded."""
+
+    path = str(project.path) if project.path else None
+    returning = _mobile_ship_returning_functions(functions)
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[int | None, str, int, str]] = set()
+    for block in _runtime_analysis_blocks(project, functions).values():
+        mobile = _mobile_ship_variables(block, returning)
+        for line_offset, line in enumerate(block.lines[1:], start=1):
+            masked = _mask_non_code(line)
+            for position, arguments in _call_arguments(masked, "ShipStar"):
+                if not arguments or (variable := _simple_identifier(arguments[0])) not in mobile:
+                    continue
+                normal, completed_takeoff = _ship_placement_guards_before(
+                    block, line_offset, position, variable
+                )
+                if normal and completed_takeoff:
+                    continue
+                key = (block.object_id, block.field, block.start_line + line_offset, variable)
+                if key in reported:
+                    continue
+                reported.add(key)
+                missing = []
+                if not normal:
+                    missing.append("ShipInNormalSpace")
+                if not completed_takeoff:
+                    missing.append("!ShipIsTakeoff")
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-shipstar-on-docked-ship",
+                        f"ShipStar({variable}) вызывается до доказательства {', '.join(missing)}; "
+                        "посаженный или ещё взлетающий корабль может вызвать EAccessViolation. "
+                        "Сначала обработайте GetShipPlanet/GetShipRuins, затем проверяйте normal-space и завершённый взлёт",
+                        path,
+                        f"{block.location} line {block.start_line + line_offset}",
+                        line.strip(),
+                    )
+                )
+    return issues
+
+
+def _starships_member_variables(block: FunctionBlock) -> set[str]:
+    """Find values obtained from the two-argument StarShips member accessor."""
+
+    members: set[str] = set()
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool|unknown)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    changed = True
+    while changed:
+        changed = False
+        for line in block.lines[1:]:
+            for match in assignment.finditer(_mask_non_code(line)):
+                target = match.group(1).casefold()
+                expression = match.group(2)
+                from_star = any(
+                    len(arguments) >= 2
+                    for _position, arguments in _call_arguments(expression, "StarShips")
+                )
+                calls = _calls(expression)
+                aliases_member = not calls and bool(
+                    {
+                        value.casefold()
+                        for value in IDENTIFIER_RE.findall(expression)
+                    }
+                    & members
+                )
+                if (from_star or aliases_member) and target not in members:
+                    members.add(target)
+                    changed = True
+    return members
+
+
+def _ship_type_condition_proves_mobile(
+    condition: str,
+    variable: str,
+    *,
+    taken_branch: bool,
+) -> bool:
+    ship_type = rf"ShipTypeN\s*\(\s*{re.escape(variable)}\s*\)"
+    mobile = (
+        rf"(?:{ship_type}\s*<\s*t_RC\b|t_RC\s*>\s*{ship_type})"
+    )
+    stationary = (
+        rf"(?:{ship_type}\s*>=\s*t_RC\b|t_RC\s*<=\s*{ship_type})"
+    )
+    pattern = mobile if taken_branch else stationary
+    return bool(re.search(pattern, condition, re.IGNORECASE))
+
+
+def _starships_member_has_mobile_type_guard(
+    block: FunctionBlock,
+    line_offset: int,
+    call_position: int,
+    variable: str,
+) -> bool:
+    lines = block.lines
+    depths = _line_depths(lines)
+    for index in range(1, line_offset + 1):
+        end = min(line_offset + 1, index + 8)
+        window_lines = list(lines[index:end])
+        if line_offset < end:
+            window_lines[line_offset - index] = window_lines[line_offset - index][
+                :call_position
+            ]
+        condition = _exiting_if_condition("\n".join(window_lines))
+        if condition is None or "&&" in condition:
+            continue
+        if depths[index] > depths[line_offset] or _variable_reassigned(
+            lines, variable, index + 1, line_offset + 1
+        ):
+            continue
+        if _ship_type_condition_proves_mobile(
+            condition, variable, taken_branch=False
+        ):
+            return True
+
+    for index in range(1, line_offset + 1):
+        if _brace_block_end(lines, index) < line_offset:
+            continue
+        condition = _first_if_condition(
+            "\n".join(lines[index : min(line_offset + 1, index + 8)])
+        )
+        if condition is None or "||" in condition:
+            continue
+        if _variable_reassigned(lines, variable, index + 1, line_offset + 1):
+            continue
+        if _ship_type_condition_proves_mobile(
+            condition, variable, taken_branch=True
+        ):
+            return True
+
+    same_line = _mask_non_code(lines[line_offset][:call_position])
+    statement_window = "\n".join(
+        (*lines[max(1, line_offset - 6) : line_offset], same_line)
+    )
+    statement_prefix = statement_window.rsplit(";", 1)[-1]
+    return (
+        "&&" in statement_prefix
+        and "||" not in statement_prefix
+        and _ship_type_condition_proves_mobile(
+            statement_prefix, variable, taken_branch=True
+        )
+    )
+
+
+def _lint_shipistakeoff_on_starships_member(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """StarShips also enumerates stations, where ShipIsTakeoff is unsafe."""
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[int | None, str, int, str]] = set()
+    for block in _runtime_analysis_blocks(project, functions).values():
+        members = _starships_member_variables(block)
+        if not members:
+            continue
+        for line_offset, line in enumerate(block.lines[1:], start=1):
+            masked = _mask_non_code(line)
+            for position, arguments in _call_arguments(masked, "ShipIsTakeoff"):
+                if not arguments or (variable := _simple_identifier(arguments[0])) not in members:
+                    continue
+                if _starships_member_has_mobile_type_guard(
+                    block, line_offset, position, variable
+                ):
+                    continue
+                key = (block.object_id, block.field, block.start_line + line_offset, variable)
+                if key in reported:
+                    continue
+                reported.add(key)
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-shipistakeoff-on-unproven-starships-member",
+                        f"ShipIsTakeoff({variable}) получает элемент StarShips без доминирующего ShipTypeN({variable}) < t_RC; StarShips включает станции, для которых lifecycle-вызов способен вызвать EAccessViolation",
+                        path,
+                        f"{block.location} line {block.start_line + line_offset}",
+                        line.strip(),
+                    )
+                )
+    return issues
+
+
+_OPAQUE_SHIP_DEREFERENCE_CALLS = {
+    "coordx",
+    "coordy",
+    "dist",
+    "getshipplanet",
+    "getshipruins",
+    "id",
+    "name",
+}
+
+
+def _dereferences_ship_handle(call: str) -> bool:
+    return (
+        call in _OPAQUE_SHIP_DEREFERENCE_CALLS
+        or call.startswith("ship")
+        or call.startswith("order")
+    )
+
+
+def _lint_shipgetbad_opaque_dereferences(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Treat ShipGetBad results as opaque until a live object is re-resolved."""
+
+    blocks = _runtime_analysis_blocks(project, functions)
+    initial_parameters: dict[str, set[int]] = {name: set() for name in blocks}
+    returning_tainted: set[str] = set()
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool|unknown)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+
+    def analyze(block: FunctionBlock, *, collect_issues: bool) -> tuple[bool, list[RuntimeIssue]]:
+        function_key = block.name.casefold()
+        parameters = _function_parameters(block)
+        tainted = {
+            parameters[index]
+            for index in initial_parameters[function_key]
+            if index < len(parameters)
+        }
+        returns_raw = False
+        found: list[RuntimeIssue] = []
+        for line_offset, line in enumerate(block.lines[1:], start=1):
+            masked = _mask_non_code(line)
+            for match in assignment.finditer(masked):
+                target = match.group(1).casefold()
+                expression = match.group(2)
+                calls = {call.casefold() for call in _calls(expression)}
+                identifiers = {
+                    value.casefold() for value in IDENTIFIER_RE.findall(expression)
+                }
+                raw = "shipgetbad" in calls or bool(calls & returning_tainted)
+                if not calls:
+                    raw |= bool(identifiers & tainted)
+                if target == "result":
+                    returns_raw |= raw
+                elif raw:
+                    tainted.add(target)
+                else:
+                    tainted.discard(target)
+
+            for _position, call, arguments in _line_call_sites(masked):
+                tainted_arguments = [
+                    index
+                    for index, argument in enumerate(arguments)
+                    if (
+                        {
+                            value.casefold() for value in IDENTIFIER_RE.findall(argument)
+                        }
+                        & tainted
+                        or "shipgetbad" in {
+                            value.casefold() for value in _calls(argument)
+                        }
+                        or bool(
+                            {value.casefold() for value in _calls(argument)}
+                            & returning_tainted
+                        )
+                    )
+                ]
+                if not tainted_arguments:
+                    continue
+                if call in initial_parameters:
+                    initial_parameters[call].update(tainted_arguments)
+                    continue
+                if not collect_issues or not _dereferences_ship_handle(call):
+                    continue
+                for argument_index in tainted_arguments:
+                    found.append(
+                        RuntimeIssue(
+                            "error",
+                            "runtime-shipgetbad-opaque-dereference",
+                            f"Аргумент {argument_index + 1} вызова {call} происходит из ShipGetBad и разыменовывается без повторного разрешения среди живых кораблей текущей системы; raw handle разрешён только для ==/!= до live-membership и type guard",
+                            str(project.path) if project.path else None,
+                            f"{block.location} line {block.start_line + line_offset}",
+                            line.strip(),
+                        )
+                    )
+        return returns_raw, found
+
+    changed = True
+    while changed:
+        before_parameters = {name: set(values) for name, values in initial_parameters.items()}
+        before_returns = set(returning_tainted)
+        for name, block in blocks.items():
+            returns_raw, _found = analyze(block, collect_issues=False)
+            if returns_raw:
+                returning_tainted.add(name)
+        changed = before_parameters != initial_parameters or before_returns != returning_tainted
+
+    issues: list[RuntimeIssue] = []
+    seen: set[tuple[str | None, str | None, str | None]] = set()
+    for block in blocks.values():
+        _returns_raw, found = analyze(block, collect_issues=True)
+        for issue in found:
+            key = (issue.code, issue.location, issue.evidence)
+            if key not in seen:
+                seen.add(key)
+                issues.append(issue)
+    return issues
+
+
 def _unguarded_order_summaries(
     functions: dict[str, FunctionBlock],
 ) -> dict[str, set[int]]:
@@ -3143,6 +3937,7 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     issues.extend(_lint_cross_block_calls(project, functions))
     issues.extend(_lint_unavailable_engine_calls(project, functions))
     issues.extend(_lint_unresolved_user_functions(project, functions))
+    issues.extend(_lint_duplicate_local_declarations(project))
     issues.extend(_lint_rscript_arrays(project))
     issues.extend(_lint_rndobject_anchor_types(project, functions))
     issues.extend(_lint_id_to_ship_guards(project, functions))
@@ -3152,6 +3947,9 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     issues.extend(_lint_linked_empty_runtime_code(project))
     issues.extend(_lint_persistent_item_handles(project, functions))
     issues.extend(_lint_persistent_world_object_handles(project, functions))
+    issues.extend(_lint_shipstar_on_unplaced_ship(project, functions))
+    issues.extend(_lint_shipistakeoff_on_starships_member(project, functions))
+    issues.extend(_lint_shipgetbad_opaque_dereferences(project, functions))
     ship_effects = _ship_effect_summaries(functions)
     issues.extend(_lint_repeated_detached_item_free(project, functions))
     issues.extend(_lint_order_rewrite_before_hyperspace_guard(project, functions))

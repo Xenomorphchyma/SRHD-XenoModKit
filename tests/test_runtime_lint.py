@@ -1374,6 +1374,184 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertIn("runtime-stale-shipgetbad-follow", codes)
 
+    def test_shipstar_requires_normal_space_and_completed_takeoff(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function CurrentStar(dword ship)",
+            "{",
+            "    dword planet = GetShipPlanet(ship);",
+            "    dword star = ShipStar(ship);",
+            "    if(!star && planet) result = PlanetToStar(planet);",
+            "    else result = star;",
+            "}",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("late-dock-fallback.rson")))
+        matching = [
+            issue for issue in issues if issue.code == "runtime-shipstar-on-docked-ship"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].evidence, "dword star = ShipStar(ship);")
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function CurrentStar(dword ship)",
+            "{",
+            "    result = 0;",
+            "    if(!ship || ShipIsTakeoff(ship)) exit;",
+            "    dword planet = GetShipPlanet(ship);",
+            "    if(planet) { result = PlanetToStar(planet); exit; }",
+            "    dword ruins = GetShipRuins(ship);",
+            "    if(ruins) exit;",
+            "    if(!ShipInNormalSpace(ship)) exit;",
+            "    result = ShipStar(ship);",
+            "}",
+        ]
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("safe-star.rson")))
+        }
+        self.assertNotIn("runtime-shipstar-on-docked-ship", safe_codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword escort = GroupShip(escorts, 0);",
+            "int together = escort && ShipInNormalSpace(escort) &&",
+            "               !ShipIsTakeoff(escort) &&",
+            "               ShipStar(Player()) == ShipStar(escort);",
+        ]
+        chain_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("guard-chain.rson")))
+        }
+        self.assertNotIn("runtime-shipstar-on-docked-ship", chain_codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword escort = GroupShip(escorts, 0);",
+            "int escort_ready = escort && ShipInNormalSpace(escort) && !ShipIsTakeoff(escort);",
+            "if(escort_ready)",
+            "    result = ShipStar(escort);",
+        ]
+        flag_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("guard-flag.rson")))
+        }
+        self.assertNotIn("runtime-shipstar-on-docked-ship", flag_codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword ranger_center = IdToShip(center_id);",
+            "if(!ranger_center || ShipTypeN(ranger_center) != t_RC) exit;",
+            "result = ShipStar(ranger_center);",
+        ]
+        station_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("station-star.rson")))
+        }
+        self.assertNotIn("runtime-shipstar-on-docked-ship", station_codes)
+
+    def test_persistent_array_requires_newarray_initialization(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "queue", "Parent": -1, "#": 20}
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "ArrayClear(queue);",
+            "ArrayAdd(queue, 42);",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("not-array.rson")))
+        }
+        self.assertIn("runtime-persistent-array-use-without-newarray", codes)
+
+        data["Visual.Objects"][0]["Variables"][0]["Init"] = "newarray(1)"
+        initialized_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("array-init.rson")))
+        }
+        self.assertNotIn("runtime-persistent-array-use-without-newarray", initialized_codes)
+
+    def test_duplicate_local_names_across_branches_are_rejected(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["States"][0]["OnActCode"] = (
+            "[t_OnPlayerBuyEq|]\n"
+            "if(choice == 1)\n"
+            "{\n"
+            "    dword selected = 1;\n"
+            "}\n"
+            "else\n"
+            "{\n"
+            "    dword selected = 2;\n"
+            "}\n"
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("duplicate-local.rson")))
+        matching = [
+            issue for issue in issues if issue.code == "runtime-duplicate-local-declaration"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].evidence, "dword selected = 2;")
+
+        data["Visual.Objects"][0]["States"][0]["OnActCode"] = (
+            "[t_OnPlayerBuyEq|]\n"
+            "if(choice == 1) { dword selected = 1; }\n"
+            "else { dword fallback = 2; }\n"
+        )
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("unique-locals.rson")))
+        }
+        self.assertNotIn("runtime-duplicate-local-declaration", safe_codes)
+
+    def test_shipgetbad_handle_must_be_resolved_from_live_membership(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword attacker = ShipGetBad(transport);",
+            "if(attacker && ShipInNormalSpace(attacker)) result = ShipStar(attacker);",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("raw-shipgetbad.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-shipgetbad-opaque-dereference"
+        ]
+        self.assertGreaterEqual(len(matching), 1)
+        self.assertTrue(any("ShipInNormalSpace" in (issue.evidence or "") for issue in matching))
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword raw_attacker = ShipGetBad(transport);",
+            "dword fresh_ship = StarShips(current_star, 0);",
+            "if(fresh_ship == raw_attacker && ShipIsTakeoff(fresh_ship)) exit;",
+        ]
+        station_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("station-target.rson")))
+        }
+        self.assertIn(
+            "runtime-shipistakeoff-on-unproven-starships-member",
+            station_codes,
+        )
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function ResolveLive(dword raw_ship, dword star)",
+            "{",
+            "    result = 0;",
+            "    for(int i = 0; i < StarShips(star); i = i + 1)",
+            "    {",
+            "        dword live_ship = StarShip(star, i);",
+            "        if(live_ship == raw_ship && ShipTypeN(live_ship) > 0 && ShipTypeN(live_ship) < t_RC)",
+            "        {",
+            "            result = live_ship;",
+            "            exit;",
+            "        }",
+            "    }",
+            "}",
+            "dword attacker = ShipGetBad(transport);",
+            "dword resolved = ResolveLive(attacker, current_star);",
+            "if(resolved) ShipState(resolved);",
+        ]
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("resolved-shipgetbad.rson")))
+        }
+        self.assertNotIn("runtime-shipgetbad-opaque-dereference", safe_codes)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -270,7 +270,20 @@ class RsonTests(unittest.TestCase):
                 project.delete_object(2)
             removed = project.delete_object(2, detach_references=True)
             self.assertEqual(removed["removed_links"], 2)
-            self.assertEqual(project.validate(), [])
+            issues = project.validate()
+            self.assertEqual(
+                {issue.code for issue in issues},
+                {"rson-object-id-range"},
+            )
+
+    def test_sparse_object_ids_are_rejected_before_rscript_hangs(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0]["Operations"][1]["#"] = 107
+        data["Visual.Links"][0]["End"] = 107
+        issues = RsonProject(data, Path("sparse-ids.rson")).validate()
+        matching = [issue for issue in issues if issue.code == "rson-object-id-range"]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("#1..#107", matching[0].message)
 
     def test_delete_link_uses_stable_zero_based_index(self) -> None:
         with tempfile.TemporaryDirectory() as name:

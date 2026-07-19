@@ -154,9 +154,11 @@ class ToolchainIntegrationTests(unittest.TestCase):
             source_rson = root / "source.rson"
             source_scr = root / "source.scr"
             source_lang = root / "source.txt"
+            empty_lang_dat = root / "Lang.dat"
             recovered = root / "recovered.rson"
             self.chain.convert_script_project(source_svr, source_rson)
             self.chain.compile_rson(source_rson, source_scr, source_lang)
+            empty_lang_dat.write_bytes(b"\xff\xfe")
             source_bytes = source_scr.read_bytes()
             staged_before = {path.name for path in rscript.parent.glob("_srhd_*")}
             stdout = StringIO()
@@ -168,13 +170,15 @@ class ToolchainIntegrationTests(unittest.TestCase):
                         "decompile",
                         str(source_scr),
                         str(recovered),
+                        "--lang-dat",
+                        str(empty_lang_dat),
                         "--deep-roundtrip",
                         "--json",
                     ]
                 )
 
             result = json.loads(stdout.getvalue())
-            self.assertEqual(exit_code, 0)
+            self.assertEqual(exit_code, 0, result)
             self.assertTrue(result["verified"])
             self.assertTrue(result["roundtrip"]["exact_binary_match"])
             self.assertTrue(result["deep_roundtrip"]["verified"])
@@ -189,6 +193,15 @@ class ToolchainIntegrationTests(unittest.TestCase):
                 },
             )
             self.assertFalse(result["dialogs_imported"])
+            self.assertEqual(result["lang_dat"], str(empty_lang_dat.resolve()))
+            self.assertEqual(result["lang_dat_skip_reason"], "empty-rscript-lang-dat")
+            self.assertTrue(
+                any(
+                    phase["name"] == "import-dialogs"
+                    and phase["status"] == "skipped"
+                    for phase in result["phases"]
+                )
+            )
             self.assertEqual(source_scr.read_bytes(), source_bytes)
             self.assertEqual(load_rson(recovered).validate(), [])
             self.assertEqual(list(root.glob(".srhd-*")), [])

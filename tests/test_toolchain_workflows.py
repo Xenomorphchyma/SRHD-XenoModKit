@@ -36,7 +36,7 @@ PROJECT = {
 
 
 class ToolchainWorkflowTests(unittest.TestCase):
-    def test_progress_timeout_is_bounded_and_zero_disables_deadlines(self) -> None:
+    def test_progress_timeout_scales_and_zero_disables_deadlines(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             small = root / "small.rson"
@@ -51,13 +51,13 @@ class ToolchainWorkflowTests(unittest.TestCase):
             explicit, explicit_policy = _rscript_timeout_policy(large, "compile", 90)
             disabled, disabled_policy = _rscript_timeout_policy(large, "compile", 0)
 
-            self.assertEqual(small_timeout, 300.0)
-            self.assertEqual(large_timeout, small_timeout)
-            self.assertEqual(small_policy["mode"], "progress-aware")
+            self.assertEqual(small_timeout, 600.0)
+            self.assertGreater(large_timeout, small_timeout)
+            self.assertEqual(small_policy["mode"], "adaptive")
             self.assertEqual(small_policy["progress_seconds"], 60.0)
-            self.assertEqual(large_policy["progress_seconds"], 60.0)
+            self.assertGreater(large_policy["progress_seconds"], 60.0)
             self.assertEqual(explicit, 90.0)
-            self.assertEqual(explicit_policy["progress_seconds"], 60.0)
+            self.assertEqual(explicit_policy["progress_seconds"], 90.0)
             self.assertIsNone(disabled)
             self.assertEqual(disabled_policy["mode"], "disabled")
             self.assertIsNone(disabled_policy["progress_seconds"])

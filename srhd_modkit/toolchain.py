@@ -25,8 +25,7 @@ from .legacy_manifest import ensure_legacy_codepage_executable
 
 
 EMPTY_RSCRIPT_LANG_DAT = b"\xff\xfe"
-DEFAULT_RSCRIPT_PROGRESS_TIMEOUT = 60.0
-DEFAULT_RSCRIPT_HARD_TIMEOUT = 300.0
+MIN_RSCRIPT_ADAPTIVE_TIMEOUT = 600.0
 
 
 def _rscript_timeout_policy(
@@ -34,20 +33,21 @@ def _rscript_timeout_policy(
     operation: str,
     requested: float | None,
 ) -> tuple[float | None, dict[str, Any]]:
-    """Choose a short progress window plus a bounded emergency deadline.
+    """Choose size-aware total and no-progress deadlines.
 
-    The legacy size formula could select hundreds of seconds even when RScript
-    was completely stalled.  The process runner now resets a 60-second window
-    only after observable progress.  A separate five-minute hard deadline
-    contains a process that keeps producing misleading activity indefinitely.
+    Small projects keep a 60-second stalled-process window.  RScript can remain
+    quiet longer while rebuilding a large graph, so both that window and the
+    total deadline grow with proven project size.  The formulas are deliberately
+    uncapped.  The Windows Job Object still owns and cleans the editor process
+    if the caller or agent terminates.
 
-    ``requested=None`` selects the defaults, ``0`` disables both deadlines,
-    and a positive value remains an explicit total deadline.  Explicit totals
-    shorter than a minute also shorten the progress window.
+    ``requested=None`` selects the adaptive deadlines, ``0`` disables both,
+    and a positive value remains an explicit operator limit.
     """
 
     if requested is not None and requested < 0:
         raise ValueError("Таймаут не может быть отрицательным; 0 отключает оба ограничения")
+    size_mib = source.stat().st_size / (1024 * 1024) if source.is_file() else 0.0
     code_lines = 0
     objects = 0
     if source.suffix.casefold() == ".rson" and source.is_file():
@@ -57,23 +57,42 @@ def _rscript_timeout_policy(
             objects = int(summary.get("objects", 0))
         except Exception:
             pass
+    if operation in {"compile", "roundtrip"}:
+        adaptive = max(
+            MIN_RSCRIPT_ADAPTIVE_TIMEOUT,
+            180.0 + code_lines * 0.35 + objects * 1.5 + size_mib * 30.0,
+        )
+        adaptive_progress = max(
+            60.0,
+            30.0 + code_lines * 0.02 + objects * 0.25 + size_mib * 10.0,
+        )
+    else:
+        adaptive = max(
+            MIN_RSCRIPT_ADAPTIVE_TIMEOUT,
+            300.0 + size_mib * 180.0,
+        )
+        adaptive_progress = max(60.0, 60.0 + size_mib * 60.0)
+    adaptive = round(adaptive, 3)
+    adaptive_progress = round(adaptive_progress, 3)
     if requested is None:
-        selected = DEFAULT_RSCRIPT_HARD_TIMEOUT
-        progress_timeout = DEFAULT_RSCRIPT_PROGRESS_TIMEOUT
-        mode = "progress-aware"
+        selected = adaptive
+        progress_timeout = adaptive_progress
+        mode = "adaptive"
     elif requested == 0:
         selected = None
         progress_timeout = None
         mode = "disabled"
     else:
         selected = float(requested)
-        progress_timeout = min(DEFAULT_RSCRIPT_PROGRESS_TIMEOUT, selected)
+        progress_timeout = min(adaptive_progress, selected)
         mode = "explicit"
     return selected, {
         "mode": mode,
         "seconds": selected,
         "hard_seconds": selected,
+        "adaptive_seconds": adaptive,
         "progress_seconds": progress_timeout,
+        "adaptive_progress_seconds": adaptive_progress,
         "progress_resets_on": ["expected-output", "process-io", "control-action"],
         "operation": operation,
         "source_size": source.stat().st_size if source.is_file() else None,
@@ -659,12 +678,21 @@ class Toolchain:
                 raise ValueError("Непроверенный RSON нельзя сохранять по пути штатного результата")
             if unverified_destination.exists() and not overwrite:
                 raise FileExistsError(f"Непроверенный результат уже существует: {unverified_destination}")
-        resolved_lang = Path(lang_dat).resolve() if lang_dat is not None else None
-        if resolved_lang is not None:
-            if resolved_lang.suffix.casefold() != ".dat":
+        requested_lang = Path(lang_dat).resolve() if lang_dat is not None else None
+        resolved_lang = requested_lang
+        lang_dat_skip_reason = None
+        if requested_lang is not None:
+            if requested_lang.suffix.casefold() != ".dat":
                 raise ValueError("Файл диалогов должен иметь расширение .dat")
-            if not resolved_lang.is_file():
-                raise FileNotFoundError(resolved_lang)
+            if not requested_lang.is_file():
+                raise FileNotFoundError(requested_lang)
+            # An explicitly supplied dialog DAT containing only the UTF-16LE
+            # BOM is semantically empty regardless of its staging path.  The
+            # stricter DATA/Script/Lang.dat path rule remains in
+            # is_empty_rscript_lang_dat() for generic DAT validation.
+            if requested_lang.read_bytes() == EMPTY_RSCRIPT_LANG_DAT:
+                resolved_lang = None
+                lang_dat_skip_reason = "empty-rscript-lang-dat"
         source_info = inspect_scr(source)
         if not source_info["supported_version"]:
             raise ValueError(f"RScript 4.10f не поддерживает SCR версии {source_info['version']}")
@@ -678,6 +706,15 @@ class Toolchain:
         phases: list[dict[str, Any]] = [
             {"name": "inspect-source", "status": "passed", "seconds": 0.0}
         ]
+        if lang_dat_skip_reason is not None:
+            phases.append(
+                {
+                    "name": "import-dialogs",
+                    "status": "skipped",
+                    "reason": lang_dat_skip_reason,
+                    "seconds": 0.0,
+                }
+            )
         project = None
         summary: dict[str, Any] | None = None
         runtime_issues: list[Any] = []
@@ -716,8 +753,9 @@ class Toolchain:
                 "unverified_path": kept,
                 "source_sha256": sha256_file(source),
                 "source_version": source_info["version"],
-                "lang_dat": str(resolved_lang) if resolved_lang is not None else None,
+                "lang_dat": str(requested_lang) if requested_lang is not None else None,
                 "dialogs_imported": resolved_lang is not None,
+                "lang_dat_skip_reason": lang_dat_skip_reason,
                 "recovered_project": reported_summary,
                 "phases": phases,
                 "error": {"type": type(exc).__name__, "message": str(exc)},
@@ -953,8 +991,9 @@ class Toolchain:
             "source_sha256": sha256_file(source),
             "destination_sha256": sha256_file(destination),
             "source_version": source_info["version"],
-            "lang_dat": str(resolved_lang) if resolved_lang is not None else None,
+            "lang_dat": str(requested_lang) if requested_lang is not None else None,
             "dialogs_imported": resolved_lang is not None,
+            "lang_dat_skip_reason": lang_dat_skip_reason,
             "objects": summary["objects"],
             "recovered_project": summary,
             "verified": True,
@@ -1167,6 +1206,7 @@ class Toolchain:
                 raise ValueError(f"RSON не прошёл проверку: {errors[0].message}")
         tool = self.require("rscript")
         destination.parent.mkdir(parents=True, exist_ok=True)
+        timeout_seconds, timeout_policy = _rscript_timeout_policy(source, "convert", None)
         # RScript 4.10f crashes with Runtime error 217 for absolute paths and
         # even relative paths containing a directory. Only a bare filename in
         # its own working directory is reliable. A UUID prevents collisions.
@@ -1180,8 +1220,8 @@ class Toolchain:
                 ["--cli", "--convert", target[0], staged_source.name],
                 cwd=tool.path.parent,
                 expected_outputs=[generated],
-                timeout=DEFAULT_RSCRIPT_HARD_TIMEOUT,
-                progress_timeout=DEFAULT_RSCRIPT_PROGRESS_TIMEOUT,
+                timeout=timeout_seconds,
+                progress_timeout=timeout_policy["progress_seconds"],
                 abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
             )
             if not generated.is_file():
@@ -1205,4 +1245,5 @@ class Toolchain:
             "compiler_was_waiting_after_output": process_result.forced_after_outputs,
             "compiler_queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
             "compiler_progress_updates": getattr(process_result, "progress_updates", 0),
+            "compiler_timeout": timeout_policy,
         }

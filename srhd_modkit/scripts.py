@@ -406,6 +406,25 @@ class RsonProject:
         duplicates = sorted({value for value in identifiers if identifiers.count(value) > 1})
         for value in duplicates:
             issues.append(ScriptIssue("error", "rson-duplicate-id", f"Повторяется номер объекта #{value}"))
+        if len(identifiers) == len(objects) and not duplicates and identifiers:
+            ordered = sorted(identifiers)
+            expected = list(range(ordered[0], ordered[0] + len(ordered)))
+            if ordered[0] not in {0, 1} or ordered != expected:
+                missing = sorted(set(range(ordered[0], ordered[-1] + 1)) - set(ordered))
+                detail = (
+                    f"; отсутствуют {', '.join(f'#{value}' for value in missing[:8])}"
+                    if missing
+                    else ""
+                )
+                issues.append(
+                    ScriptIssue(
+                        "error",
+                        "rson-object-id-range",
+                        "RScript требует плотные номера объектов, начинающиеся с #0 или #1; "
+                        f"получен диапазон #{ordered[0]}..#{ordered[-1]} для {len(ordered)} объектов{detail}. "
+                        "Разреженные большие ID приводят к List index out of bounds внутри компилятора",
+                    )
+                )
         known = set(identifiers)
         for item in objects:
             parent = item.get("Parent", -1)
