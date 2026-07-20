@@ -11,7 +11,7 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 
 1. Найти корень репозитория, содержащий `srhd.py`, `pyproject.toml` и каталог `srhd_modkit`. Обозначать его как `<MODKIT_ROOT>`.
 2. Если этот скилл загружен прямо из репозитория, `<MODKIT_ROOT>` находится на три уровня выше `SKILL.md`: `.agents/skills/srhd-modkit/../../..`.
-3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.9.4` или новее.
+3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.9.3` или новее.
 4. При другой версии сначала прочитать локальные `README_RU.md`, `AUDIT_RU.md` и вывод `python -B srhd.py --help`; не предполагать наличие `script decompile`.
 5. Если корень найти нельзя, запросить путь к клону ModKit. Не использовать каталог установленной игры вместо инструментария.
 6. Для точного синтаксиса читать [references/commands.md](references/commands.md).
