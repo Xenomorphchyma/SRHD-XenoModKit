@@ -34,6 +34,8 @@ from .resources import (
 )
 from .runtime_lint import (
     RuntimeIssue,
+    compare_storage_schemas,
+    dialog_semantic_map,
     lint_main_runtime,
     lint_module_runtime,
     lint_rson_runtime,
@@ -133,6 +135,8 @@ __all__ = [
     "inspect_resource",
     "verify_resource",
     "RuntimeIssue",
+    "compare_storage_schemas",
+    "dialog_semantic_map",
     "lint_main_runtime",
     "lint_module_runtime",
     "lint_rson_runtime",
@@ -195,4 +199,4 @@ __all__ = [
     "build_quest_from_json",
 ]
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"

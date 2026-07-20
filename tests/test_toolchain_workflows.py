@@ -10,7 +10,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, load_rson
-from srhd_modkit.toolchain import Toolchain, _rscript_timeout_policy
+from srhd_modkit.scripts import inspect_scr
+from srhd_modkit.toolchain import (
+    Toolchain,
+    _rscript_failure_diagnostic,
+    _rscript_timeout_policy,
+)
 
 
 PROJECT = {
@@ -141,6 +146,13 @@ class ToolchainWorkflowTests(unittest.TestCase):
                     "verified": True,
                     "source_sha256": "right" if is_right else "left",
                     "source_version": 8,
+                    "lang_dat": "Lang.dat",
+                    "dialogs_imported": not is_right,
+                    "lang_import": {
+                        "status": "failed-fallback" if is_right else "passed",
+                        "fallback_used": is_right,
+                        "diagnostic": None,
+                    },
                     "recovered_project": project.summary(),
                     "roundtrip": {},
                     "deep_roundtrip": None,
@@ -160,6 +172,81 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertEqual(len(result["comparison"]["runtime_issues"]["added"]), 1)
             self.assertEqual(len(result["comparison"]["runtime_issues"]["resolved"]), 1)
             self.assertFalse(result["comparison"]["temporary_projects_persisted"])
+            self.assertTrue(result["right"]["lang_import"]["fallback_used"])
+            self.assertFalse(result["right"]["dialogs_imported"])
+
+    def test_tfileec_modal_is_structured_and_lang_fallback_is_explicit(self) -> None:
+        diagnostic = _rscript_failure_diagnostic(
+            TimeoutError(
+                r"Процесс остановлен; контролы диалога: TFileEC.Open. FileName=D:\RScript\BlockPar\temp.txt."
+            )
+        )
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual(diagnostic["code"], "decompile-lang-import-tfileec-open")
+        self.assertTrue(diagnostic["temp_path"].endswith("temp.txt"))
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "source.scr"
+            output = root / "verified.rson"
+            lang = root / "Lang.dat"
+            source.write_bytes((8).to_bytes(4, "little") + b"source")
+            lang.write_bytes(b"not-empty")
+            chain = Toolchain(root / "tools")
+            recover_calls: list[Path | None] = []
+
+            def fake_recover(_source, recovered, *, lang_dat, **_kwargs):
+                recover_calls.append(lang_dat)
+                if lang_dat is not None:
+                    raise TimeoutError(
+                        r"TFileEC.Open. FileName=D:\RScript\BlockPar\temp.txt."
+                    )
+                recovered.write_text(json.dumps(PROJECT), encoding="utf-8")
+                return SimpleNamespace(
+                    exit_code=0,
+                    forced_after_outputs=False,
+                    elapsed_seconds=0.01,
+                    queue_seconds=0.0,
+                    progress_updates=1,
+                    last_progress_seconds=0.01,
+                ), {
+                    "mode": "explicit-test",
+                    "seconds": 60.0,
+                    "progress_seconds": 60.0,
+                }
+
+            def fake_compile(_source, scr_output, lang_output, **_kwargs):
+                scr_output.write_bytes((8).to_bytes(4, "little") + b"rebuilt")
+                lang_output.write_text("", encoding="utf-8")
+                process = SimpleNamespace(
+                    exit_code=0,
+                    forced_after_outputs=False,
+                    elapsed_seconds=0.01,
+                    queue_seconds=0.0,
+                    progress_updates=1,
+                    last_progress_seconds=0.01,
+                )
+                return process, inspect_scr(scr_output), {
+                    "mode": "explicit-test",
+                    "seconds": 60.0,
+                    "progress_seconds": 60.0,
+                }
+
+            with patch.object(chain, "_recover_scr_with_rscript", side_effect=fake_recover), patch.object(
+                chain, "_compile_rson_with_rscript", side_effect=fake_compile
+            ):
+                result = chain.decompile_scr(
+                    source,
+                    output,
+                    lang_dat=lang,
+                    fallback_without_lang=True,
+                )
+
+            self.assertTrue(result["verified"])
+            self.assertFalse(result["dialogs_imported"])
+            self.assertTrue(result["lang_import"]["fallback_used"])
+            self.assertEqual(result["lang_import"]["status"], "failed-fallback")
+            self.assertEqual(recover_calls, [lang.resolve(), None])
 
 
 if __name__ == "__main__":

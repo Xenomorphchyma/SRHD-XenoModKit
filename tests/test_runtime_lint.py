@@ -12,7 +12,12 @@ from types import SimpleNamespace
 from srhd_modkit.blockpar import parse_blockpar
 from srhd_modkit.cli import _runtime_lint_target, cmd_script_audit_mod, cmd_script_build
 from srhd_modkit.module_info import parse_module_info
-from srhd_modkit.runtime_lint import lint_main_runtime, lint_module_runtime, lint_rson_runtime
+from srhd_modkit.runtime_lint import (
+    compare_storage_schemas,
+    lint_main_runtime,
+    lint_module_runtime,
+    lint_rson_runtime,
+)
 from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, RsonProject
 
 
@@ -1421,7 +1426,8 @@ class RuntimeLintTests(unittest.TestCase):
             issue.code
             for issue in lint_rson_runtime(RsonProject(data, Path("guard-chain.rson")))
         }
-        self.assertNotIn("runtime-shipstar-on-docked-ship", chain_codes)
+        self.assertIn("runtime-shipstar-on-docked-ship", chain_codes)
+        self.assertIn("runtime-object-api-behind-boolean-guard", chain_codes)
 
         data["Visual.Objects"][0]["Operations"][1]["Code"] = [
             "dword escort = GroupShip(escorts, 0);",
@@ -1490,6 +1496,20 @@ class RuntimeLintTests(unittest.TestCase):
 
         data["Visual.Objects"][0]["States"][0]["OnActCode"] = (
             "[t_OnPlayerBuyEq|]\n"
+            "dword first = 1, selected = 2;\n"
+            "int other = 3, selected = 4;\n"
+        )
+        comma_issues = lint_rson_runtime(RsonProject(data, Path("comma-locals.rson")))
+        self.assertEqual(
+            sum(
+                issue.code == "runtime-duplicate-local-declaration"
+                for issue in comma_issues
+            ),
+            1,
+        )
+
+        data["Visual.Objects"][0]["States"][0]["OnActCode"] = (
+            "[t_OnPlayerBuyEq|]\n"
             "if(choice == 1) { dword selected = 1; }\n"
             "else { dword fallback = 2; }\n"
         )
@@ -1551,6 +1571,175 @@ class RuntimeLintTests(unittest.TestCase):
             for issue in lint_rson_runtime(RsonProject(data, Path("resolved-shipgetbad.rson")))
         }
         self.assertNotIn("runtime-shipgetbad-opaque-dereference", safe_codes)
+
+    def test_unregistered_tvar_assignment_is_a_link_error(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "missing_storage_version = 1;"
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("missing-tvar.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-code-uses-unregistered-tvar"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("missing_storage_version", matching[0].message)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "int local_storage_version = 0;",
+            "local_storage_version = 1;",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("local-var.rson")))
+        }
+        self.assertNotIn("runtime-code-uses-unregistered-tvar", codes)
+
+    def test_object_api_guard_must_be_a_separate_statement(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword target = 0;",
+            "if(!target || !ShipCanJump(Player(), ShipStar(Player()), target, 1)) exit;",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("eager-bool.rson")))
+        }
+        self.assertIn("runtime-object-api-behind-boolean-guard", codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword target = 0;",
+            "if(!target) exit;",
+            "if(!ShipCanJump(Player(), ShipStar(Player()), target, 1)) exit;",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("sequential-guard.rson")))
+        }
+        self.assertNotIn("runtime-object-api-behind-boolean-guard", codes)
+
+    def test_dialog_forward_reference_to_persistent_array_is_blocked(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Operations"][0]["Code"].append("dialog_items = newarray(1);")
+        group["Dialogs"] = [
+            {"Type": "TDialog", "Name": "ArrayDialog", "Parent": -1, "#": 4}
+        ]
+        group["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "ArrayDialogBegin",
+                "Parent": -1,
+                "#": 5,
+                "Code.Type": "DialogBegin",
+                "Code": ["if(ArrayDim(dialog_items) > 1) result = dialog_items[1];"],
+            }
+        )
+        group["Variables"] = [
+            {
+                "Type": "TVar",
+                "Name": "dialog_items",
+                "Parent": -1,
+                "#": 6,
+                "Var.Type": "None",
+                "Init": "",
+            }
+        ]
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 4, "End": 5, "Nom": 0, "Arrow": True}
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("dialog-array-forward.rson")))
+        }
+        self.assertIn("rscript-dialog-persistent-array", codes)
+
+        group["Variables"][0]["#"] = 4
+        group["Dialogs"][0]["#"] = 5
+        group["Operations"][-1]["#"] = 6
+        data["Visual.Links"][0]["Begin"] = 5
+        data["Visual.Links"][0]["End"] = 6
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("dialog-array-backward.rson")))
+        }
+        self.assertNotIn("rscript-dialog-persistent-array", codes)
+
+    def test_storage_comparison_detects_array_hidden_by_legacy_gate(self) -> None:
+        old_data = deepcopy(SAFE_RSON)
+        old_data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "initialized", "Parent": -1, "#": 4, "Init": "0"}
+        ]
+        old_data["Visual.Objects"][0]["Operations"][0]["Code"].append("initialized = 0;")
+        new_data = deepcopy(old_data)
+        new_data["Visual.Objects"][0]["Variables"].append(
+            {
+                "Type": "TVar",
+                "Name": "saved_items",
+                "Parent": -1,
+                "#": 5,
+                "Var.Type": "None",
+                "Init": "",
+            }
+        )
+        new_data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "if(!initialized)",
+                "{",
+                "    saved_items = newarray(1);",
+                "    initialized = 1;",
+                "}",
+            ]
+        )
+        new_data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "if(ArrayDim(saved_items) > 1) result = saved_items[1];"
+        ]
+        old = RsonProject(old_data, Path("old.rson"))
+        new = RsonProject(new_data, Path("new.rson"))
+        comparison = compare_storage_schemas(old, new)
+        self.assertEqual(comparison["status"], "issues")
+        self.assertEqual(comparison["added_arrays"], ["saved_items"])
+        self.assertEqual(
+            comparison["issues"][0]["code"],
+            "runtime-new-persistent-array-without-storage-migration",
+        )
+
+    def test_dialog_targets_transitions_ether_and_warrior_advisories(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Dialogs"] = [
+            {"Type": "TDialog", "Name": "LoopDialog", "Parent": -1, "#": 4}
+        ]
+        group["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "LoopHandler",
+                "Parent": -1,
+                "#": 5,
+                "Code.Type": "Turn",
+                "Code": [
+                    "InjectAnswer('LoopDialog', 'Again', 0);",
+                    "DChange(99);",
+                    "Ether(0, 'Stable', 'One');",
+                    "EtherDelete('Stable');",
+                    "Ether(0, 'Stable', 'Two');",
+                    "dword released = BuyWarrior(home_planet);",
+                    "ShipOut(released);",
+                ],
+            }
+        )
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 4, "End": 5, "Nom": 0, "Arrow": True}
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("dialog-semantics.rson")))
+        }
+        self.assertIn("dialog-inject-self-target", codes)
+        self.assertIn("dialog-transition-number-missing", codes)
+        self.assertIn("runtime-ether-id-reuse-after-delete", codes)
+        self.assertIn("runtime-warrior-home-unchanged", codes)
 
 
 if __name__ == "__main__":

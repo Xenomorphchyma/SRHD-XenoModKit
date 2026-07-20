@@ -417,6 +417,117 @@ def _lint_unavailable_engine_calls(
     return issues
 
 
+_OBJECT_API_ARGUMENTS: dict[str, tuple[int, ...]] = {
+    "id": (0,),
+    "itemexist": (0,),
+    "planettostar": (0,),
+    "shipcanjump": (0, 1, 2),
+    "shipstar": (0,),
+    "shipistakeoff": (0,),
+    "shipinnormalspace": (0,),
+    "starowner": (0,),
+    "starplanets": (0,),
+    "starships": (0,),
+}
+
+
+def _iter_parsed_calls(text: str, function_name: str) -> Iterable[tuple[int, list[str], int]]:
+    masked = _mask_non_code(text)
+    pattern = re.compile(rf"\b{re.escape(function_name)}\s*\(", re.IGNORECASE)
+    for match in pattern.finditer(masked):
+        open_paren = masked.find("(", match.start())
+        parsed = _split_call_arguments(text, open_paren)
+        if parsed is not None:
+            arguments, end = parsed
+            yield match.start(), arguments, end
+
+
+def _boolean_statement(masked: str, position: int) -> tuple[int, int, str]:
+    start = max(
+        masked.rfind(";", 0, position),
+        masked.rfind("{", 0, position),
+        masked.rfind("}", 0, position),
+    ) + 1
+    end_candidates = [
+        value
+        for value in (
+            masked.find(";", position),
+            masked.find("{", position),
+            masked.find("}", position),
+        )
+        if value >= 0
+    ]
+    end = min(end_candidates) if end_candidates else len(masked)
+    return start, end, masked[start:end]
+
+
+def _same_expression_null_guard(expression: str, variable: str) -> bool:
+    wanted = re.escape(variable)
+    return bool(
+        re.search(
+            rf"(?:!\s*{wanted}\b|\b{wanted}\s*(?:==|<=)\s*0\b|\b0\s*(?:==|>=)\s*{wanted}\b)",
+            expression,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _same_expression_positive_guard(expression: str, variable: str) -> bool:
+    wanted = re.escape(variable)
+    return bool(
+        re.search(
+            rf"(?:^|[=(&|])\s*{wanted}\s*&&",
+            expression,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _lint_object_api_behind_boolean_guard(project: RsonProject) -> list[RuntimeIssue]:
+    """Do not treat neighbouring &&/|| operands as lazy safety guards."""
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for container in _iter_code_containers(project):
+        text = "\n".join(container.lines)
+        masked = _mask_non_code(text)
+        reported: set[tuple[int, str, str]] = set()
+        for call, indexes in _OBJECT_API_ARGUMENTS.items():
+            for position, arguments, _end in _iter_parsed_calls(text, call):
+                statement_start, _statement_end, statement = _boolean_statement(masked, position)
+                if "&&" not in statement and "||" not in statement:
+                    continue
+                for index in indexes:
+                    if index >= len(arguments):
+                        continue
+                    variable = _simple_identifier(arguments[index])
+                    guarded = variable is not None and (
+                        _same_expression_null_guard(statement, variable)
+                        or _same_expression_positive_guard(
+                            statement[: max(0, position - statement_start)],
+                            variable,
+                        )
+                    )
+                    if not guarded:
+                        continue
+                    line_number = text.count("\n", 0, position) + 1
+                    key = (line_number, call, variable)
+                    if key in reported:
+                        continue
+                    reported.add(key)
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "runtime-object-api-behind-boolean-guard",
+                            f"{call} получает объект {variable}, безопасность которого доказывается только соседним операндом &&/||. RScript runtime не гарантирует короткое замыкание; вынесите проверку объекта в отдельный предшествующий if/exit, а вызов API — в следующую инструкцию",
+                            path,
+                            f"{container.location}:{line_number}",
+                            container.lines[line_number - 1].strip(),
+                        )
+                    )
+    return issues
+
+
 def _line_comment_start(line: str) -> int | None:
     """Return the first // outside an RScript string literal."""
 
@@ -600,6 +711,50 @@ _LOCAL_DECLARATION_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)\b",
     re.IGNORECASE,
 )
+_LOCAL_DECLARATION_STATEMENT_RE = re.compile(
+    r"\b(?:int|dword|str|float|double|bool|unknown)\s+([^;\r\n]+)",
+    re.IGNORECASE,
+)
+
+
+def _local_declaration_sites(text: str) -> list[tuple[str, int]]:
+    """Return every name from typed declarations, including comma lists."""
+
+    result: list[tuple[str, int]] = []
+    for statement in _LOCAL_DECLARATION_STATEMENT_RE.finditer(_mask_non_code(text)):
+        payload = statement.group(1)
+        payload_start = statement.start(1)
+        declarations: list[tuple[str, int]] = []
+        depth = 0
+        start = 0
+        for index, char in enumerate(payload):
+            if char in "([":
+                depth += 1
+            elif char in ")]":
+                depth = max(0, depth - 1)
+            elif char == "," and depth == 0:
+                declarations.append((payload[start:index], start))
+                start = index + 1
+        declarations.append((payload[start:], start))
+        for declaration, offset in declarations:
+            match = re.match(
+                r"\s*(?:(?:int|dword|str|float|double|bool|unknown)\s+)?"
+                r"([A-Za-z_][A-Za-z0-9_]*)\b",
+                declaration,
+                re.IGNORECASE,
+            )
+            if match:
+                result.append(
+                    (
+                        match.group(1).casefold(),
+                        payload_start + offset + match.start(1),
+                    )
+                )
+    return result
+
+
+def _local_declaration_names(text: str) -> set[str]:
+    return {name for name, _position in _local_declaration_sites(text)}
 
 
 def _lint_duplicate_local_declarations(project: RsonProject) -> list[RuntimeIssue]:
@@ -652,8 +807,9 @@ def _lint_duplicate_local_declarations(project: RsonProject) -> list[RuntimeIssu
             declarations: dict[str, tuple[int, str]] = {}
             for line_index, line in lines:
                 masked = _mask_non_code(line)
-                for match in _LOCAL_DECLARATION_RE.finditer(masked):
-                    name = match.group(1).casefold()
+                if FUNCTION_RE.match(masked):
+                    continue
+                for name, _position in _local_declaration_sites(masked):
                     previous = declarations.get(name)
                     if previous is None:
                         declarations[name] = (line_index, line.strip())
@@ -663,7 +819,7 @@ def _lint_duplicate_local_declarations(project: RsonProject) -> list[RuntimeIssu
                         RuntimeIssue(
                             "error",
                             "runtime-duplicate-local-declaration",
-                            f"Локальное имя {match.group(1)} повторно объявлено в одном RScript scope ({scope_name}); "
+                            f"Локальное имя {name} повторно объявлено в одном RScript scope ({scope_name}); "
                             f"первое объявление находится на строке {first_line + 1}. Даже разные if-ветви не создают отдельный scope и могут повесить RScript 4.10f",
                             path,
                             f"{container.location}:{line_index + 1}",
@@ -1589,6 +1745,268 @@ def _shared_tvars(project: RsonProject) -> set[str]:
         for item in project.iter_objects()
         if str(item.get("Type", "")).casefold() == "tvar" and str(item.get("Name", "")).strip()
     }
+
+
+_IMPLICIT_RUNTIME_VARIABLES = {
+    "ganswerdata",
+    "result",
+}
+
+
+def _container_local_names(
+    container: CodeContainer,
+    functions: dict[str, FunctionBlock],
+) -> set[str]:
+    text = "\n".join(container.lines)
+    names = _local_declaration_names(text)
+    for block in functions.values():
+        if block.object_id == container.object_id and block.field == container.field:
+            names.update(_function_parameters(block))
+    return names
+
+
+def _lint_unregistered_tvar_assignments(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject assignments that look persistent but have no graph symbol.
+
+    RScript accepts a bare assignment syntactically even when the identifier is
+    neither a typed local nor a TVar.  The generated SCR then fails in the game
+    with ``Not link var``.  Object names are also linkable symbols, so they are
+    part of the project symbol table rather than guessed from naming prefixes.
+    """
+
+    shared = _shared_tvars(project)
+    implicit_globals = {
+        match.group(1).casefold()
+        for _object_id, _line_number, line in _global_initialization_lines(project)
+        for match in VARIABLE_ASSIGN_RE.finditer(_mask_non_code(line))
+    }
+    object_names = {
+        str(item.get("Name", "")).strip().casefold()
+        for item in project.iter_objects()
+        if str(item.get("Name", "")).strip()
+    }
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for container in _iter_code_containers(project):
+        local = _container_local_names(container, functions)
+        known = (
+            shared
+            | implicit_globals
+            | object_names
+            | local
+            | _IMPLICIT_RUNTIME_VARIABLES
+            | set(RSCRIPT_RUNTIME_CALLS)
+        )
+        reported: set[str] = set()
+        for line_number, line in enumerate(container.lines, start=1):
+            masked = _mask_non_code(line)
+            imported = {
+                match.group(1).casefold()
+                for match in re.finditer(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*ImportedFunction\s*\(",
+                    masked,
+                    re.IGNORECASE,
+                )
+            }
+            known.update(imported)
+            for match in VARIABLE_ASSIGN_RE.finditer(masked):
+                name = match.group(1).casefold()
+                if name in known or name in reported:
+                    continue
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-code-uses-unregistered-tvar",
+                        f"Code присваивает {match.group(1)}, но граф не содержит TVar/именованный объект с таким Name и в текущем scope нет типизированной локальной переменной; текстовое присваивание не объявляет переменную сценария и приводит к Not link var",
+                        path,
+                        f"{container.location}:{line_number}",
+                        line.strip(),
+                    )
+                )
+                reported.add(name)
+        text = "\n".join(container.lines)
+        call_arguments = dict(_OBJECT_API_ARGUMENTS)
+        call_arguments.update({name: (0,) for name in _RSCRIPT_ARRAY_CALLS})
+        for call, indexes in call_arguments.items():
+            for position, arguments, _end in _iter_parsed_calls(text, call):
+                for index in indexes:
+                    if index >= len(arguments):
+                        continue
+                    name = _simple_identifier(arguments[index])
+                    if name is None or name in known or name in reported:
+                        continue
+                    line_number = text.count("\n", 0, position) + 1
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "runtime-code-uses-unregistered-tvar",
+                            f"{call} читает {name}, но граф не содержит TVar/именованный объект с таким Name и в текущем scope нет типизированной локальной переменной; игра может завершить handler с Not link var :{name}",
+                            path,
+                            f"{container.location}:{line_number}",
+                            container.lines[line_number - 1].strip(),
+                        )
+                    )
+                    reported.add(name)
+    return issues
+
+
+def _dialog_code_object_ids(project: RsonProject) -> set[int]:
+    result = _dialog_scoped_turn_objects(project)
+    for item in project.iter_objects():
+        object_id = item.get("#")
+        if not isinstance(object_id, int):
+            continue
+        if str(item.get("Code.Type", "")).casefold() == "dialogbegin":
+            result.add(object_id)
+        elif str(item.get("Type", "")).casefold().startswith("tdialog"):
+            result.add(object_id)
+    return result
+
+
+def _lint_dialog_persistent_arrays(project: RsonProject) -> list[RuntimeIssue]:
+    """Block a proven RScript 4.10f compiler hang in dialog handlers."""
+
+    persistent_arrays = _rscript_array_names(project) & _shared_tvars(project)
+    if not persistent_arrays:
+        return []
+    tvar_ids = {
+        str(item.get("Name", "")).casefold(): item.get("#")
+        for item in project.iter_objects()
+        if str(item.get("Type", "")).casefold() == "tvar"
+        and str(item.get("Name", "")).strip()
+        and isinstance(item.get("#"), int)
+    }
+    dialog_objects = _dialog_code_object_ids(project)
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    array_call = re.compile(
+        rf"\b(?:{'|'.join(sorted(_RSCRIPT_ARRAY_CALLS))})\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+        re.IGNORECASE,
+    )
+    for container in _iter_code_containers(project):
+        if container.object_id not in dialog_objects and container.code_type != "dialogbegin":
+            continue
+        reported: set[str] = set()
+        for line_number, line in enumerate(container.lines, start=1):
+            masked = _mask_non_code(line)
+            names = {
+                match.group(1).casefold()
+                for match in array_call.finditer(masked)
+            }
+            names.update(
+                match.group(1).casefold()
+                for match in re.finditer(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[",
+                    masked,
+                )
+            )
+            for name in sorted(names & persistent_arrays):
+                # Proven RScript 4.10f failure is a forward reference from a
+                # dialog Top to a later dynamic TVar. Older arrays declared
+                # before the handler are used successfully by shipped scripts.
+                if (
+                    container.object_id is None
+                    or tvar_ids.get(name, -1) <= container.object_id
+                ):
+                    continue
+                if name in reported:
+                    continue
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "rscript-dialog-persistent-array",
+                        f"Диалоговый code object #{container.object_id} обращается вперёд к persistent-массиву {name} (TVar #{tvar_ids.get(name)}); RScript 4.10f способен зависнуть без диагностической ошибки. Перенесите TVar перед обработчиком, синхронизируйте нужное состояние в scalar TVar или выполняйте обход массива только в обычном Turn-коде",
+                        path,
+                        f"{container.location}:{line_number}",
+                        line.strip(),
+                    )
+                )
+                reported.add(name)
+    return issues
+
+
+def _enclosing_if_conditions(lines: tuple[str, ...], line_index: int) -> list[str]:
+    result: list[str] = []
+    for index in range(line_index + 1):
+        if _brace_block_end(lines, index) < line_index:
+            continue
+        condition = _first_if_condition(
+            "\n".join(lines[index : min(len(lines), index + 8)])
+        )
+        if condition is not None:
+            result.append(condition)
+    return result
+
+
+def _persistent_array_first_run_gates(project: RsonProject) -> dict[str, set[str]]:
+    """Map arrays initialized only below a negated long-lived scalar gate."""
+
+    arrays = _rscript_array_names(project) & _shared_tvars(project)
+    scalar_tvars = _shared_tvars(project) - arrays
+    assignments: dict[str, list[set[str]]] = {name: [] for name in arrays}
+    assignment = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*newarray\s*\(",
+        re.IGNORECASE,
+    )
+    for container in _iter_code_containers(project):
+        for index, line in enumerate(container.lines):
+            for match in assignment.finditer(_mask_non_code(line)):
+                name = match.group(1).casefold()
+                if name not in assignments:
+                    continue
+                gates: set[str] = set()
+                for condition in _enclosing_if_conditions(container.lines, index):
+                    folded = _mask_non_code(condition)
+                    for gate in scalar_tvars:
+                        wanted = re.escape(gate)
+                        if re.search(
+                            rf"(?:!\s*{wanted}\b|\b{wanted}\s*(?:==|<=)\s*0\b|\b0\s*(?:==|>=)\s*{wanted}\b)",
+                            folded,
+                            re.IGNORECASE,
+                        ):
+                            gates.add(gate)
+                assignments[name].append(gates)
+    return {
+        name: set.intersection(*gate_sets)
+        for name, gate_sets in assignments.items()
+        if gate_sets and all(gate_sets) and set.intersection(*gate_sets)
+    }
+
+
+def _lint_persistent_array_migrations(project: RsonProject) -> list[RuntimeIssue]:
+    gates = _persistent_array_first_run_gates(project)
+    if not gates:
+        return []
+    dialog_objects = _dialog_code_object_ids(project)
+    path = str(project.path) if project.path else None
+    used_in_turn: set[str] = set()
+    for container in _iter_code_containers(project):
+        if container.code_type != "turn" or container.object_id in dialog_objects:
+            continue
+        folded = _mask_non_code("\n".join(container.lines))
+        for name in gates:
+            if re.search(
+                rf"(?:\b(?:{'|'.join(sorted(_RSCRIPT_ARRAY_CALLS))})\s*\(\s*{re.escape(name)}\b|\b{re.escape(name)}\s*\[)",
+                folded,
+                re.IGNORECASE,
+            ):
+                used_in_turn.add(name)
+    grouped: dict[tuple[str, ...], list[str]] = {}
+    for name in sorted(used_in_turn):
+        grouped.setdefault(tuple(sorted(gates[name])), []).append(name)
+    return [
+        RuntimeIssue(
+            "warning",
+            "runtime-new-persistent-array-without-storage-migration",
+            f"Persistent-массивы {', '.join(names)} используются обычным Turn-кодом, но все их newarray находятся под долговечным first-run gate ({', '.join(gate_names)}); старое сохранение может уже пройти этот gate и получить ArrayDim - not array. Добавьте отдельную миграционную границу до первого Array* или сравните старый и новый SCR",
+            path,
+            evidence=f"arrays={','.join(names)}; gates={','.join(gate_names)}",
+        )
+        for gate_names, names in sorted(grouped.items())
+    ]
 
 
 def _persistent_item_parameter_sinks(
@@ -2810,7 +3228,7 @@ def _ship_placement_guards_before(
 
     same_line = _mask_non_code(lines[line_offset][:call_position])
     condition = _first_if_condition(same_line)
-    if condition is not None and "||" not in condition:
+    if condition is not None and "||" not in condition and "&&" not in condition:
         normal |= True in _condition_call_polarity(
             condition, "ShipInNormalSpace", variable
         )
@@ -2820,20 +3238,6 @@ def _ship_placement_guards_before(
         if _condition_uses_positive_flag(condition, guard_flags):
             normal = True
             completed_takeoff = True
-    # RScript boolean expressions short-circuit left to right.  Accept guards
-    # in the same ``&&`` chain only when they occur before ShipStar; a plain
-    # standalone query is not proof and a disjunction is ambiguous.
-    statement_window = "\n".join(
-        (*lines[max(1, line_offset - 6) : line_offset], same_line)
-    )
-    statement_prefix = statement_window.rsplit(";", 1)[-1]
-    if "&&" in statement_prefix and "||" not in statement_prefix:
-        normal |= True in _condition_call_polarity(
-            statement_prefix, "ShipInNormalSpace", variable
-        )
-        completed_takeoff |= False in _condition_call_polarity(
-            statement_prefix, "ShipIsTakeoff", variable
-        )
     if line_offset > 1:
         previous_line = _mask_non_code(lines[line_offset - 1])
         previous_condition = _first_if_condition(previous_line)
@@ -2986,18 +3390,9 @@ def _starships_member_has_mobile_type_guard(
         ):
             return True
 
-    same_line = _mask_non_code(lines[line_offset][:call_position])
-    statement_window = "\n".join(
-        (*lines[max(1, line_offset - 6) : line_offset], same_line)
-    )
-    statement_prefix = statement_window.rsplit(";", 1)[-1]
-    return (
-        "&&" in statement_prefix
-        and "||" not in statement_prefix
-        and _ship_type_condition_proves_mobile(
-            statement_prefix, variable, taken_branch=True
-        )
-    )
+    # A type check in the same boolean expression is not a safety proof:
+    # SRHD's RScript runtime does not reliably short-circuit &&/|| operands.
+    return False
 
 
 def _lint_shipistakeoff_on_starships_member(
@@ -3930,15 +4325,307 @@ def _graph_guarded_turn_entries(
     }
 
 
+def _literal_string(expression: str) -> str | None:
+    value = expression.strip()
+    if len(value) < 2 or value[0] not in {"'", '"'} or value[-1] != value[0]:
+        return None
+    return value[1:-1]
+
+
+def _constant_int(expression: str) -> int | None:
+    value = expression.strip()
+    return int(value) if re.fullmatch(r"[+-]?\d+", value) else None
+
+
+def _dialog_graph_contexts(
+    project: RsonProject,
+) -> tuple[dict[int, set[str]], dict[int, set[int]], dict[str, dict[str, Any]]]:
+    objects = {
+        item["#"]: item
+        for item in project.iter_objects()
+        if isinstance(item.get("#"), int)
+    }
+    outgoing: dict[int, set[int]] = {object_id: set() for object_id in objects}
+    links = project.data.get("Visual.Links", [])
+    if isinstance(links, list):
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            begin, end = link.get("Begin"), link.get("End")
+            if begin in objects and end in objects:
+                outgoing[begin].add(end)
+    for object_id, item in objects.items():
+        parent = item.get("Parent")
+        if parent in objects:
+            outgoing[parent].add(object_id)
+
+    dialogs = {
+        str(item.get("Name", "")).strip().casefold(): item
+        for item in objects.values()
+        if item.get("Type") == "TDialog" and str(item.get("Name", "")).strip()
+    }
+    contexts: dict[int, set[str]] = {object_id: set() for object_id in objects}
+    for folded_name, dialog in dialogs.items():
+        start = dialog.get("#")
+        pending = [start]
+        seen: set[int] = set()
+        while pending:
+            current = pending.pop()
+            if current in seen or current not in objects:
+                continue
+            seen.add(current)
+            contexts[current].add(folded_name)
+            pending.extend(outgoing.get(current, ()))
+    return contexts, outgoing, dialogs
+
+
+def _lint_dialog_semantics(project: RsonProject) -> list[RuntimeIssue]:
+    path = str(project.path) if project.path else None
+    contexts, outgoing, dialogs = _dialog_graph_contexts(project)
+    objects = {
+        item["#"]: item
+        for item in project.iter_objects()
+        if isinstance(item.get("#"), int)
+    }
+    dmsg_numbers = {
+        value
+        for item in objects.values()
+        if item.get("Type") == "TDialogMsg"
+        and (value := _constant_int(str(item.get("DMsg.Num", "")))) is not None
+    }
+    amsg_numbers = {
+        value
+        for item in objects.values()
+        if item.get("Type") == "TDialogAnswer"
+        and (value := _constant_int(str(item.get("AMsg.Num", "")))) is not None
+    }
+    issues: list[RuntimeIssue] = []
+    station_injected: set[str] = set()
+
+    for container in _iter_code_containers(project):
+        text = "\n".join(container.lines)
+        context_id = container.object_id if container.object_id is not None else -1
+        source_dialogs = contexts.get(context_id, set())
+        for call, known_numbers in (("DChange", dmsg_numbers), ("DAdd", amsg_numbers)):
+            for position, arguments, _end in _iter_parsed_calls(text, call):
+                if not arguments or (number := _constant_int(arguments[0])) is None:
+                    continue
+                if number in known_numbers:
+                    continue
+                line_number = text.count("\n", 0, position) + 1
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "dialog-transition-number-missing",
+                        f"{call}({number}) не соответствует ни одному глобальному {'DMsg.Num' if call == 'DChange' else 'AMsg.Num'}; RScript не переписывает эту константу после уплотнения номеров",
+                        path,
+                        f"{container.location}:{line_number}",
+                        container.lines[line_number - 1].strip(),
+                    )
+                )
+
+        for call in ("AddDialogInject", "InjectAnswer"):
+            for position, arguments, _end in _iter_parsed_calls(text, call):
+                if not arguments or (target := _literal_string(arguments[0])) is None:
+                    continue
+                folded_target = target.casefold()
+                line_number = text.count("\n", 0, position) + 1
+                if not folded_target:
+                    # Empty target is the documented callback/attached-code
+                    # form of InjectAnswer, not a missing named TDialog.
+                    continue
+                if folded_target not in dialogs:
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "dialog-inject-target-missing",
+                            f"{call} ссылается на отсутствующий TDialog {target}",
+                            path,
+                            f"{container.location}:{line_number}",
+                            container.lines[line_number - 1].strip(),
+                        )
+                    )
+                    continue
+                target_id = dialogs[folded_target].get("#")
+                if not outgoing.get(target_id, set()):
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "dialog-inject-target-without-handler",
+                            f"Целевой TDialog {target} не имеет достижимого обработчика в Visual.Links/Parent",
+                            path,
+                            f"{container.location}:{line_number}",
+                            container.lines[line_number - 1].strip(),
+                        )
+                    )
+                if call == "InjectAnswer" and folded_target in source_dialogs:
+                    issues.append(
+                        RuntimeIssue(
+                            "info",
+                            "dialog-inject-self-target",
+                            f"InjectAnswer из ветви {target} снова направляет кнопку в тот же TDialog; это допустимо для динамического списка, но третий аргумент является GAnswerData, а не номером другого ответа. Проверьте, что self-target намеренный и handler действительно обрабатывает переданные данные",
+                            path,
+                            f"{container.location}:{line_number}",
+                            container.lines[line_number - 1].strip(),
+                        )
+                    )
+                if call == "AddDialogInject" and container.code_type == "dialogbegin":
+                    folded_text = _mask_non_code(text).casefold()
+                    if any(
+                        marker in folded_text
+                        for marker in (
+                            "getshipplanet(player())",
+                            "storageitems(",
+                            "storageitemlocation(",
+                            "getshipruins(player())",
+                        )
+                    ):
+                        station_injected.add(folded_target)
+
+    if station_injected:
+        for container in _iter_code_containers(project):
+            context_id = container.object_id if container.object_id is not None else -1
+            source_dialogs = contexts.get(context_id, set())
+            if not source_dialogs.intersection(station_injected):
+                continue
+            text = "\n".join(container.lines)
+            for position, arguments, _end in _iter_parsed_calls(text, "DAnswer"):
+                if not arguments:
+                    continue
+                if not re.match(r"\s*['\"]fastexit~", arguments[0], re.IGNORECASE):
+                    continue
+                line_number = text.count("\n", 0, position) + 1
+                issues.append(
+                    RuntimeIssue(
+                        "warning",
+                        "dialog-fastexit-on-station",
+                        "Диалог, регистрируемый для планеты/станции, использует fastexit; в этом контексте команда не закрывает ветку надёжно. Используйте restart",
+                        path,
+                        f"{container.location}:{line_number}",
+                        container.lines[line_number - 1].strip(),
+                    )
+                )
+    return issues
+
+
+def _constant_ether_id(expression: str) -> str | None:
+    literal = _literal_string(expression)
+    if literal is not None:
+        return f"str:{literal.casefold()}"
+    number = _constant_int(expression)
+    return f"int:{number}" if number is not None else None
+
+
+def _lint_ether_semantics(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for block in _runtime_analysis_blocks(project, functions).values():
+        text = block.text
+        events: list[tuple[int, str, list[str]]] = []
+        for call in ("Ether", "EtherDelete"):
+            events.extend(
+                (position, call, arguments)
+                for position, arguments, _end in _iter_parsed_calls(text, call)
+            )
+        shown: set[str] = set()
+        deleted: set[str] = set()
+        reported: set[str] = set()
+        for position, call, arguments in sorted(events):
+            line_number = text.count("\n", 0, position) + block.start_line
+            if call == "Ether" and len(arguments) >= 2:
+                message_type = _constant_int(arguments[0])
+                ether_id = _constant_ether_id(arguments[1])
+                if message_type == 8:
+                    issues.append(
+                        RuntimeIssue(
+                            "info",
+                            "runtime-ether-message-type",
+                            "Ether type 8 — это mp_ShipMinus (значок поломки/гаечный ключ), а не общий сигнал; для общего сообщения обычно используется mp_Galaxy/0",
+                            path,
+                            f"{block.location} line {line_number}",
+                            block.lines[max(0, line_number - block.start_line)].strip(),
+                        )
+                    )
+                if ether_id is not None and ether_id in deleted and ether_id not in reported:
+                    issues.append(
+                        RuntimeIssue(
+                            "warning",
+                            "runtime-ether-id-reuse-after-delete",
+                            "EtherDelete скрывает уведомление, но не освобождает его уникальный ID; повторный Ether с тем же константным ID будет молча проигнорирован. Используйте новый монотонный ID",
+                            path,
+                            f"{block.location} line {line_number}",
+                            block.lines[max(0, line_number - block.start_line)].strip(),
+                        )
+                    )
+                    reported.add(ether_id)
+                if ether_id is not None:
+                    shown.add(ether_id)
+            elif call == "EtherDelete" and arguments:
+                ether_id = _constant_ether_id(arguments[0])
+                if ether_id is not None and ether_id in shown:
+                    deleted.add(ether_id)
+    return issues
+
+
+def _lint_warrior_home_release(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    purchase = re.compile(
+        r"(?:\b(?:int|dword|unknown)\s+)?\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*BuyWarrior\s*\(([^)]*)\)",
+        re.IGNORECASE,
+    )
+    for block in _runtime_analysis_blocks(project, functions).values():
+        bought: dict[str, tuple[str, int]] = {}
+        home_changed: set[str] = set()
+        for offset, line in enumerate(block.lines, start=0):
+            masked = _mask_non_code(line)
+            for match in purchase.finditer(masked):
+                bought[match.group(1).casefold()] = (match.group(2).strip(), offset)
+            for _position, arguments in _call_arguments(masked, "ShipStatistic"):
+                if len(arguments) >= 2 and _constant_int(arguments[1]) == 10:
+                    if (ship := _simple_identifier(arguments[0])) is not None:
+                        home_changed.add(ship)
+            for call in ("ShipOut", "ShipFreeFlight"):
+                for _position, arguments in _call_arguments(masked, call):
+                    if not arguments or (ship := _simple_identifier(arguments[0])) not in bought:
+                        continue
+                    if ship in home_changed:
+                        continue
+                    home, _bought_offset = bought[ship]
+                    issues.append(
+                        RuntimeIssue(
+                            "info",
+                            "runtime-warrior-home-unchanged",
+                            f"Корабль {ship}, созданный BuyWarrior({home}), освобождается через {call} без ShipStatistic({ship}, 10, new_planet); его ванильная FHomePlanet останется исходной. Это допустимо, если поведение намеренно",
+                            path,
+                            f"{block.location} line {block.start_line + offset}",
+                            line.strip(),
+                        )
+                    )
+                    bought.pop(ship, None)
+    return issues
+
+
 def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     path = str(project.path) if project.path else None
     functions, issues = _extract_functions(project)
     issues.extend(_lint_apostrophes_in_line_comments(project))
+    issues.extend(_lint_unregistered_tvar_assignments(project, functions))
     issues.extend(_lint_cross_block_calls(project, functions))
     issues.extend(_lint_unavailable_engine_calls(project, functions))
     issues.extend(_lint_unresolved_user_functions(project, functions))
+    issues.extend(_lint_object_api_behind_boolean_guard(project))
     issues.extend(_lint_duplicate_local_declarations(project))
     issues.extend(_lint_rscript_arrays(project))
+    issues.extend(_lint_dialog_persistent_arrays(project))
+    issues.extend(_lint_persistent_array_migrations(project))
+    issues.extend(_lint_dialog_semantics(project))
     issues.extend(_lint_rndobject_anchor_types(project, functions))
     issues.extend(_lint_id_to_ship_guards(project, functions))
     issues.extend(_lint_suppressed_shipjoin_state(project, functions))
@@ -3958,6 +4645,8 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     issues.extend(_lint_stale_shipgetbad_follow(project, functions))
     issues.extend(_lint_landed_shipout_after_mutation(project, functions, ship_effects))
     issues.extend(_lint_group_shipout_iteration(project, functions, ship_effects))
+    issues.extend(_lint_ether_semantics(project, functions))
+    issues.extend(_lint_warrior_home_release(project, functions))
     graph = _call_graph(functions)
     risky = _risky_functions(functions, graph)
 
@@ -4180,6 +4869,65 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
             )
         )
     return issues
+
+
+def compare_storage_schemas(left: RsonProject, right: RsonProject) -> dict[str, Any]:
+    """Compare persistent-array compatibility between two script revisions."""
+
+    left_arrays = _rscript_array_names(left) & _shared_tvars(left)
+    right_arrays = _rscript_array_names(right) & _shared_tvars(right)
+    added = sorted(right_arrays - left_arrays)
+    removed = sorted(left_arrays - right_arrays)
+    right_gates = _persistent_array_first_run_gates(right)
+    left_symbols = _shared_tvars(left)
+    issues: list[RuntimeIssue] = []
+    for name in added:
+        legacy_gates = sorted(right_gates.get(name, set()) & left_symbols)
+        if not legacy_gates:
+            continue
+        issues.append(
+            RuntimeIssue(
+                "error",
+                "runtime-new-persistent-array-without-storage-migration",
+                f"Новый persistent-массив {name} инициализируется только под legacy gate ({', '.join(legacy_gates)}), уже существовавшим в старой версии; старое сохранение может пропустить newarray. Добавьте отдельную миграционную границу до первого Array* и завершите текущий handler после миграции",
+                str(right.path) if right.path else None,
+                evidence=f"array={name}; legacy_gates={','.join(legacy_gates)}",
+            )
+        )
+    return {
+        "schema": "srhd-modkit-storage-compat-v1",
+        "status": "issues" if issues else "passed",
+        "coverage": "version-aware" if added or removed else "no-schema-change",
+        "added_arrays": added,
+        "removed_arrays": removed,
+        "issues": [issue.as_dict() for issue in issues],
+    }
+
+
+def dialog_semantic_map(project: RsonProject) -> dict[str, Any]:
+    """Return the global dialog address table used by RScript."""
+
+    messages: list[dict[str, Any]] = []
+    answers: list[dict[str, Any]] = []
+    dialogs: list[dict[str, Any]] = []
+    for item in project.iter_objects():
+        common = {
+            "object_id": item.get("#"),
+            "name": str(item.get("Name", "")),
+            "parent": item.get("Parent"),
+        }
+        if item.get("Type") == "TDialogMsg":
+            messages.append({**common, "number": _constant_int(str(item.get("DMsg.Num", "")))})
+        elif item.get("Type") == "TDialogAnswer":
+            answers.append({**common, "number": _constant_int(str(item.get("AMsg.Num", "")))})
+        elif item.get("Type") == "TDialog":
+            dialogs.append(common)
+    key = lambda value: (value.get("object_id") is None, value.get("object_id"), value.get("name", ""))
+    return {
+        "messages": sorted(messages, key=key),
+        "answers": sorted(answers, key=key),
+        "dialogs": sorted(dialogs, key=key),
+    }
 
 
 def _split_call_arguments(text: str, open_paren: int) -> tuple[list[str], int] | None:

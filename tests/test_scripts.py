@@ -94,6 +94,95 @@ class RsonTests(unittest.TestCase):
             {issue.code for issue in RsonProject(data, Path("bad-count.rson")).validate()},
         )
 
+    def test_rscript_410f_rejects_a_fifth_real_tgroup(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0]["Groups"] = [
+            {
+                "Type": "TGroup",
+                "Name": f"Group{index}",
+                "Parent": -1,
+                "#": index + 2,
+            }
+            for index in range(1, 5)
+        ]
+        self.assertNotIn(
+            "rscript-tgroup-hard-limit",
+            {issue.code for issue in RsonProject(data, Path("four-groups.rson")).validate()},
+        )
+        data["Visual.Objects"][0]["Groups"].append(
+            {"Type": "TGroup", "Name": "Fifth", "Parent": -1, "#": 7}
+        )
+        issue = next(
+            issue
+            for issue in RsonProject(data, Path("five-groups.rson")).validate()
+            if issue.code == "rscript-tgroup-hard-limit"
+        )
+        self.assertEqual(issue.severity, "error")
+        self.assertIn("#7 Fifth", issue.message)
+
+    def test_dialog_numbers_are_global_dense_and_unique(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0]["Dialogs"] = [
+            {
+                "Type": "TDialogMsg",
+                "Name": "First",
+                "Parent": -1,
+                "#": 3,
+                "DMsg.Num": "0",
+                "Msg": "",
+            },
+            {
+                "Type": "TDialogMsg",
+                "Name": "Second",
+                "Parent": -1,
+                "#": 4,
+                "DMsg.Num": 0,
+                "Msg": "",
+            },
+            {
+                "Type": "TDialogAnswer",
+                "Name": "Sparse",
+                "Parent": -1,
+                "#": 5,
+                "AMsg.Num": 10,
+                "Msg": "",
+            },
+            {"Type": "TDialog", "Name": "Repeated", "Parent": -1, "#": 6},
+            {"Type": "TDialog", "Name": "Repeated", "Parent": -1, "#": 7},
+        ]
+        issues = RsonProject(data, Path("dialog-numbers.rson")).validate()
+        codes = {issue.code for issue in issues}
+        self.assertIn("dialog-global-number-collision", codes)
+        self.assertIn("dialog-noncanonical-numbering", codes)
+        self.assertIn("dialog-duplicate-name", codes)
+
+    def test_dialog_answer_msg_cannot_contain_rscript_expression(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0]["Dialogs"] = [
+            {
+                "Type": "TDialogAnswer",
+                "Name": "Broken",
+                "Parent": -1,
+                "#": 3,
+                "AMsg.Num": 0,
+                "Msg": "DAnswer('restart~' + CT('Mod.Answer'));",
+            }
+        ]
+        codes = {
+            issue.code
+            for issue in RsonProject(data, Path("dialog-msg-code.rson")).validate()
+        }
+        self.assertIn("dialog-answer-msg-contains-rscript-expression", codes)
+
+        data["Visual.Objects"][0]["Dialogs"][0]["Msg"] = (
+            'DAnswer(CT("Script.TestMod.41"))'
+        )
+        canonical_codes = {
+            issue.code
+            for issue in RsonProject(data, Path("dialog-msg-canonical.rson")).validate()
+        }
+        self.assertNotIn("dialog-answer-msg-contains-rscript-expression", canonical_codes)
+
     def test_set_code_updates_line_count_and_survives_json(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

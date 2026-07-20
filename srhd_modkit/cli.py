@@ -1477,6 +1477,7 @@ def cmd_script_decompile(args: argparse.Namespace) -> int:
         roundtrip_timeout=args.roundtrip_timeout,
         keep_unverified=args.keep_unverified,
         deep_roundtrip=args.deep_roundtrip,
+        fallback_without_lang=args.fallback_without_lang,
     )
     if args.json:
         print_json(result)
@@ -1485,6 +1486,8 @@ def cmd_script_decompile(args: argparse.Namespace) -> int:
         print(f"Объектов: {result['objects']}")
         print("Проверочный цикл SCR -> RSON -> SCR: пройден")
         print(f"SHA-256 RSON: {result['destination_sha256']}")
+        if result.get("lang_import", {}).get("fallback_used"):
+            print("Lang.dat не импортирован: выполнен явно разрешённый fallback без диалогов")
     else:
         print(f"RSON не опубликован: {result['error']['message']}")
         for phase in result["phases"]:
@@ -1505,6 +1508,7 @@ def cmd_script_compare_scr(args: argparse.Namespace) -> int:
         decompile_timeout=args.decompile_timeout,
         roundtrip_timeout=args.roundtrip_timeout,
         deep_roundtrip=args.deep_roundtrip,
+        fallback_without_lang=args.fallback_without_lang,
         max_diff_lines=args.max_diff_lines,
     )
     if args.json:
@@ -1645,7 +1649,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.3")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.4")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -2061,7 +2065,7 @@ def build_parser() -> argparse.ArgumentParser:
     script_build.add_argument(
         "--timeout",
         type=float,
-        help="Общий лимит RScript; по умолчанию 300 с и 60 с без прогресса, 0 отключает оба",
+        help="Общий лимит RScript; по умолчанию от 600 с и 60 с без прогресса с адаптацией для крупных проектов, 0 отключает оба",
     )
     script_build.add_argument("--tools-root")
     script_build.add_argument("--json", action="store_true")
@@ -2085,12 +2089,12 @@ def build_parser() -> argparse.ArgumentParser:
     script_decompile.add_argument(
         "--decompile-timeout",
         type=float,
-        help="Общий лимит восстановления; по умолчанию 300 с и 60 с без прогресса, 0 отключает оба",
+        help="Общий лимит восстановления; по умолчанию от 600 с и 60 с без прогресса с адаптацией для крупных проектов, 0 отключает оба",
     )
     script_decompile.add_argument(
         "--roundtrip-timeout",
         type=float,
-        help="Общий лимит контрольной сборки; по умолчанию 300 с и 60 с без прогресса, 0 отключает оба",
+        help="Общий лимит контрольной сборки; по умолчанию от 600 с и 60 с без прогресса с адаптацией для крупных проектов, 0 отключает оба",
     )
     script_decompile.add_argument(
         "--keep-unverified",
@@ -2100,6 +2104,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--deep-roundtrip",
         action="store_true",
         help="Дополнительно проверить SCR -> RSON -> SCR -> RSON (медленнее)",
+    )
+    script_decompile.add_argument(
+        "--fallback-without-lang",
+        action="store_true",
+        help="Если необязательный импорт Lang.dat завершился ошибкой, явно повторить восстановление без диалогов и честно отметить fallback в JSON",
     )
     script_decompile.add_argument("--overwrite", action="store_true")
     script_decompile.add_argument("--tools-root")
@@ -2114,6 +2123,11 @@ def build_parser() -> argparse.ArgumentParser:
     script_compare.add_argument("right")
     script_compare.add_argument("--left-lang-dat")
     script_compare.add_argument("--right-lang-dat")
+    script_compare.add_argument(
+        "--fallback-without-lang",
+        action="store_true",
+        help="Явно продолжить сравнение без импорта диалогов, если Lang.dat вызвал сбой RScript",
+    )
     script_compare.add_argument("--decompile-timeout", type=float)
     script_compare.add_argument("--roundtrip-timeout", type=float)
     script_compare.add_argument("--deep-roundtrip", action="store_true")

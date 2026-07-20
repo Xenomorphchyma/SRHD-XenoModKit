@@ -5,6 +5,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,7 +20,11 @@ from .formats import inspect_file
 from .image_codec import read_gi, read_png, write_gi, write_png
 from .blockpar import load_blockpar
 from .scripts import inspect_scr, load_rson
-from .runtime_lint import lint_rson_runtime
+from .runtime_lint import (
+    compare_storage_schemas,
+    dialog_semantic_map,
+    lint_rson_runtime,
+)
 from .hidden_process import HiddenControlAction, run_on_hidden_desktop
 from .legacy_manifest import ensure_legacy_codepage_executable
 
@@ -99,6 +104,54 @@ def _rscript_timeout_policy(
         "objects": objects or None,
         "code_lines": code_lines or None,
     }
+
+
+def _rscript_failure_diagnostic(exc: Exception) -> dict[str, Any] | None:
+    """Extract stable machine-readable facts from legacy modal diagnostics."""
+
+    message = str(exc)
+    match = re.search(
+        r"TFileEC\.Open\.\s*FileName=(.+?\.txt)\.",
+        message,
+        re.IGNORECASE,
+    )
+    if match:
+        temp_path = Path(match.group(1)).resolve()
+        exists = temp_path.exists()
+        readable = False
+        detected_encoding = None
+        if temp_path.is_file():
+            try:
+                prefix = temp_path.read_bytes()[:4]
+                readable = True
+                if prefix.startswith(b"\xff\xfe"):
+                    detected_encoding = "utf-16le-bom"
+                elif prefix.startswith(b"\xfe\xff"):
+                    detected_encoding = "utf-16be-bom"
+                elif prefix.startswith(b"\xef\xbb\xbf"):
+                    detected_encoding = "utf-8-bom"
+                else:
+                    detected_encoding = "legacy-ansi-or-unknown"
+            except OSError:
+                readable = False
+        return {
+            "code": "decompile-lang-import-tfileec-open",
+            "message": message,
+            "temp_path": str(temp_path),
+            "exists": exists,
+            "is_file": temp_path.is_file(),
+            "readable": readable,
+            "detected_encoding": detected_encoding,
+            "lock_status": "unknown",
+            "suggested_retry": "Повторите без --lang-dat или явно разрешите --fallback-without-lang",
+        }
+    if any(marker in message.casefold() for marker in ("скрытое окно", "контролы диалога", "окно ошибки")):
+        return {
+            "code": "rscript-modal-error",
+            "message": message,
+            "suggested_retry": "Если сбой возник при импорте Lang.dat, повторите без --lang-dat или явно разрешите --fallback-without-lang",
+        }
+    return None
 
 
 def _project_graph_sha256(project: Any) -> str:
@@ -657,6 +710,7 @@ class Toolchain:
         roundtrip_timeout: float | None = None,
         keep_unverified: str | Path | None = None,
         deep_roundtrip: bool = False,
+        fallback_without_lang: bool = False,
     ) -> dict[str, Any]:
         """Recover RSON and publish it only after a fail-closed round trip."""
 
@@ -724,6 +778,9 @@ class Toolchain:
         exact_binary_match = False
         roundtrip_policy: dict[str, Any] | None = None
         decompile_policy: dict[str, Any] | None = None
+        dialogs_imported = resolved_lang is not None
+        lang_fallback_used = False
+        lang_import_error: dict[str, Any] | None = None
 
         def preserve_unverified() -> str | None:
             if unverified_destination is None or not recovered.is_file():
@@ -742,6 +799,7 @@ class Toolchain:
             reported_summary = dict(summary) if summary is not None else None
             if reported_summary is not None:
                 reported_summary["path"] = kept
+            diagnostic = _rscript_failure_diagnostic(exc)
             return {
                 "schema": "srhd-modkit-decompile-v1",
                 "status": "failed" if operational else "unverified",
@@ -754,11 +812,22 @@ class Toolchain:
                 "source_sha256": sha256_file(source),
                 "source_version": source_info["version"],
                 "lang_dat": str(requested_lang) if requested_lang is not None else None,
-                "dialogs_imported": resolved_lang is not None,
+                "dialogs_imported": dialogs_imported,
                 "lang_dat_skip_reason": lang_dat_skip_reason,
+                "lang_import": {
+                    "status": (
+                        "failed-fallback" if lang_fallback_used else "failed"
+                    ) if requested_lang is not None else "not-requested",
+                    "fallback_used": lang_fallback_used,
+                    "diagnostic": lang_import_error or diagnostic,
+                },
                 "recovered_project": reported_summary,
                 "phases": phases,
-                "error": {"type": type(exc).__name__, "message": str(exc)},
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "diagnostic": diagnostic,
+                },
                 "validation_issues": [item.as_dict() for item in (validation_issues or [])],
                 "runtime_issues": [issue.as_dict() for issue in runtime_issues],
                 "timeouts": {
@@ -800,7 +869,44 @@ class Toolchain:
                         "error": str(exc),
                     }
                 )
-                return failure_result(exc, operational=True)
+                if resolved_lang is None or not fallback_without_lang:
+                    return failure_result(exc, operational=True)
+                lang_import_error = _rscript_failure_diagnostic(exc) or {
+                    "code": "decompile-lang-import-failed",
+                    "message": str(exc),
+                    "suggested_retry": "RSON будет восстановлен без диалогов Lang.dat по явно разрешённому fallback",
+                }
+                dialogs_imported = False
+                lang_fallback_used = True
+                recovered.unlink(missing_ok=True)
+                fallback_started = time.monotonic()
+                try:
+                    process_result, decompile_policy = self._recover_scr_with_rscript(
+                        source,
+                        recovered,
+                        lang_dat=None,
+                        timeout=decompile_timeout,
+                    )
+                    phases.append(
+                        {
+                            "name": "recover-rson-without-lang",
+                            "status": "passed",
+                            "seconds": round(time.monotonic() - fallback_started, 3),
+                            "reason": "explicit-fallback-after-lang-import-failure",
+                            "exit_code": process_result.exit_code,
+                            "queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
+                        }
+                    )
+                except Exception as fallback_exc:
+                    phases.append(
+                        {
+                            "name": "recover-rson-without-lang",
+                            "status": "failed",
+                            "seconds": round(time.monotonic() - fallback_started, 3),
+                            "error": str(fallback_exc),
+                        }
+                    )
+                    return failure_result(fallback_exc, operational=True)
 
             phase_started = time.monotonic()
             try:
@@ -992,8 +1098,17 @@ class Toolchain:
             "destination_sha256": sha256_file(destination),
             "source_version": source_info["version"],
             "lang_dat": str(requested_lang) if requested_lang is not None else None,
-            "dialogs_imported": resolved_lang is not None,
+            "dialogs_imported": dialogs_imported,
             "lang_dat_skip_reason": lang_dat_skip_reason,
+            "lang_import": {
+                "status": (
+                    "failed-fallback"
+                    if lang_fallback_used
+                    else "passed" if dialogs_imported else "skipped" if lang_dat_skip_reason else "not-requested"
+                ),
+                "fallback_used": lang_fallback_used,
+                "diagnostic": lang_import_error,
+            },
             "objects": summary["objects"],
             "recovered_project": summary,
             "verified": True,
@@ -1035,6 +1150,7 @@ class Toolchain:
         decompile_timeout: float | None = None,
         roundtrip_timeout: float | None = None,
         deep_roundtrip: bool = False,
+        fallback_without_lang: bool = False,
         max_diff_lines: int = 200,
     ) -> dict[str, Any]:
         """Compare two SCR projects through verified temporary RSON recovery."""
@@ -1054,6 +1170,7 @@ class Toolchain:
                 decompile_timeout=decompile_timeout,
                 roundtrip_timeout=roundtrip_timeout,
                 deep_roundtrip=deep_roundtrip,
+                fallback_without_lang=fallback_without_lang,
             )
             right_result = self.decompile_scr(
                 right,
@@ -1062,6 +1179,7 @@ class Toolchain:
                 decompile_timeout=decompile_timeout,
                 roundtrip_timeout=roundtrip_timeout,
                 deep_roundtrip=deep_roundtrip,
+                fallback_without_lang=fallback_without_lang,
             )
 
             def side(result: dict[str, Any]) -> dict[str, Any]:
@@ -1074,6 +1192,9 @@ class Toolchain:
                         "operational_failure",
                         "source_sha256",
                         "source_version",
+                        "lang_dat",
+                        "dialogs_imported",
+                        "lang_import",
                         "recovered_project",
                         "roundtrip",
                         "deep_roundtrip",
@@ -1093,9 +1214,19 @@ class Toolchain:
             metadata_match = False
             event_signatures_match: bool | None = None
             runtime_changes = {"added": [], "resolved": [], "unchanged": []}
+            storage_compatibility: dict[str, Any] | None = None
+            dialog_semantics: dict[str, Any] | None = None
             if verified:
                 left_project = load_rson(left_rson)
                 right_project = load_rson(right_rson)
+                storage_compatibility = compare_storage_schemas(left_project, right_project)
+                left_dialogs = dialog_semantic_map(left_project)
+                right_dialogs = dialog_semantic_map(right_project)
+                dialog_semantics = {
+                    "match": left_dialogs == right_dialogs,
+                    "left": left_dialogs,
+                    "right": right_dialogs,
+                }
                 stable_fields = ("file_version", "objects", "links", "code_lines", "types")
                 left_summary = left_project.summary()
                 right_summary = right_project.summary()
@@ -1179,6 +1310,8 @@ class Toolchain:
                     "code_changed": bool(changed_blocks) if verified else None,
                     "changed_blocks": changed_blocks,
                     "runtime_issues": runtime_changes,
+                    "storage_compatibility": storage_compatibility,
+                    "dialog_semantics": dialog_semantics,
                     "temporary_projects_persisted": False,
                 },
             }

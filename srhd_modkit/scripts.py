@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 RSON_FILE_ID = 573785173
 RSON_FILE_VERSION = 8
+RSCRIPT_410F_MAX_TGROUPS = 4
 STATE_EVENTS_RE = re.compile(
     r"^\s*\[([A-Za-z_][A-Za-z0-9_]*(?:,[A-Za-z_][A-Za-z0-9_]*)*)\|((?:-?\d+)?)\](?:\r?\n|$)"
 )
@@ -367,6 +368,106 @@ class RsonProject:
                             )
 
         objects = list(self.iter_objects())
+        tgroups = [
+            item
+            for item in objects
+            if str(item.get("Type", "")).casefold() == "tgroup"
+        ]
+        if len(tgroups) > RSCRIPT_410F_MAX_TGROUPS:
+            labels = ", ".join(
+                f"#{item.get('#')} {str(item.get('Name', '')).strip() or '<без имени>'}"
+                for item in tgroups
+            )
+            issues.append(
+                ScriptIssue(
+                    "error",
+                    "rscript-tgroup-hard-limit",
+                    f"RScript 4.10f поддерживает не более {RSCRIPT_410F_MAX_TGROUPS} объектов TGroup; "
+                    f"найдено {len(tgroups)}: {labels}",
+                    "Visual.Objects",
+                )
+            )
+
+        dialog_number_fields = {
+            "TDialogMsg": "DMsg.Num",
+            "TDialogAnswer": "AMsg.Num",
+        }
+        for object_type, field in dialog_number_fields.items():
+            numbered: list[tuple[int, dict[str, Any]]] = []
+            for item in objects:
+                if item.get("Type") != object_type:
+                    continue
+                raw_number = item.get(field)
+                try:
+                    number = int(raw_number)
+                except (TypeError, ValueError):
+                    issues.append(
+                        ScriptIssue(
+                            "error",
+                            "dialog-number-invalid",
+                            f"{field} должен быть неотрицательным целым числом",
+                            f"object #{item.get('#')} {field}",
+                        )
+                    )
+                    continue
+                if isinstance(raw_number, bool) or number < 0 or str(raw_number).strip() != str(number):
+                    issues.append(
+                        ScriptIssue(
+                            "error",
+                            "dialog-number-invalid",
+                            f"{field} должен быть неотрицательным целым числом",
+                            f"object #{item.get('#')} {field}",
+                        )
+                    )
+                    continue
+                numbered.append((number, item))
+
+            by_number: dict[int, list[dict[str, Any]]] = {}
+            for number, item in numbered:
+                by_number.setdefault(number, []).append(item)
+            for number, owners in sorted(by_number.items()):
+                if len(owners) < 2:
+                    continue
+                identifiers = ", ".join(f"#{item.get('#')}" for item in owners)
+                issues.append(
+                    ScriptIssue(
+                        "error",
+                        "dialog-global-number-collision",
+                        f"{field}={number} повторяется в объектах {identifiers}; номера {field} глобальны для всего SCR, а не для отдельного TDialog",
+                        "Visual.Objects",
+                    )
+                )
+            unique = sorted(by_number)
+            if unique and unique != list(range(len(unique))):
+                issues.append(
+                    ScriptIssue(
+                        "warning",
+                        "dialog-noncanonical-numbering",
+                        f"{field} использует разреженные номера {unique}; RScript 4.10f уплотняет их до 0..{len(unique) - 1}, не переписывая константы DChange/DAdd",
+                        "Visual.Objects",
+                    )
+                )
+
+        dialog_names: dict[str, list[dict[str, Any]]] = {}
+        for item in objects:
+            if item.get("Type") != "TDialog":
+                continue
+            name = str(item.get("Name", "")).strip()
+            if name:
+                dialog_names.setdefault(name.casefold(), []).append(item)
+        for name, owners in sorted(dialog_names.items()):
+            if len(owners) < 2:
+                continue
+            identifiers = ", ".join(f"#{item.get('#')}" for item in owners)
+            issues.append(
+                ScriptIssue(
+                    "error",
+                    "dialog-duplicate-name",
+                    f"Имя TDialog {owners[0].get('Name')} повторяется в объектах {identifiers}; InjectAnswer не сможет однозначно выбрать цель",
+                    "Visual.Objects",
+                )
+            )
+
         identifiers: list[int] = []
         for index, item in enumerate(objects):
             location = f"object[{index}]"
@@ -393,6 +494,37 @@ class RsonProject:
                             "rson-state-events",
                             "Некорректная сигнатура событий в начале OnActCode",
                             location,
+                        )
+                    )
+
+            if item.get("Type") == "TDialogAnswer" and isinstance(item.get("Msg"), str):
+                message = item["Msg"].strip()
+                explicit_code = re.search(
+                    r"\b(?:InjectAnswer|DChange|DAdd)\s*\(",
+                    message,
+                    re.IGNORECASE,
+                )
+                ct_keys = re.findall(
+                    r"\bCT\s*\(\s*['\"]([^'\"]+)['\"]",
+                    message,
+                    re.IGNORECASE,
+                )
+                canonical_key = re.compile(
+                    rf"^Script\.{re.escape(self.name)}\.\d+$",
+                    re.IGNORECASE,
+                )
+                noncanonical_dynamic_answer = bool(
+                    re.search(r"\bDAnswer\s*\(", message, re.IGNORECASE)
+                    and ct_keys
+                    and any(not canonical_key.fullmatch(key) for key in ct_keys)
+                )
+                if explicit_code or noncanonical_dynamic_answer:
+                    issues.append(
+                        ScriptIssue(
+                            "error",
+                            "dialog-answer-msg-contains-rscript-expression",
+                            "TDialogAnswer.Msg не принимает произвольный runtime CT/переход как поле Code: RScript локализует выражение в автоматический Script.<name>.<number>. Для динамического ответа используйте InjectAnswer из code object; канонический DAnswer(CT('Script.<ScriptName>.<number>')) после декомпиляции допустим",
+                            f"object #{item.get('#')} Msg",
                         )
                     )
 
