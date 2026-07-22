@@ -14,7 +14,13 @@ from .formats import format_catalog, get_format_spec, inspect_file, scan_formats
 from .modcfg import parse_modcfg, validate_modcfg
 from .module_info import parse_module_info
 from .validation import validate_collection, validate_mod
-from .toolchain import ConversionItem, Toolchain, is_empty_rscript_lang_dat
+from .toolchain import (
+    ConversionItem,
+    RScriptLangFragment,
+    Toolchain,
+    inspect_rscript_lang_fragment,
+    is_empty_rscript_lang_dat,
+)
 from .blockpar import BlockParDocument, BlockParNode, BlockParParameter, load_blockpar, parse_blockpar
 from .scripts import RsonProject, ScriptIssue, inspect_scr, load_rson
 from .resources import (
@@ -116,6 +122,8 @@ __all__ = [
     "stage_tree",
     "Toolchain",
     "ConversionItem",
+    "RScriptLangFragment",
+    "inspect_rscript_lang_fragment",
     "is_empty_rscript_lang_dat",
     "BlockParDocument",
     "BlockParNode",

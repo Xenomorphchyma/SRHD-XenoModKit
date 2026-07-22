@@ -1644,6 +1644,7 @@ def _lint_fixed_array_contracts(project: RsonProject) -> list[RuntimeIssue]:
     )
     assignment_tail = re.compile(r"^\s*=(?!=)\s*([^;]+)")
     runtime_persistent_fixed: set[str] = set()
+    runtime_allocation_blocks: dict[str, set[str]] = {}
     for block in blocks.values():
         # Code.Type=Init is a shared function library in decompiled projects;
         # its functions run only when called and do not rebuild arrays on each
@@ -1655,7 +1656,35 @@ def _lint_fixed_array_contracts(project: RsonProject) -> list[RuntimeIssue]:
                 name = match.group(1).casefold()
                 if name in shared and name in sizes and int(match.group(2)) == sizes[name]:
                     runtime_persistent_fixed.add(name)
-    reported_terminal: set[str] = set()
+                    runtime_allocation_blocks.setdefault(name, set()).add(
+                        block.name.casefold()
+                    )
+    terminal_candidates: dict[
+        str,
+        list[tuple[FunctionBlock, int, str, bool]],
+    ] = {}
+
+    # Limit the persistence advisory to code that is actually reachable from
+    # the game-clock Turn graph.  A fixed table used only by an Init helper,
+    # dialog, or another self-contained operation has the ordinary and valid
+    # newarray(N) contract 0..N-1 and must not be treated as the confirmed CSL
+    # cross-turn lifecycle failure.
+    dialog_scoped_turns = _dialog_scoped_turn_objects(project)
+    turn_handlers = {
+        name: block
+        for name, block in blocks.items()
+        if name.startswith("__handler_")
+        and block.code_type == "turn"
+        and block.object_id not in dialog_scoped_turns
+    }
+    graph = _call_graph(functions)
+    turn_starts = {
+        call.casefold()
+        for block in turn_handlers.values()
+        for call in _calls(block.body_text)
+        if call.casefold() in functions
+    }
+    periodic_blocks = set(turn_handlers) | _reachable(turn_starts, graph)
 
     for block in blocks.values():
         loops = _loop_ranges_by_line(block.lines, bounds, sizes)
@@ -1732,19 +1761,10 @@ def _lint_fixed_array_contracts(project: RsonProject) -> list[RuntimeIssue]:
                     low, high = index_bounds
                     if (
                         name in runtime_persistent_fixed
-                        and name not in reported_terminal
                         and low <= sizes[name] - 1 <= high
                     ):
-                        reported_terminal.add(name)
-                        issues.append(
-                            RuntimeIssue(
-                                "error",
-                                "runtime-persistent-fixed-array-terminal-slot",
-                                f"Persistent fixed-массив {name} создаётся в runtime-коде и использует последний физический слот {sizes[name] - 1} newarray({sizes[name]}). Подтверждённый чистый запуск SRHD передал это обращение движку как внутренний индекс {sizes[name]} и остановил NextDay; оставьте один запасной terminal-слот",
-                                path,
-                                f"{block.location} line {block.start_line + line_index}",
-                                line.strip(),
-                            )
+                        terminal_candidates.setdefault(name, []).append(
+                            (block, line_index, line, assigned is not None)
                         )
                     if low < 0 or high >= sizes[name]:
                         key = (block.name, line_index, name)
@@ -1800,6 +1820,35 @@ def _lint_fixed_array_contracts(project: RsonProject) -> list[RuntimeIssue]:
                 )
             )
             break
+
+    # newarray(N) normally permits 0..N-1; using N-1 in one self-contained
+    # initializer/consumer is valid and common.  The confirmed CSL failure was
+    # narrower: a shared fixed table was allocated in one periodic Turn
+    # function, retained across turns, and its terminal slot was read from
+    # another function on the same Turn call graph.  Report that cross-scope
+    # lifecycle as an advisory instead of globally outlawing the last valid
+    # index.  Writes alone are not evidence of the failure.
+    for name, candidates in sorted(terminal_candidates.items()):
+        allocation_blocks = runtime_allocation_blocks.get(name, set())
+        cross_scope = [
+            candidate for candidate in candidates
+            if candidate[0].name.casefold() not in allocation_blocks
+            and candidate[0].name.casefold() in periodic_blocks
+            and not candidate[3]
+        ]
+        if not cross_scope or not (allocation_blocks & periodic_blocks):
+            continue
+        block, line_index, line, _assigned = cross_scope[0]
+        issues.append(
+            RuntimeIssue(
+                "warning",
+                "runtime-persistent-fixed-array-terminal-slot",
+                f"Persistent fixed-массив {name} создаётся в одной функции обработчика хода, а последний допустимый слот {sizes[name] - 1} newarray({sizes[name]}) читается из другой функции того же Turn-графа. Сам индекс корректен по обычному контракту 0..N-1; предупреждение относится только к подтверждённому межходовому риску хранения таблицы. Докажите пересоздание до каждого чтения либо используйте отдельные scalar TVar для малого фиксированного набора",
+                path,
+                f"{block.location} line {block.start_line + line_index}",
+                line.strip(),
+            )
+        )
     return issues
 
 

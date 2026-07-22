@@ -254,11 +254,15 @@ if(current_cargo) ItemExist(current_cargo);
   другой миграции или условной ветви не защищает чистый запуск;
 - чтение нетипизированного fixed-слота и доказанный выход за `0..N-1` —
   `runtime-fixed-array-untyped-slot` и `runtime-fixed-array-index-contract`;
-- использование последнего физического слота fixed-массива, который создаётся
-  в runtime и сохраняется между ходами, —
-  `runtime-persistent-fixed-array-terminal-slot`; подтверждённый новый запуск
-  EarthTest передал исходный слот `6` из `newarray(7)` как внутренний индекс
-  `7`, поэтому для persistent-таблицы нужен один запасной terminal-слот;
+- межходовое чтение последнего physical-слота persistent fixed-массива из
+  другой функции реального Turn-графа — предупреждение
+  `runtime-persistent-fixed-array-terminal-slot`. Сам индекс `N-1` корректен и
+  не запрещается: правило не действует на локальную таблицу, диалоговый граф,
+  недостижимую от игрового хода функцию или чтение в той же функции. Узкий
+  шаблон основан на журнале EarthTest: при исходном `newarray(7)` и цикле
+  `1..6` движок сообщил `index=7`. Если таблица гарантированно пересоздаётся до
+  каждого чтения, предупреждение можно обосновать; для малого межходового
+  набора устойчивее отдельные scalar TVar;
 - прямое чтение/запись `[0]` и циклы от `0`/до `>= 0` для доказанного
   динамического массива — `runtime-rscript-array-service-index`;
 - проверки вроде `ArrayDim(queue) > 0` или `<= 0` —
@@ -713,6 +717,44 @@ python srhd.py script validate D:\work\MyScript.rson
 python srhd.py script build D:\work\MyScript.rson `
   --scr D:\work\MyScript.scr --lang D:\work\MyScript.txt
 ```
+
+Третий файл, который RScript 4.10f создаёт при компиляции, не является готовым
+BlockPar `Lang.dat`: это UTF-16LE-фрагмент с BOM и плоскими строками
+`number=value`. При расширении `.txt` параметр `--lang` сохраняет этот
+проверенный сырой фрагмент. Для игрового DAT используйте один из вариантов:
+
+```powershell
+# Только проверенный игровой DAT; сырой фрагмент останется во временном staging.
+python srhd.py script build D:\work\MyScript.rson `
+  --scr D:\work\MyScript.scr --lang D:\work\Lang.dat
+
+# Одновременно диагностический фрагмент и игровой DAT.
+python srhd.py script build D:\work\MyScript.rson `
+  --scr D:\work\MyScript.scr --lang D:\work\MyScript.lang.txt `
+  --lang-dat D:\work\Lang.dat
+```
+
+ModKit классифицирует фрагмент как `complete`, `empty`, `incomplete` или
+`invalid`. Полный и действительно пустой результат оборачивается в узлы
+`Script/<ScriptName>`, собирается BlockParEditor и читается обратно. Код
+возврата RScript `0` сам по себе успехом языка не считается. `�`, управляющий
+текст или символы вне CP1251 останавливают всю публикацию и перечисляются по
+числовым ключам.
+
+После декомпиляции без импорта диалогов RScript обычно возвращает CT/code-
+заглушки. Такой `incomplete`-фрагмент можно сохранить как TXT для диагностики,
+но нельзя превратить в игровой DAT без проверенной базы:
+
+```powershell
+python srhd.py script build D:\work\Recovered.rson `
+  --scr D:\work\Recovered.scr --lang D:\work\Recovered.lang.txt `
+  --lang-dat D:\work\Lang.dat --lang-base D:\work\KnownGood\Lang.dat
+```
+
+База декодируется как BlockPar, должна содержать `Script/<ScriptName>` и все
+используемые числовые ключи. Для неполного проекта она сохраняется побайтно —
+ModKit не подменяет отсутствующий текст заглушками. SCR и языковые выходы не
+публикуются, пока все запрошенные проверки не завершены.
 
 `script build --timeout 0` отключает оба дедлайна компилятора. Без параметра
 малый проект получает 60-секундное скользящее окно без прогресса и общий предел

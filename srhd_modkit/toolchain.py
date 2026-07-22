@@ -18,7 +18,13 @@ from typing import Any, Iterable
 from .files import sha256_file
 from .formats import inspect_file
 from .image_codec import read_gi, read_png, write_gi, write_png
-from .blockpar import load_blockpar
+from .blockpar import (
+    BlockParDocument,
+    BlockParNode,
+    BlockParParameter,
+    load_blockpar,
+    parse_blockpar,
+)
 from .scripts import inspect_scr, load_rson
 from .runtime_lint import (
     compare_storage_schemas,
@@ -227,6 +233,165 @@ def _replace_cross_device_safe(staged: Path, destination: Path) -> None:
         staged.unlink()
     finally:
         local_stage.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class RScriptLangFragment:
+    """Validated UTF-16 dialog fragment emitted by RScript 4.10f.
+
+    The compiler output is a flat ``number=value`` fragment, not a complete
+    BlockPar document and therefore not a game-ready ``Lang.dat`` by itself.
+    ``incomplete`` means that RScript exported CT/code placeholders recovered
+    without dialog text rather than actual localized strings. ``invalid``
+    identifies replacement characters, controls, or text outside the game's
+    CP1251 language contract.
+    """
+
+    path: str
+    status: str
+    entries: tuple[tuple[str, str], ...]
+    placeholder_keys: tuple[str, ...] = ()
+    empty_keys: tuple[str, ...] = ()
+    invalid_text_keys: tuple[str, ...] = ()
+    referenced_ct_keys: tuple[str, ...] = ()
+
+    @property
+    def usable_for_game_language(self) -> bool:
+        return self.status in {"complete", "empty"}
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "srhd-modkit-rscript-lang-fragment-v1",
+            "path": self.path,
+            "format": "rscript-dialog-fragment",
+            "encoding": "utf-16-le-bom",
+            "status": self.status,
+            "entries": len(self.entries),
+            "keys": [key for key, _value in self.entries],
+            "placeholder_keys": list(self.placeholder_keys),
+            "empty_keys": list(self.empty_keys),
+            "invalid_text_keys": list(self.invalid_text_keys),
+            "referenced_ct_keys": list(self.referenced_ct_keys),
+            "usable_for_game_language": self.usable_for_game_language,
+            "game_dat_ready": False,
+        }
+
+
+_RSCRIPT_LANG_PLACEHOLDER_RE = re.compile(
+    r"(?:"
+    r"Script\.[A-Za-z0-9_.-]+\.\d+"
+    r"|CT\s*\(.*\)\s*;?"
+    r"|(?:DAnswer|DText)\s*\(\s*CT\s*\(.*\)\s*\)\s*;?"
+    r")",
+    re.IGNORECASE,
+)
+_SCRIPT_CT_KEY_RE = re.compile(r"Script\.([A-Za-z0-9_.-]+)\.(\d+)", re.IGNORECASE)
+
+
+def inspect_rscript_lang_fragment(path: str | Path) -> RScriptLangFragment:
+    """Parse and classify the flat language fragment produced by RScript."""
+
+    source = Path(path).resolve()
+    raw = source.read_bytes()
+    if not raw.startswith(EMPTY_RSCRIPT_LANG_DAT):
+        raise ValueError("Языковой вывод RScript не имеет обязательного UTF-16LE BOM FF FE")
+    if len(raw) % 2:
+        raise ValueError("Языковой вывод RScript имеет нечётную длину UTF-16LE")
+    try:
+        text = raw[len(EMPTY_RSCRIPT_LANG_DAT) :].decode("utf-16-le")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Языковой вывод RScript повреждён как UTF-16LE") from exc
+
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    placeholders: list[str] = []
+    empty: list[str] = []
+    invalid_text: list[str] = []
+    referenced: set[str] = set()
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not line:
+            continue
+        if "=" not in line:
+            raise ValueError(f"Некорректная строка языкового фрагмента RScript #{number}: нет '='")
+        key, value = line.split("=", 1)
+        if not re.fullmatch(r"\d+", key):
+            raise ValueError(
+                f"Некорректный ключ языкового фрагмента RScript в строке {number}: {key!r}"
+            )
+        if key in seen:
+            raise ValueError(f"Дублирующийся ключ языкового фрагмента RScript: {key}")
+        seen.add(key)
+        entries.append((key, value))
+        stripped = value.strip()
+        if not stripped:
+            empty.append(key)
+        try:
+            value.encode("cp1251", errors="strict")
+        except UnicodeEncodeError:
+            invalid_text.append(key)
+        else:
+            if "\ufffd" in value or any(
+                ord(character) < 0x20 and character not in {"\t"}
+                for character in value
+            ):
+                invalid_text.append(key)
+        if _RSCRIPT_LANG_PLACEHOLDER_RE.fullmatch(stripped):
+            placeholders.append(key)
+        for match in _SCRIPT_CT_KEY_RE.finditer(value):
+            referenced.add(f"Script.{match.group(1)}.{match.group(2)}")
+
+    status = (
+        "empty"
+        if not entries
+        else "invalid"
+        if invalid_text
+        else "incomplete"
+        if placeholders or empty
+        else "complete"
+    )
+    return RScriptLangFragment(
+        str(source),
+        status,
+        tuple(entries),
+        tuple(placeholders),
+        tuple(empty),
+        tuple(invalid_text),
+        tuple(sorted(referenced, key=str.casefold)),
+    )
+
+
+def _reject_invalid_rscript_lang_fragment(fragment: RScriptLangFragment) -> None:
+    if fragment.status != "invalid":
+        return
+    preview = ", ".join(fragment.invalid_text_keys[:12])
+    suffix = "…" if len(fragment.invalid_text_keys) > 12 else ""
+    raise ValueError(
+        "Языковой вывод RScript содержит повреждённый или не совместимый с "
+        f"CP1251 текст в ключах {preview}{suffix}"
+    )
+
+
+def _iter_string_values(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_string_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_string_values(child)
+
+
+def _project_script_language_keys(project: Any, script_name: str) -> set[str]:
+    """Return numeric Script.<name> CT keys referenced anywhere in RSON."""
+
+    result: set[str] = set()
+    target = script_name.casefold()
+    for value in _iter_string_values(project.data):
+        for match in _SCRIPT_CT_KEY_RE.finditer(value):
+            if match.group(1).casefold() == target:
+                result.add(match.group(2))
+    return result
 
 
 @dataclass(frozen=True)
@@ -565,14 +730,185 @@ class Toolchain:
             )
             if not staged_scr.is_file():
                 raise RuntimeError(f"RScript CLI не создал SCR (код {process_result.exit_code})")
-            if not staged_lang.exists():
-                staged_lang.write_text("", encoding="utf-8")
+            if not staged_lang.is_file():
+                raise RuntimeError(
+                    f"RScript CLI не создал языковой фрагмент (код {process_result.exit_code})"
+                )
+            lang_fragment = inspect_rscript_lang_fragment(staged_lang)
+            _reject_invalid_rscript_lang_fragment(lang_fragment)
             scr_info = inspect_scr(staged_scr)
             if not scr_info["supported_version"]:
                 raise RuntimeError(f"RScript создал SCR неподдерживаемой версии {scr_info['version']}")
+            scr_info["lang_fragment"] = lang_fragment.as_dict()
             _replace_cross_device_safe(staged_scr, scr_output)
             _replace_cross_device_safe(staged_lang, lang_output)
         return process_result, scr_info, timeout_policy
+
+    def _load_script_lang_base(
+        self,
+        source: Path,
+        workspace: Path,
+    ) -> tuple[BlockParDocument, Path]:
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        if source.suffix.casefold() == ".txt":
+            return load_blockpar(source), source
+        if source.suffix.casefold() != ".dat":
+            raise ValueError("Базовый язык должен быть BlockPar TXT или Lang.dat")
+        decoded = workspace / "lang-base.decoded.txt"
+        self.convert_dat(source, decoded)
+        return load_blockpar(decoded), decoded
+
+    @staticmethod
+    def _script_lang_node(document: BlockParDocument, script_name: str) -> BlockParNode:
+        try:
+            return document.find_node(f"Script/{script_name}")
+        except KeyError as exc:
+            raise ValueError(
+                f"Базовый язык не содержит узел Script/{script_name}"
+            ) from exc
+
+    def _prepare_script_lang_dat(
+        self,
+        project: Any,
+        fragment: RScriptLangFragment,
+        destination: Path,
+        workspace: Path,
+        *,
+        base: Path | None,
+    ) -> dict[str, Any]:
+        """Create or preserve a verified game Lang.dat in staging."""
+
+        script_name = str(project.summary().get("name", "")).strip()
+        if not script_name or re.search(r"[\\/\r\n{}]", script_name):
+            raise ValueError(f"Некорректное имя скрипта для Lang.dat: {script_name!r}")
+
+        base_document: BlockParDocument | None = None
+        base_source: Path | None = None
+        if base is not None:
+            base_document, base_source = self._load_script_lang_base(base, workspace)
+
+        if fragment.status == "invalid":
+            preview = ", ".join(fragment.invalid_text_keys[:12])
+            suffix = "…" if len(fragment.invalid_text_keys) > 12 else ""
+            raise ValueError(
+                "RScript создал языковой фрагмент с повреждённым или не совместимым "
+                f"с CP1251 текстом в ключах {preview}{suffix}; игровой Lang.dat не создан"
+            )
+
+        if fragment.status == "incomplete":
+            if base_document is None or base is None:
+                raise ValueError(
+                    "RScript создал неполный языковой фрагмент с CT/code-заглушками. "
+                    "Для игрового Lang.dat передайте --lang-base с проверенным прежним "
+                    "Lang.dat/TXT либо сначала восстановите RSON с импортом диалогов"
+                )
+            node = self._script_lang_node(base_document, script_name)
+            available = {parameter.key for parameter in node.parameters}
+            required = _project_script_language_keys(project, script_name)
+            missing = sorted(required - available, key=lambda value: int(value))
+            if missing:
+                preview = ", ".join(missing[:12])
+                suffix = "…" if len(missing) > 12 else ""
+                raise ValueError(
+                    f"Базовый Lang.dat не покрывает Script/{script_name}: "
+                    f"отсутствуют ключи {preview}{suffix}"
+                )
+            if base.suffix.casefold() == ".dat":
+                shutil.copy2(base, destination)
+            else:
+                self.convert_dat(base_source, destination)
+            return {
+                "status": "verified",
+                "mode": "preserved-base",
+                "script_node": f"Script/{script_name}",
+                "entries": len(node.parameters),
+                "required_keys": len(required),
+                "base": str(base),
+                "base_sha256": sha256_file(base),
+                "reason": "rson-dialog-text-not-imported",
+            }
+
+        if fragment.status == "empty":
+            if base_document is not None and base is not None:
+                # A no-dialog rebuild must not erase unrelated language data.
+                if base.suffix.casefold() == ".dat":
+                    shutil.copy2(base, destination)
+                else:
+                    self.convert_dat(base_source, destination)
+                return {
+                    "status": "verified",
+                    "mode": "preserved-base",
+                    "script_node": f"Script/{script_name}",
+                    "entries": 0,
+                    "required_keys": 0,
+                    "base": str(base),
+                    "base_sha256": sha256_file(base),
+                    "reason": "rscript-empty-dialog-fragment",
+                }
+
+        required = _project_script_language_keys(project, script_name)
+        fragment_keys = {key for key, _value in fragment.entries}
+        missing_fragment = sorted(required - fragment_keys, key=lambda value: int(value))
+        if missing_fragment:
+            preview = ", ".join(missing_fragment[:12])
+            suffix = "…" if len(missing_fragment) > 12 else ""
+            raise ValueError(
+                f"Языковой фрагмент RScript не покрывает Script/{script_name}: "
+                f"отсутствуют ключи {preview}{suffix}. Используйте импорт диалогов "
+                "или проверенный --lang-base"
+            )
+
+        if base_document is None:
+            base_document = parse_blockpar(
+                f"Script ^{{\r\n    {script_name} ~{{\r\n    }}\r\n}}\r\n",
+                encoding="cp1251",
+            )
+            node = base_document.find_node(f"Script/{script_name}")
+            mode = "generated-empty" if fragment.status == "empty" else "generated"
+        else:
+            try:
+                node = base_document.find_node(f"Script/{script_name}")
+            except KeyError:
+                try:
+                    base_document.find_node("Script")
+                except KeyError:
+                    base_document.ensure_node("Script", operator="^")
+                node = base_document.add_node("Script", script_name, operator="~")
+            mode = "merged-base"
+
+        node.entries = [
+            entry
+            for entry in node.entries
+            if not isinstance(entry, BlockParParameter) or not entry.key.isdecimal()
+        ]
+        indent = node.indent + "    "
+        node.entries.extend(
+            BlockParParameter(key=key, value=value, indent=indent, modified=True)
+            for key, value in fragment.entries
+        )
+        blockpar_source = workspace / "lang.generated.txt"
+        base_document.save(
+            blockpar_source,
+            encoding="cp1251",
+            include_raw=False,
+            bom=False,
+        )
+        self.convert_dat(blockpar_source, destination, verify=True)
+        return {
+            "status": "verified",
+            "mode": mode,
+            "script_node": f"Script/{script_name}",
+            "entries": len(fragment.entries),
+            "required_keys": len(required),
+            "base": str(base) if base is not None else None,
+            "base_sha256": sha256_file(base) if base is not None else None,
+            "reason": (
+                "script-has-no-exported-dialog-text"
+                if fragment.status == "empty"
+                else "complete-rscript-dialog-fragment"
+            ),
+        }
 
     def compile_rson(
         self,
@@ -580,12 +916,27 @@ class Toolchain:
         scr_output: str | Path,
         lang_output: str | Path,
         *,
+        lang_dat_output: str | Path | None = None,
+        lang_base: str | Path | None = None,
         overwrite: bool = False,
         timeout: float | None = None,
     ) -> dict[str, Any]:
         source = Path(source).resolve()
         scr_output = Path(scr_output).resolve()
-        lang_output = Path(lang_output).resolve()
+        requested_lang_output = Path(lang_output).resolve()
+        requested_lang_dat = Path(lang_dat_output).resolve() if lang_dat_output is not None else None
+        lang_base_path = Path(lang_base).resolve() if lang_base is not None else None
+        if requested_lang_output.suffix.casefold() == ".dat":
+            if requested_lang_dat is not None and requested_lang_dat != requested_lang_output:
+                raise ValueError("Нельзя задать два разных игровых Lang.dat через --lang и --lang-dat")
+            requested_lang_dat = requested_lang_output
+            fragment_output: Path | None = None
+        else:
+            fragment_output = requested_lang_output
+        if requested_lang_dat is not None and requested_lang_dat.suffix.casefold() != ".dat":
+            raise ValueError("Игровой языковой результат --lang-dat должен иметь расширение .dat")
+        if lang_base_path is not None and requested_lang_dat is None:
+            raise ValueError("--lang-base используется только вместе с игровым --lang-dat")
         if source.suffix.casefold() != ".rson":
             raise ValueError("Компилятор принимает проект .rson")
         project = load_rson(source)
@@ -600,22 +951,92 @@ class Toolchain:
                 "RSON не прошёл runtime-lint: "
                 + "; ".join(f"{issue.code}: {issue.message}" for issue in runtime_errors[:5])
             )
-        existing = [path for path in (scr_output, lang_output) if path.exists()]
+        destinations = [scr_output]
+        if fragment_output is not None:
+            destinations.append(fragment_output)
+        if requested_lang_dat is not None:
+            destinations.append(requested_lang_dat)
+        folded_destinations = [str(path).casefold() for path in destinations]
+        if len(set(folded_destinations)) != len(folded_destinations):
+            raise ValueError("SCR, языковой фрагмент и Lang.dat должны иметь разные пути")
+        existing = [path for path in destinations if path.exists()]
         if existing and not overwrite:
             raise FileExistsError(f"Результат уже существует: {existing[0]}")
-        process_result, _scr_info, timeout_policy = self._compile_rson_with_rscript(
-            source,
-            scr_output,
-            lang_output,
-            timeout=timeout,
-        )
+        scr_output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".srhd-script-build-",
+            dir=scr_output.parent,
+        ) as temp_name:
+            transaction = Path(temp_name)
+            staged_scr = transaction / "compiled.scr"
+            staged_fragment = transaction / "compiled.lang.txt"
+            process_result, _scr_info, timeout_policy = self._compile_rson_with_rscript(
+                source,
+                staged_scr,
+                staged_fragment,
+                timeout=timeout,
+            )
+            fragment = inspect_rscript_lang_fragment(staged_fragment)
+            _reject_invalid_rscript_lang_fragment(fragment)
+            fragment_sha256 = sha256_file(staged_fragment)
+            game_lang: dict[str, Any] | None = None
+            staged_lang_dat: Path | None = None
+            if requested_lang_dat is not None:
+                staged_lang_dat = transaction / "compiled.lang.dat"
+                game_lang = self._prepare_script_lang_dat(
+                    project,
+                    fragment,
+                    staged_lang_dat,
+                    transaction,
+                    base=lang_base_path,
+                )
+
+            # Nothing reaches caller-visible paths until every requested
+            # language artifact has been parsed and, for DAT, round-tripped.
+            _replace_cross_device_safe(staged_scr, scr_output)
+            if fragment_output is not None:
+                fragment_output.parent.mkdir(parents=True, exist_ok=True)
+                _replace_cross_device_safe(staged_fragment, fragment_output)
+            if requested_lang_dat is not None and staged_lang_dat is not None:
+                requested_lang_dat.parent.mkdir(parents=True, exist_ok=True)
+                _replace_cross_device_safe(staged_lang_dat, requested_lang_dat)
+
+        fragment_result = fragment.as_dict()
+        fragment_result["path"] = str(fragment_output) if fragment_output is not None else None
+        fragment_result["sha256"] = fragment_sha256
+        if game_lang is not None and requested_lang_dat is not None:
+            game_lang["path"] = str(requested_lang_dat)
+            game_lang["sha256"] = sha256_file(requested_lang_dat)
+            game_lang["size"] = requested_lang_dat.stat().st_size
+        legacy_lang = fragment_output or requested_lang_dat
+        assert legacy_lang is not None
+        language_warnings: list[dict[str, Any]] = []
+        if fragment.status == "incomplete":
+            language_warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "rscript-lang-fragment-incomplete",
+                    "message": (
+                        "RSON не содержит импортированный текст части диалогов: RScript "
+                        "вывел CT/code-заглушки. SCR собран, но языковой фрагмент нельзя "
+                        "превращать в игровой Lang.dat без проверенной базы"
+                    ),
+                    "placeholder_keys": list(fragment.placeholder_keys),
+                    "empty_keys": list(fragment.empty_keys),
+                }
+            )
         return {
             "source": str(source),
             "scr": str(scr_output),
-            "lang": str(lang_output),
+            "lang": str(legacy_lang),
             "scr_size": scr_output.stat().st_size,
             "scr_sha256": sha256_file(scr_output),
-            "lang_sha256": sha256_file(lang_output),
+            "lang_sha256": sha256_file(legacy_lang),
+            "language": {
+                "fragment": fragment_result,
+                "game_dat": game_lang,
+                "warnings": language_warnings,
+            },
             "compiler_exit_code": process_result.exit_code,
             "compiler_was_waiting_after_output": process_result.forced_after_outputs,
             "compiler_seconds": round(process_result.elapsed_seconds, 3),

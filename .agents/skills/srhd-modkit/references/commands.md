@@ -39,6 +39,8 @@ python -B srhd.py script set-code "<WORK>/Script.rson" "<OUT>/Script.rson" --id 
 python -B srhd.py script set-code "<WORK>/Script.rson" "<OUT>/Script.rson" --id 17 --field OnActCode --code-file "<WORK>/player-buy.txt"
 python -B srhd.py script set-events "<WORK>/Script.rson" "<OUT>/Script.rson" --id 17 --event t_OnEnteringForm
 python -B srhd.py script build "<OUT>/Script.rson" --scr "<OUT>/Script.scr" --lang "<OUT>/Lang.txt"
+python -B srhd.py script build "<OUT>/Script.rson" --scr "<OUT>/Script.scr" --lang "<OUT>/Lang.dat"
+python -B srhd.py script build "<OUT>/Recovered.rson" --scr "<OUT>/Recovered.scr" --lang "<OUT>/Recovered.lang.txt" --lang-dat "<OUT>/Lang.dat" --lang-base "<WORK>/KnownGood/Lang.dat"
 python -B srhd.py script decompile "<WORK>/Script.scr" "<OUT>/Script.rson" --lang-dat "<WORK>/Lang.dat" --json
 python -B srhd.py script decompile "<WORK>/Script.scr" "<OUT>/Script.rson" --lang-dat "<WORK>/Lang.dat" --fallback-without-lang --json
 python -B srhd.py script decompile "<WORK>/Script.scr" "<OUT>/Script.rson" --deep-roundtrip --json
@@ -50,6 +52,14 @@ python -B srhd.py script inspect-scr "<OUT>/Script.scr" --json
 Также доступны `set-field`, `clone-object`, `add-link`, `delete-link`, `delete-object`, `register` и `convert`. Перед точечным изменением смотреть `python -B srhd.py script <command> --help`.
 
 Небольшой проект RScript использует 60-секундное окно без подтверждённого прогресса и общий предел от 600 секунд; крупный получает адаптивно больше времени по размеру, объектам и строкам кода. Положительный параметр timeout задаёт явный общий предел; ноль у `build --timeout`, обоих таймаутов `decompile` и одноимённых параметров `compare-scr` отключает оба ограничения. Непроверенный RSON сохранять только отдельным явным `--keep-unverified`; штатный output остаётся fail-closed.
+
+`script build --lang *.txt` сохраняет проверенный сырой UTF-16LE-фрагмент
+RScript `number=value`. Путь `--lang *.dat` либо отдельный `--lang-dat` означает
+игровой BlockPar DAT: полный/пустой фрагмент оборачивается и проверяется,
+`incomplete` после декомпиляции без диалогов требует `--lang-base`. База должна
+содержать `Script/<ScriptName>` и все используемые ключи; в этом режиме она
+сохраняется побайтно. `invalid` с `�`, control или не-CP1251 текстом блокирует
+SCR и язык даже при exit code RScript 0.
 
 `--fallback-without-lang` использовать только осознанно после диагностики ошибки
 импорта: RSON будет проверен round-trip, но текст диалогов из Lang.dat потерян,
@@ -83,6 +93,12 @@ intent-sensitive и блокируют только при `--strict`/`--warning
 Результаты `GalaxyStar` и `StarRuins` требуют отдельного null-guard перед
 `Star*`, `Ship*`, `Id` и `RelationToRanger`; повторный `ShipTypeN` после
 типизированного `StarRuins(star, 'TYPE')` не нужен.
+
+Для fixed `newarray(N)` допустимы индексы `0..N-1`; запасной слот не является
+общим требованием. Ошибки выдаются только при доказанном выходе за границу или
+нетипизированном чтении. `runtime-persistent-fixed-array-terminal-slot` — узкое
+предупреждение для чтения `N-1` из другой функции реального межходового
+Turn-графа; оно не блокирует обычный workflow без `--strict`.
 `Dist` также разыменовывает звёзды. Отдельный guard может быть доказан через
 безопасный пользовательский predicate; `!object || object == other` допустим,
 поскольку второй операнд только сравнивает handles. Отчёт показывает первое

@@ -11,11 +11,13 @@ from unittest.mock import patch
 
 from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, load_rson
 from srhd_modkit.scripts import inspect_scr
+from srhd_modkit.blockpar import parse_blockpar
 from srhd_modkit.toolchain import (
     Toolchain,
     _decompiled_runtime_issue,
     _rscript_failure_diagnostic,
     _rscript_timeout_policy,
+    inspect_rscript_lang_fragment,
 )
 from srhd_modkit.runtime_lint import RuntimeIssue
 
@@ -264,6 +266,283 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertTrue(result["lang_import"]["fallback_used"])
             self.assertEqual(result["lang_import"]["status"], "failed-fallback")
             self.assertEqual(recover_calls, [lang.resolve(), None])
+
+    def test_rscript_lang_fragment_is_classified_without_treating_it_as_dat(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            complete = root / "complete.txt"
+            incomplete = root / "incomplete.txt"
+            empty = root / "empty.txt"
+            invalid = root / "invalid.txt"
+            duplicate = root / "duplicate.txt"
+            complete.write_bytes("0=Готово\r\n1=Назад\r\n".encode("utf-16"))
+            incomplete.write_bytes(
+                '0=Script.Workflow.4\r\n1=DAnswer(CT("Script.Workflow.5"));\r\n'.encode(
+                    "utf-16"
+                )
+            )
+            empty.write_bytes(b"\xff\xfe")
+            invalid.write_bytes("0=Повреждён�\r\n".encode("utf-16"))
+            duplicate.write_bytes("0=Один\r\n0=Два\r\n".encode("utf-16"))
+
+            self.assertEqual(inspect_rscript_lang_fragment(complete).status, "complete")
+            value = inspect_rscript_lang_fragment(incomplete)
+            self.assertEqual(value.status, "incomplete")
+            self.assertEqual(value.placeholder_keys, ("0", "1"))
+            self.assertEqual(
+                value.referenced_ct_keys,
+                ("Script.Workflow.4", "Script.Workflow.5"),
+            )
+            self.assertEqual(inspect_rscript_lang_fragment(empty).status, "empty")
+            invalid_value = inspect_rscript_lang_fragment(invalid)
+            self.assertEqual(invalid_value.status, "invalid")
+            self.assertEqual(invalid_value.invalid_text_keys, ("0",))
+            with self.assertRaisesRegex(ValueError, "Дублирующийся ключ"):
+                inspect_rscript_lang_fragment(duplicate)
+
+    def test_compile_does_not_publish_incomplete_fragment_as_lang_dat(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "workflow.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+            scr = root / "workflow.scr"
+            lang_dat = root / "Lang.dat"
+            chain = Toolchain()
+
+            def fake_compile(_source, scr_output, lang_output, **_kwargs):
+                scr_output.parent.mkdir(parents=True, exist_ok=True)
+                scr_output.write_bytes((8).to_bytes(4, "little") + b"compiled")
+                lang_output.write_bytes('0=Script.Workflow.0\r\n'.encode("utf-16"))
+                process = SimpleNamespace(
+                    exit_code=0,
+                    forced_after_outputs=False,
+                    elapsed_seconds=0.01,
+                    queue_seconds=0.0,
+                    progress_updates=1,
+                    last_progress_seconds=0.01,
+                )
+                return process, inspect_scr(scr_output), {"mode": "test"}
+
+            with patch.object(chain, "_compile_rson_with_rscript", side_effect=fake_compile):
+                with self.assertRaisesRegex(ValueError, "неполный языковой фрагмент"):
+                    chain.compile_rson(source, scr, lang_dat)
+
+            self.assertFalse(scr.exists())
+            self.assertFalse(lang_dat.exists())
+
+    def test_compile_rejects_invalid_cp1251_language_text_before_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "workflow.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+            scr = root / "workflow.scr"
+            fragment = root / "workflow.lang.txt"
+            chain = Toolchain()
+
+            def fake_compile(_source, scr_output, lang_output, **_kwargs):
+                scr_output.parent.mkdir(parents=True, exist_ok=True)
+                scr_output.write_bytes((8).to_bytes(4, "little") + b"compiled")
+                lang_output.write_bytes("0=Повреждён�\r\n".encode("utf-16"))
+                process = SimpleNamespace(
+                    exit_code=0,
+                    forced_after_outputs=False,
+                    elapsed_seconds=0.01,
+                    queue_seconds=0.0,
+                    progress_updates=1,
+                    last_progress_seconds=0.01,
+                )
+                return process, inspect_scr(scr_output), {"mode": "test"}
+
+            with patch.object(chain, "_compile_rson_with_rscript", side_effect=fake_compile):
+                with self.assertRaisesRegex(ValueError, "не совместимый с CP1251"):
+                    chain.compile_rson(source, scr, fragment)
+
+            self.assertFalse(scr.exists())
+            self.assertFalse(fragment.exists())
+
+    def test_compile_can_preserve_verified_lang_base_for_incomplete_rson(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            data = deepcopy(PROJECT)
+            data["Visual.Objects"][0]["Operations"][0]["Code"] = [
+                'result = CT("Script.Workflow.0");'
+            ]
+            source = root / "workflow.rson"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            scr = root / "workflow.scr"
+            lang_dat = root / "Lang.dat"
+            base = root / "base.dat"
+            base.write_bytes(b"verified-base-dat")
+            base_document = parse_blockpar(
+                "Script ^{\n    Workflow ~{\n        0=Сохранённый текст\n    }\n}\n",
+                encoding="cp1251",
+            )
+            chain = Toolchain()
+
+            def fake_compile(_source, scr_output, lang_output, **_kwargs):
+                scr_output.parent.mkdir(parents=True, exist_ok=True)
+                scr_output.write_bytes((8).to_bytes(4, "little") + b"compiled")
+                lang_output.write_bytes('0=Script.Workflow.0\r\n'.encode("utf-16"))
+                process = SimpleNamespace(
+                    exit_code=0,
+                    forced_after_outputs=False,
+                    elapsed_seconds=0.01,
+                    queue_seconds=0.0,
+                    progress_updates=1,
+                    last_progress_seconds=0.01,
+                )
+                return process, inspect_scr(scr_output), {"mode": "test"}
+
+            with patch.object(chain, "_compile_rson_with_rscript", side_effect=fake_compile), patch.object(
+                chain,
+                "_load_script_lang_base",
+                return_value=(base_document, base),
+            ):
+                result = chain.compile_rson(
+                    source,
+                    scr,
+                    lang_dat,
+                    lang_base=base,
+                )
+
+            self.assertEqual(lang_dat.read_bytes(), base.read_bytes())
+            self.assertEqual(result["language"]["fragment"]["status"], "incomplete")
+            self.assertEqual(result["language"]["game_dat"]["mode"], "preserved-base")
+            self.assertEqual(
+                result["language"]["warnings"][0]["code"],
+                "rscript-lang-fragment-incomplete",
+            )
+
+    def test_compile_wraps_complete_fragment_before_building_lang_dat(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "workflow.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+            scr = root / "workflow.scr"
+            fragment = root / "workflow.lang.txt"
+            lang_dat = root / "Lang.dat"
+            chain = Toolchain()
+            captured: dict[str, str] = {}
+
+            def fake_compile(_source, scr_output, lang_output, **_kwargs):
+                scr_output.parent.mkdir(parents=True, exist_ok=True)
+                scr_output.write_bytes((8).to_bytes(4, "little") + b"compiled")
+                lang_output.write_bytes("0=Готово\r\n1=Назад\r\n".encode("utf-16"))
+                process = SimpleNamespace(
+                    exit_code=0,
+                    forced_after_outputs=False,
+                    elapsed_seconds=0.01,
+                    queue_seconds=0.0,
+                    progress_updates=1,
+                    last_progress_seconds=0.01,
+                )
+                return process, inspect_scr(scr_output), {"mode": "test"}
+
+            def fake_convert(source_path, destination_path, **_kwargs):
+                source_path = Path(source_path)
+                destination_path = Path(destination_path)
+                captured["text"] = source_path.read_text(encoding="cp1251")
+                destination_path.write_bytes(b"verified-game-dat")
+                return {"verified": True}
+
+            with patch.object(chain, "_compile_rson_with_rscript", side_effect=fake_compile), patch.object(
+                chain,
+                "convert_dat",
+                side_effect=fake_convert,
+            ):
+                result = chain.compile_rson(
+                    source,
+                    scr,
+                    fragment,
+                    lang_dat_output=lang_dat,
+                )
+
+            self.assertIn("Script ^{", captured["text"])
+            self.assertIn("Workflow ~{", captured["text"])
+            self.assertIn("0=Готово", captured["text"])
+            self.assertEqual(fragment.read_bytes()[:2], b"\xff\xfe")
+            self.assertEqual(lang_dat.read_bytes(), b"verified-game-dat")
+            self.assertEqual(result["language"]["game_dat"]["mode"], "generated")
+
+    def test_compile_builds_blockpar_container_for_empty_game_lang_dat(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "workflow.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+            scr = root / "workflow.scr"
+            lang_dat = root / "Lang.dat"
+            chain = Toolchain()
+            captured: dict[str, str] = {}
+
+            def fake_compile(_source, scr_output, lang_output, **_kwargs):
+                scr_output.parent.mkdir(parents=True, exist_ok=True)
+                scr_output.write_bytes((8).to_bytes(4, "little") + b"compiled")
+                lang_output.write_bytes(b"\xff\xfe")
+                process = SimpleNamespace(
+                    exit_code=0,
+                    forced_after_outputs=False,
+                    elapsed_seconds=0.01,
+                    queue_seconds=0.0,
+                    progress_updates=1,
+                    last_progress_seconds=0.01,
+                )
+                return process, inspect_scr(scr_output), {"mode": "test"}
+
+            def fake_convert(source_path, destination_path, **_kwargs):
+                source_path = Path(source_path)
+                destination_path = Path(destination_path)
+                captured["text"] = source_path.read_text(encoding="cp1251")
+                destination_path.write_bytes(b"verified-empty-game-dat")
+                return {"verified": True}
+
+            with patch.object(chain, "_compile_rson_with_rscript", side_effect=fake_compile), patch.object(
+                chain,
+                "convert_dat",
+                side_effect=fake_convert,
+            ):
+                result = chain.compile_rson(source, scr, lang_dat)
+
+            self.assertIn("Script ^{", captured["text"])
+            self.assertIn("Workflow ~{", captured["text"])
+            self.assertNotEqual(lang_dat.read_bytes(), b"\xff\xfe")
+            self.assertEqual(
+                result["language"]["game_dat"]["mode"],
+                "generated-empty",
+            )
+
+    def test_complete_fragment_must_cover_referenced_script_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            data = deepcopy(PROJECT)
+            data["Visual.Objects"][0]["Operations"][0]["Code"] = [
+                'result = CT("Script.Workflow.9");'
+            ]
+            source = root / "workflow.rson"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            scr = root / "workflow.scr"
+            lang_dat = root / "Lang.dat"
+            chain = Toolchain()
+
+            def fake_compile(_source, scr_output, lang_output, **_kwargs):
+                scr_output.parent.mkdir(parents=True, exist_ok=True)
+                scr_output.write_bytes((8).to_bytes(4, "little") + b"compiled")
+                lang_output.write_bytes("0=Готово\r\n".encode("utf-16"))
+                process = SimpleNamespace(
+                    exit_code=0,
+                    forced_after_outputs=False,
+                    elapsed_seconds=0.01,
+                    queue_seconds=0.0,
+                    progress_updates=1,
+                    last_progress_seconds=0.01,
+                )
+                return process, inspect_scr(scr_output), {"mode": "test"}
+
+            with patch.object(chain, "_compile_rson_with_rscript", side_effect=fake_compile):
+                with self.assertRaisesRegex(ValueError, "не покрывает Script/Workflow"):
+                    chain.compile_rson(source, scr, lang_dat)
+
+            self.assertFalse(scr.exists())
+            self.assertFalse(lang_dat.exists())
 
 
 if __name__ == "__main__":

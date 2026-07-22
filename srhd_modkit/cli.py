@@ -1508,6 +1508,8 @@ def cmd_script_build(args: argparse.Namespace) -> int:
         source,
         args.scr,
         args.lang,
+        lang_dat_output=getattr(args, "lang_dat", None),
+        lang_base=getattr(args, "lang_base", None),
         overwrite=args.overwrite,
         timeout=getattr(args, "timeout", None),
     )
@@ -1521,6 +1523,21 @@ def cmd_script_build(args: argparse.Namespace) -> int:
         print(f"SCR: {result['scr']} ({human_size(result['scr_size'])})")
         print(f"Lang: {result['lang']}")
         print(f"SHA-256 SCR: {result['scr_sha256']}")
+        language = result.get("language", {})
+        fragment = language.get("fragment", {})
+        if fragment:
+            print(
+                f"Языковой фрагмент RScript: {fragment.get('status')}; "
+                f"записей {fragment.get('entries')}"
+            )
+        game_dat = language.get("game_dat")
+        if game_dat:
+            print(
+                f"Игровой Lang.dat: {game_dat.get('mode')} "
+                f"({game_dat.get('path')})"
+            )
+        for warning in language.get("warnings", []):
+            print(f"WARNING {warning['code']}: {warning['message']}")
     return 0
 
 
@@ -2140,7 +2157,25 @@ def build_parser() -> argparse.ArgumentParser:
     script_build = script_sub.add_parser("build", help="Скомпилировать RSON в SCR через CLI RScript")
     script_build.add_argument("source")
     script_build.add_argument("--scr", required=True)
-    script_build.add_argument("--lang", required=True)
+    script_build.add_argument(
+        "--lang",
+        required=True,
+        help=(
+            "Выход RScript: UTF-16 TXT-фрагмент number=value. Если указан .dat, "
+            "ModKit безопасно соберёт игровой Lang.dat вместо публикации сырого фрагмента"
+        ),
+    )
+    script_build.add_argument(
+        "--lang-dat",
+        help="Дополнительно собрать проверенный игровой Lang.dat из языкового фрагмента",
+    )
+    script_build.add_argument(
+        "--lang-base",
+        help=(
+            "Проверенный существующий Lang.dat/TXT для слияния или побайтового "
+            "сохранения, если RSON восстановлен без текста диалогов"
+        ),
+    )
     script_build.add_argument("--overwrite", action="store_true")
     script_build.add_argument(
         "--timeout",

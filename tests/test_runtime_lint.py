@@ -1658,26 +1658,52 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-fixed-array-index-contract", fixed_codes)
 
-    def test_runtime_persistent_fixed_array_reserves_terminal_slot(self) -> None:
+    def test_runtime_persistent_fixed_array_terminal_slot_is_cross_scope_advisory(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Variables"] = [
             {"Type": "TVar", "Name": "transport_ids", "Parent": -1, "#": 20},
         ]
-        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+        init = data["Visual.Objects"][0]["Operations"][0]
+        init["Code.Type"] = "Init"
+        init["Code"] = [
             "function ResetIds()",
             "{",
             "    transport_ids = newarray(7);",
             "    for(int i = 0; i <= 6; i = i + 1)",
             "        transport_ids[i] = 0;",
+            "    if(transport_ids[6]) result = 1;",
             "}",
         ]
-        codes = {
-            issue.code
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = ["ResetIds();"]
+        same_scope = [
+            issue
             for issue in lint_rson_runtime(RsonProject(data, Path("terminal-slot.rson")))
-        }
-        self.assertIn("runtime-persistent-fixed-array-terminal-slot", codes)
+            if issue.code == "runtime-persistent-fixed-array-terminal-slot"
+        ]
+        self.assertEqual(same_scope, [])
 
-        data["Visual.Objects"][0]["Operations"][1]["Code"][2] = (
+        init["Code"].extend(
+            [
+                "function IsTransportId(int wanted)",
+                "{",
+                "    result = 0;",
+                "    for(int read_i = 1; read_i <= 6; read_i = read_i + 1)",
+                "        if(transport_ids[read_i] == wanted) { result = 1; exit; }",
+                "}",
+            ]
+        )
+        data["Visual.Objects"][0]["Operations"][1]["Code"].append(
+            "IsTransportId(42);"
+        )
+        cross_scope = [
+            issue
+            for issue in lint_rson_runtime(RsonProject(data, Path("terminal-cross-scope.rson")))
+            if issue.code == "runtime-persistent-fixed-array-terminal-slot"
+        ]
+        self.assertEqual(len(cross_scope), 1)
+        self.assertEqual(cross_scope[0].severity, "warning")
+
+        init["Code"][2] = (
             "    transport_ids = newarray(8);"
         )
         reserved_codes = {

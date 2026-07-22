@@ -20,11 +20,14 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 
 - Runtime-lint больше не считает `newarray(...)` из другой миграции доказательством для чистого запуска: `ArrayClear` до доминирующей инициализации блокируется как `runtime-persistent-array-use-before-newarray`.
 - Fixed-массивы проверяются на неизвестные читаемые слоты, выходы за `0..N-1` и ошибочное `<= ArrayDim(array)`.
-- Runtime-created persistent fixed-массив обязан оставлять запасной terminal-слот: подтверждённый новый запуск EarthTest 1.0.57 передал исходный последний слот движку как индекс за границей.
+- Обычный последний индекс `N-1` разрешён. Отдельное предупреждение выдаётся только для подтверждённо рискованного межходового Turn-графа: persistent fixed-массив создаётся в одной функции, а крайний слот читается в другой. Это находит EarthTest 1.0.57 (`newarray(7)` и runtime `index=7`), не запрещая локальные, диалоговые и самодостаточные таблицы.
+- Read-only проверка 20 установленных скриптов без ZelRangers дала 0 ложных terminal-slot срабатываний; реальные таблицы `newarray(2)[1]`, `newarray(3)[2]` и `newarray(9)[8]` не ограничиваются.
 - Dynamic persistent-массивы с `ArrayClear + ArrayAdd + live ArrayDim` получают предупреждение о возможном дрейфе состояния сохранения.
 - `script compare-storage` обнаруживает изменение ёмкости persistent-массива между версиями RSON.
 - Собственные литеральные `CT(...)` сверяются со всеми поставляемыми языковыми TXT/DAT; пустой ключ на пути к `AddPlanetNews` считается runtime-fatal.
-- Полный набор 0.9.5 состоит из 195 тестов.
+- `script build` отличает сырой UTF-16LE-фрагмент RScript `number=value` от игрового BlockPar `Lang.dat`. Полный или пустой результат безопасно оборачивается и проверяется; неполный проект требует `--lang-base`, который сверяется и сохраняется побайтно.
+- Повреждённый `�`, управляющие символы и текст вне CP1251 блокируют публикацию даже при успешном коде возврата RScript. Номера проблемных языковых ключей остаются в диагностике.
+- Полный набор 0.9.5 состоит из 202 тестов и 22 подтестов.
 
 ## Новое в 0.9.4
 
@@ -544,7 +547,8 @@ python srhd.py release build D:\path\Mod D:\SRHD_Modding\Releases\Mod.zip
 from srhd_modkit import (
     RgbaImage, Toolchain, analyze_modset, audit_mod, build_release,
     build_quest_from_json, discover_mods,
-    inspect_file, inspect_gi, inspect_quest, load_blockpar, read_gi,
+    inspect_file, inspect_gi, inspect_quest, inspect_rscript_lang_fragment,
+    load_blockpar, read_gi,
     read_png, stage_tree, verify_gi, verify_quest, write_gi, write_png,
 )
 from srhd_modkit.resources import build_gai, build_pkg, extract_resource, inspect_gai, inspect_hai, inspect_pkg
@@ -555,6 +559,13 @@ print(inspect_file(r"D:\path\Main.dat", include_hash=True))
 tools = Toolchain()
 tools.convert([r"D:\path\Images"], r"D:\path\PNG", direction="gi-png")
 tools.convert_dat(r"D:\path\Main.dat", r"D:\work\Main.txt")
+tools.compile_rson(
+    r"D:\work\Script.rson",
+    r"D:\work\Script.scr",
+    r"D:\work\Script.lang.txt",
+    lang_dat_output=r"D:\work\Lang.dat",
+    lang_base=r"D:\work\KnownGood\Lang.dat",
+)
 document = load_blockpar(r"D:\work\Main.txt")
 document.find_node("Data/SE/Ship").set_parameter("Cost", "1500")
 stage_tree(r"D:\path\OriginalMod", r"D:\path\WorkingCopy")
