@@ -37,6 +37,7 @@ MAX_PARAMETERS = 4096
 MAX_RECORDS = 1_000_000
 MAX_STRING_UNITS = 16_000_000
 MAX_QUEST_SIZE = 512 * 1024 * 1024
+QUEST_IMAGE_REUSE_WARNING_THRESHOLD = 6
 
 
 class QuestFormatError(ValueError):
@@ -1061,9 +1062,80 @@ def _automatic_cycle(document: QuestDocument) -> tuple[int, ...] | None:
     return None
 
 
+def quest_location_images(document: QuestDocument) -> tuple[dict[str, Any], ...]:
+    """Return the explicit location-text image assignment table."""
+
+    rows: list[dict[str, Any]] = []
+    for location_index, location in enumerate(document.locations):
+        assignments = [
+            {
+                "text_index": text_index,
+                "image": text.media.img or None,
+            }
+            for text_index, text in enumerate(location.texts)
+        ]
+        images = tuple(
+            sorted(
+                {item["image"] for item in assignments if item["image"]},
+                key=str.casefold,
+            )
+        )
+        rows.append(
+            {
+                "location_index": location_index,
+                "location_id": location.id,
+                "text_count": len(location.texts),
+                "assignments": assignments,
+                "images": list(images),
+                "missing_text_indices": [
+                    item["text_index"] for item in assignments if item["image"] is None
+                ],
+                "has_image": bool(images),
+            }
+        )
+    return tuple(rows)
+
+
+def quest_image_usage(document: QuestDocument) -> tuple[dict[str, Any], ...]:
+    """Count explicit frame reuse by text variants and distinct locations."""
+
+    frames: Counter[str] = Counter()
+    locations: dict[str, set[int]] = {}
+    spelling: dict[str, str] = {}
+    for location in document.locations:
+        for text in location.texts:
+            if not text.media.img:
+                continue
+            folded = text.media.img.casefold()
+            spelling.setdefault(folded, text.media.img)
+            frames[folded] += 1
+            locations.setdefault(folded, set()).add(location.id)
+    return tuple(
+        {
+            "image": spelling[key],
+            "location_count": len(locations[key]),
+            "text_count": frames[key],
+            "locations": sorted(locations[key]),
+        }
+        for key in sorted(
+            locations,
+            key=lambda item: (-len(locations[item]), spelling[item].casefold()),
+        )
+    )
+
+
 def validate_quest(document: QuestDocument) -> tuple[QuestIssue, ...]:
     issues: list[QuestIssue] = []
     params_count = len(document.parameters)
+    if not 0 <= document.hardness <= 100:
+        issues.append(
+            QuestIssue(
+                "error",
+                "quest-hardness-out-of-range",
+                f"Сложность hardness={document.hardness}; ожидается значение от 0 до 100",
+                "hardness",
+            )
+        )
     if not params_count:
         issues.append(QuestIssue("warning", "quest-no-parameters", "В квесте нет параметров"))
     if params_count > 96:
@@ -1281,6 +1353,17 @@ def validate_quest(document: QuestDocument) -> tuple[QuestIssue, ...]:
                 evidence=" -> ".join(map(str, cycle)),
             )
         )
+    for usage in quest_image_usage(document):
+        if usage["location_count"] < QUEST_IMAGE_REUSE_WARNING_THRESHOLD:
+            continue
+        issues.append(
+            QuestIssue(
+                "warning",
+                "quest-location-image-reused-many-times",
+                f"Кадр {usage['image']} назначен {usage['location_count']} разным локациям",
+                evidence=", ".join(map(str, usage["locations"])),
+            )
+        )
     return tuple(issues)
 
 
@@ -1288,6 +1371,20 @@ def inspect_quest(path: str | Path) -> dict[str, Any]:
     path = Path(path).resolve()
     document = load_quest(path)
     issues = validate_quest(document)
+    location_images = quest_location_images(document)
+    image_usage = quest_image_usage(document)
+    media = quest_media(document)
+    locations_without_images = [
+        item["location_id"] for item in location_images if not item["has_image"]
+    ]
+    location_texts_without_images = [
+        {
+            "location_id": item["location_id"],
+            "text_indices": item["missing_text_indices"],
+        }
+        for item in location_images
+        if item["missing_text_indices"]
+    ]
     return {
         "schema": QUEST_REPORT_SCHEMA,
         "path": str(path),
@@ -1300,6 +1397,14 @@ def inspect_quest(path: str | Path) -> dict[str, Any]:
         "parameters": len(document.parameters),
         "locations": len(document.locations),
         "jumps": len(document.jumps),
+        "hardness": document.hardness,
+        "screen": {"width": document.screen_width, "height": document.screen_height},
+        "media": {key: list(value) for key, value in media.items()},
+        "location_images": list(location_images),
+        "locations_without_images": locations_without_images,
+        "location_texts_without_images": location_texts_without_images,
+        "image_usage": list(image_usage),
+        "image_reuse_warning_threshold": QUEST_IMAGE_REUSE_WARNING_THRESHOLD,
         "issues": [item.as_dict() for item in issues],
         "valid": not any(item.severity == "error" for item in issues),
         "capabilities": ["inspect", "validate", "export-json", "build-qmm", "roundtrip"],

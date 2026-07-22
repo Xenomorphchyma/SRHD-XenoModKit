@@ -59,6 +59,7 @@ FORMAT_SPECS: tuple[FormatSpec, ...] = (
     FormatSpec("Windows library", (".dll",), "binary", "passthrough", signature=b"MZ"),
     FormatSpec("plain text", (".txt", ".ini", ".cfg", ".csv", ".md", ".log"), "text", "text"),
     FormatSpec("JSON", (".json",), "structured-text", "text"),
+    FormatSpec("Python source", (".py",), "source-code", "headless", "Python stdlib", "syntax-check"),
 )
 
 FORMAT_BY_EXTENSION = {
@@ -72,14 +73,68 @@ def get_format_spec(path_or_extension: str | Path) -> FormatSpec | None:
     return FORMAT_BY_EXTENSION.get(extension)
 
 
-def _dimensions(path: Path, spec: FormatSpec | None) -> dict[str, int]:
+_JPEG_START_OF_FRAME_MARKERS = frozenset(
+    {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+)
+
+
+def _jpeg_metadata(path: Path) -> dict[str, Any]:
+    with path.open("rb") as stream:
+        if stream.read(2) != b"\xff\xd8":
+            return {}
+        while True:
+            byte = stream.read(1)
+            if not byte:
+                return {}
+            if byte != b"\xff":
+                continue
+            while byte == b"\xff":
+                byte = stream.read(1)
+                if not byte:
+                    return {}
+            marker = byte[0]
+            if marker in {0xD9, 0xDA}:
+                return {}
+            if marker in {0x00, 0x01} or 0xD0 <= marker <= 0xD9:
+                continue
+            raw_length = stream.read(2)
+            if len(raw_length) != 2:
+                return {}
+            segment_length = struct.unpack(">H", raw_length)[0]
+            if segment_length < 2:
+                return {}
+            if marker not in _JPEG_START_OF_FRAME_MARKERS:
+                stream.seek(segment_length - 2, 1)
+                continue
+            payload = stream.read(segment_length - 2)
+            if len(payload) < 6:
+                return {}
+            height, width = struct.unpack(">HH", payload[1:5])
+            components = payload[5]
+            mode = {1: "L", 3: "RGB", 4: "CMYK"}.get(components, f"components-{components}")
+            return {
+                "width": width,
+                "height": height,
+                "mode": mode,
+                "components": components,
+            }
+
+
+def _dimensions(path: Path, spec: FormatSpec | None) -> dict[str, Any]:
     if spec is None:
         return {}
     with path.open("rb") as stream:
         header = stream.read(32)
     if spec.name == "PNG image" and len(header) >= 24 and header.startswith(b"\x89PNG\r\n\x1a\n"):
         width, height = struct.unpack(">II", header[16:24])
-        return {"width": width, "height": height}
+        color_type = header[25] if len(header) > 25 else None
+        mode = {0: "L", 2: "RGB", 3: "P", 4: "LA", 6: "RGBA"}.get(
+            color_type,
+            f"color-type-{color_type}" if color_type is not None else "unknown",
+        )
+        return {"width": width, "height": height, "mode": mode, "color_type": color_type}
+    if spec.name == "JPEG image":
+        return _jpeg_metadata(path)
     if spec.name == "GI image" and len(header) >= 24 and header.startswith(b"gi\0\0"):
         width, height = struct.unpack("<II", header[16:24])
         return {"width": width, "height": height}

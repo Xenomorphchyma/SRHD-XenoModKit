@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import tempfile
+import tokenize
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -15,7 +16,7 @@ from .formats import get_format_spec, inspect_file
 from .game_text import lint_game_text
 from .module_info import find_module_info, parse_module_info
 from .resources import UnsupportedResourceFormat, verify_resource
-from .quests import inspect_quest, verify_quest
+from .quests import inspect_quest, load_quest, quest_media, verify_quest
 from .runtime_lint import (
     has_onstart_script_run,
     lint_main_runtime,
@@ -609,6 +610,603 @@ def _resource_integrity_check(context: AuditContext) -> AuditCheck:
     )
 
 
+def _python_sources_check(context: AuditContext) -> AuditCheck:
+    name = "python-sources"
+    paths = [path for path in iter_files(context.root) if path.suffix.casefold() == ".py"]
+    if not paths:
+        return AuditCheck(name, "skipped", details={"reason": "Python-файлы не найдены"})
+    issues: list[AuditIssue] = []
+    checked: list[str] = []
+    for path in paths:
+        try:
+            with tokenize.open(path) as stream:
+                source = stream.read()
+            compile(source, str(path), "exec", dont_inherit=True)
+            checked.append(str(path))
+        except SyntaxError as exc:
+            issues.append(
+                _issue(
+                    context,
+                    name,
+                    "error",
+                    "python-syntax-invalid",
+                    exc.msg,
+                    path,
+                    location=f"line {exc.lineno or 0}:{exc.offset or 0}",
+                    evidence=(exc.text or "").strip() or None,
+                )
+            )
+        except Exception as exc:
+            issues.append(
+                _issue(context, name, "error", "python-source-unreadable", str(exc), path)
+            )
+    return AuditCheck(
+        name,
+        _status(issues),
+        tuple(issues),
+        tuple(checked),
+        details={"files": len(paths), "scope": "decode-and-compile-without-execution"},
+    )
+
+
+def _node_parameters(document: BlockParDocument, path: str) -> dict[str, str]:
+    try:
+        node = document.find_node(path)
+    except KeyError:
+        return {}
+    return {item.key: item.value for item in node.parameters}
+
+
+def _quest_card_nodes(document: BlockParDocument) -> dict[str, dict[str, str]]:
+    try:
+        node = document.find_node("PlanetQuest/List")
+    except KeyError:
+        return {}
+    return {
+        child.name: {item.key: item.value for item in child.parameters}
+        for child in node.children
+    }
+
+
+def _quest_lang_documents(context: AuditContext) -> list[tuple[Path, BlockParDocument]]:
+    return [
+        (path, document)
+        for path, document in context.dat_documents.items()
+        if document is not None and path.name.casefold() == "lang.dat"
+    ]
+
+
+def _quest_cache_documents(context: AuditContext) -> list[tuple[Path, BlockParDocument]]:
+    return [
+        (path, document)
+        for path, document in context.dat_documents.items()
+        if document is not None and path.name.casefold() == "cachedata.dat"
+    ]
+
+
+def _resolve_game_reference(
+    root: Path,
+    raw: str,
+    file_index: dict[str, Path],
+) -> tuple[str, Path | None, str | None]:
+    value = raw.strip().strip('"').replace("\\", "/")
+    if not value:
+        return "missing", None, None
+    if value.startswith("/") or (len(value) > 1 and value[1] == ":"):
+        return "unsafe", None, value
+    parts = [part for part in value.split("/") if part and part != "."]
+    if not parts or any(part == ".." for part in parts):
+        return "unsafe", None, value
+    folded = [part.casefold() for part in parts]
+    candidates: list[tuple[str, bool]] = []
+    root_name = root.name.casefold()
+    if root_name in folded:
+        index = folded.index(root_name)
+        if index + 1 < len(parts):
+            candidates.append(("/".join(parts[index + 1 :]), True))
+    if folded[0] in {"data", "cfg", "source"}:
+        candidates.append(("/".join(parts), True))
+    for index, part in enumerate(folded):
+        if part in {"data", "cfg"}:
+            candidates.append(("/".join(parts[index:]), False))
+    for candidate, explicit_local in candidates:
+        found = file_index.get(candidate.casefold())
+        if found is not None:
+            return "local", found, candidate
+        if explicit_local:
+            return "missing", None, candidate
+    return "external", None, value
+
+
+def _parse_card_integer(
+    context: AuditContext,
+    validator: str,
+    issues: list[AuditIssue],
+    path: Path,
+    quest_id: str,
+    fields: dict[str, str],
+    key: str,
+) -> int | None:
+    raw = fields.get(key)
+    if raw is None:
+        issues.append(
+            _issue(
+                context,
+                validator,
+                "error",
+                "quest-card-field-missing",
+                f"У карточки квеста {quest_id} отсутствует поле {key}",
+                path,
+                location=f"PlanetQuest/List/{quest_id}/{key}",
+            )
+        )
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        issues.append(
+            _issue(
+                context,
+                validator,
+                "error",
+                "quest-card-field-not-integer",
+                f"Поле {key} карточки {quest_id} должно быть целым числом: {raw!r}",
+                path,
+                location=f"PlanetQuest/List/{quest_id}/{key}",
+            )
+        )
+        return None
+
+
+def _quest_cards_check(context: AuditContext) -> AuditCheck:
+    name = "quest-cards"
+    quest_paths = [
+        path for path in iter_files(context.root) if path.suffix.casefold() in {".qm", ".qmm"}
+    ]
+    if not quest_paths:
+        return AuditCheck(name, "skipped", details={"reason": "QM/QMM не найдены"})
+    documents = _quest_lang_documents(context)
+    if not documents:
+        return AuditCheck(
+            name,
+            "unsupported",
+            details={"reason": "Lang.dat с PlanetQuest не найден; карточки проверить невозможно"},
+            complete=False,
+        )
+    issues: list[AuditIssue] = []
+    checked: list[str] = []
+    cards_report: list[dict[str, Any]] = []
+    registered_local: set[str] = set()
+    file_index = _relative_index(context.root)
+    for path, document in documents:
+        routes = _node_parameters(document, "PlanetQuest/PlanetQuest")
+        cards = _quest_card_nodes(document)
+        items = _node_parameters(document, "PlanetQuest/ItemForPlanetQuest")
+        starts = _node_parameters(document, "PlanetQuest/StartText")
+        if not routes and not cards:
+            continue
+        checked.append(str(path))
+        for quest_id in sorted(set(routes) | set(cards), key=str.casefold):
+            route = routes.get(quest_id)
+            fields = cards.get(quest_id)
+            if route is None:
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-card-path-missing",
+                        f"Карточка {quest_id} не имеет локальной записи PlanetQuest/PlanetQuest; путь может наследоваться от базовой игры или другого мода",
+                        path,
+                    )
+                )
+                continue
+            if fields is None:
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-card-missing",
+                        f"Для пути квеста {quest_id} отсутствует локальная PlanetQuest/List/{quest_id}; карточка может наследоваться от базовой игры или другого мода",
+                        path,
+                    )
+                )
+                continue
+            numeric_id = quest_id.isdecimal()
+            if not numeric_id:
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-card-id-nonnumeric",
+                        f"Идентификатор карточки {quest_id!r} не числовой; движок допускает такие ключи, но не все обработчики интерфейса одинаково их поддерживают",
+                        path,
+                        location=f"PlanetQuest/List/{quest_id}",
+                    )
+                )
+            length = _parse_card_integer(context, name, issues, path, quest_id, fields, "Length")
+            difficulty = _parse_card_integer(context, name, issues, path, quest_id, fields, "Dif")
+            if length is not None and not 0 <= length <= 4:
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-card-length-nonstandard",
+                        f"Length={length}; штатные карточки используют значения от 0 до 4",
+                        path,
+                        location=f"PlanetQuest/List/{quest_id}/Length",
+                    )
+                )
+            if difficulty is not None and not 0 <= difficulty <= 100:
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-card-difficulty-nonstandard",
+                        f"Dif={difficulty}; ожидается шкала от 0 до 100",
+                        path,
+                        location=f"PlanetQuest/List/{quest_id}/Dif",
+                    )
+                )
+            image = fields.get("Image")
+            if not image:
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "error",
+                        "quest-card-image-missing",
+                        f"У карточки {quest_id} отсутствует Image",
+                        path,
+                    )
+                )
+            elif not image.casefold().startswith("bm.pqi."):
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-card-image-not-pqi",
+                        f"Image карточки {quest_id} не использует Bm.PQI.*: {image}",
+                        path,
+                    )
+                )
+            if quest_id not in items:
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-card-item-entry-missing",
+                        f"Для карточки {quest_id} отсутствует ItemForPlanetQuest; у обычного планетарного квеста обычно указывают хотя бы none",
+                        path,
+                    )
+                )
+            if quest_id not in starts:
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-card-start-text-missing",
+                        f"Для карточки {quest_id} отсутствует StartText",
+                        path,
+                    )
+                )
+            status, resolved, relative = _resolve_game_reference(context.root, route, file_index)
+            hardness: int | None = None
+            if status == "unsafe":
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "error",
+                        "quest-card-path-unsafe",
+                        f"Небезопасный путь QMM карточки {quest_id}: {route}",
+                        path,
+                    )
+                )
+            elif status == "missing":
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "error",
+                        "quest-card-qmm-missing",
+                        f"Путь карточки {quest_id} не указывает на существующий файл: {route}",
+                        path,
+                    )
+                )
+            elif status == "local" and resolved is not None:
+                if resolved.suffix.casefold() not in {".qm", ".qmm"}:
+                    issues.append(
+                        _issue(
+                            context,
+                            name,
+                            "error",
+                            "quest-card-path-not-quest",
+                            f"Путь карточки {quest_id} не ведёт к QM/QMM: {route}",
+                            path,
+                        )
+                    )
+                else:
+                    registered_local.add(str(resolved.resolve()).casefold())
+                    try:
+                        hardness = load_quest(resolved).hardness
+                    except Exception as exc:
+                        issues.append(
+                            _issue(
+                                context,
+                                name,
+                                "error",
+                                "quest-card-qmm-invalid",
+                                str(exc),
+                                resolved,
+                            )
+                        )
+            cards_report.append(
+                {
+                    "lang": str(path),
+                    "id": quest_id,
+                    "numeric_id": numeric_id,
+                    "qmm": route,
+                    "qmm_resolution": status,
+                    "resolved_qmm": str(resolved) if resolved else None,
+                    "length": length,
+                    "hourglasses_expected": length if length is not None and length > 0 else 0,
+                    "difficulty": difficulty,
+                    "hardness": hardness,
+                    "image": image,
+                    "item": items.get(quest_id),
+                    "has_start_text": quest_id in starts,
+                }
+            )
+    for quest_path in quest_paths:
+        if str(quest_path.resolve()).casefold() not in registered_local:
+            issues.append(
+                _issue(
+                    context,
+                    name,
+                    "warning",
+                    "quest-card-registration-missing",
+                    "QM/QMM не имеет прямой локальной регистрации Lang.dat; это допустимо для замены базового квеста, но для нового квеста требуется PlanetQuest/PlanetQuest",
+                    quest_path,
+                )
+            )
+    if not cards_report:
+        return AuditCheck(
+            name,
+            _status(issues) if issues else "unsupported",
+            tuple(issues),
+            tuple(checked),
+            details={"reason": "PlanetQuest/List и PlanetQuest/PlanetQuest не найдены"},
+            complete=False,
+        )
+    return AuditCheck(
+        name,
+        _status(issues),
+        tuple(issues),
+        tuple(dict.fromkeys(checked + [str(path) for path in quest_paths])),
+        details={
+            "cards": cards_report,
+            "hourglass_semantics": "Length задаёт ожидаемое число песочных часов; фактический рендер проверяется в игре",
+        },
+    )
+
+
+def _pqi_key(value: str | None) -> str | None:
+    if not value:
+        return None
+    result = value.strip()
+    prefix = "bm.pqi."
+    return result[len(prefix) :] if result.casefold().startswith(prefix) else result
+
+
+def _quest_media_check(context: AuditContext) -> AuditCheck:
+    name = "quest-media"
+    quest_paths = [
+        path for path in iter_files(context.root) if path.suffix.casefold() in {".qm", ".qmm"}
+    ]
+    if not quest_paths:
+        return AuditCheck(name, "skipped", details={"reason": "QM/QMM не найдены"})
+    issues: list[AuditIssue] = []
+    checked: list[str] = []
+    referenced: set[str] = set()
+    quest_reports: list[dict[str, Any]] = []
+    for path in quest_paths:
+        try:
+            report = inspect_quest(path)
+            document = load_quest(path)
+            referenced.update(
+                key.casefold()
+                for value in quest_media(document)["images"]
+                if (key := _pqi_key(value)) is not None
+            )
+            quest_reports.append(
+                {
+                    "path": str(path),
+                    "location_images": report["location_images"],
+                    "locations_without_images": report["locations_without_images"],
+                    "location_texts_without_images": report["location_texts_without_images"],
+                    "image_usage": report["image_usage"],
+                }
+            )
+            checked.append(str(path))
+        except Exception as exc:
+            issues.append(_issue(context, name, "error", "quest-media-read-failed", str(exc), path))
+
+    for _path, document in _quest_lang_documents(context):
+        for fields in _quest_card_nodes(document).values():
+            key = _pqi_key(fields.get("Image"))
+            if key:
+                referenced.add(key.casefold())
+
+    file_index = _relative_index(context.root)
+    registrations: list[dict[str, Any]] = []
+    registered_paths: set[str] = set()
+    registered_keys: set[str] = set()
+    for cache_path, document in _quest_cache_documents(context):
+        try:
+            node = document.find_node("Bm/PQI")
+        except KeyError:
+            continue
+        checked.append(str(cache_path))
+        for parameter in node.parameters:
+            key = parameter.key
+            folded_key = key.casefold()
+            registered_keys.add(folded_key)
+            status, resolved, relative = _resolve_game_reference(
+                context.root, parameter.value, file_index
+            )
+            registrations.append(
+                {
+                    "key": key,
+                    "value": parameter.value,
+                    "cache": str(cache_path),
+                    "resolution": status,
+                    "resolved": str(resolved) if resolved else None,
+                }
+            )
+            if status == "unsafe":
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "error",
+                        "quest-pqi-path-unsafe",
+                        f"Bm.PQI.{key} содержит небезопасный путь: {parameter.value}",
+                        cache_path,
+                    )
+                )
+            elif status == "missing":
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "error",
+                        "quest-pqi-file-missing",
+                        f"Bm.PQI.{key} указывает на отсутствующий локальный файл: {parameter.value}",
+                        cache_path,
+                    )
+                )
+            elif status == "local" and resolved is not None:
+                registered_paths.add(str(resolved.resolve()).casefold())
+                if folded_key not in referenced:
+                    issues.append(
+                        _issue(
+                            context,
+                            name,
+                            "warning",
+                            "quest-pqi-asset-unused",
+                            f"Локальный ассет Bm.PQI.{key} не используется QMM или карточкой квеста",
+                            resolved,
+                            evidence=parameter.value,
+                        )
+                    )
+
+    pqi_files = [
+        path
+        for path in iter_files(context.root)
+        if len(path.relative_to(context.root).parts) >= 3
+        and tuple(part.casefold() for part in path.relative_to(context.root).parts[:2])
+        == ("data", "pqi")
+    ]
+    asset_reports: list[dict[str, Any]] = []
+    local_stems: dict[str, list[Path]] = {}
+    for path in pqi_files:
+        checked.append(str(path))
+        local_stems.setdefault(path.stem.casefold(), []).append(path)
+        registered = str(path.resolve()).casefold() in registered_paths
+        if not registered:
+            issues.append(
+                _issue(
+                    context,
+                    name,
+                    "warning",
+                    "quest-pqi-file-unregistered",
+                    "Файл DATA/PQI не имеет соответствующей записи Bm.PQI.* в CacheData",
+                    path,
+                )
+            )
+        info = inspect_file(path)
+        width = info.get("width")
+        height = info.get("height")
+        mode = info.get("mode")
+        if width is None or height is None or mode is None:
+            issues.append(
+                _issue(
+                    context,
+                    name,
+                    "error",
+                    "quest-pqi-image-metadata-unreadable",
+                    "Не удалось прочитать размеры или цветовой режим изображения PQI",
+                    path,
+                )
+            )
+        else:
+            if (width, height) != (343, 394):
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-pqi-image-size-nonstandard",
+                        f"Размер {width}x{height}; штатный кадр PQI имеет размер 343x394",
+                        path,
+                    )
+                )
+            if mode != "RGB":
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "quest-pqi-image-mode-nonstandard",
+                        f"Цветовой режим {mode}; для штатного кадра PQI ожидается RGB",
+                        path,
+                    )
+                )
+        asset_reports.append(
+            {
+                "path": str(path),
+                "registered": registered,
+                "width": width,
+                "height": height,
+                "mode": mode,
+                "standard_343x394_rgb": (width, height, mode) == (343, 394, "RGB"),
+            }
+        )
+    for key in sorted(referenced - registered_keys):
+        if key not in local_stems:
+            continue
+        issues.append(
+            _issue(
+                context,
+                name,
+                "error",
+                "quest-pqi-reference-unregistered",
+                f"Квест использует локальный кадр {key}, но CacheData не содержит Bm.PQI.{key}",
+                local_stems[key][0],
+            )
+        )
+    return AuditCheck(
+        name,
+        _status(issues),
+        tuple(issues),
+        tuple(dict.fromkeys(checked)),
+        details={
+            "quests": quest_reports,
+            "registrations": registrations,
+            "assets": asset_reports,
+            "standard": {"width": 343, "height": 394, "mode": "RGB", "enforcement": "warning"},
+        },
+    )
+
+
 def _quest_check(context: AuditContext) -> AuditCheck:
     name = "text-quests"
     paths = [
@@ -838,10 +1436,17 @@ def default_registry() -> AuditRegistry:
     registry.register("workspace-artifacts", _workspace_artifacts_check)
     registry.register("format-signatures", _format_signatures_check)
     registry.register("unknown-formats", _unknown_formats_check)
+    registry.register("python-sources", _python_sources_check)
     registry.register("blockpar-dat", _dat_check)
     registry.register("game-text", _text_check)
     registry.register("scripts", _script_check)
     registry.register("text-quests", _quest_check)
+    registry.register("quest-cards", _quest_cards_check)
+    registry.register(
+        "quest-media",
+        _quest_media_check,
+        profiles=(AuditProfile.RELEASE,),
+    )
     registry.register(
         "resource-integrity",
         _resource_integrity_check,

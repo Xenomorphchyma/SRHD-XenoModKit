@@ -88,6 +88,8 @@ from .quests import (
     load_quest,
     load_quest_json,
     parse_quest,
+    quest_image_usage,
+    quest_location_images,
     quest_media,
     validate_quest,
     verify_quest,
@@ -192,6 +194,8 @@ __all__ = [
     "validate_quest",
     "inspect_quest",
     "verify_quest",
+    "quest_location_images",
+    "quest_image_usage",
     "quest_media",
     "export_quest_json",
     "load_quest_json",
@@ -199,4 +203,4 @@ __all__ = [
     "build_quest_from_json",
 ]
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"

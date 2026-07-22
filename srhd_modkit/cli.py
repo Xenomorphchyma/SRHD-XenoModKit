@@ -20,8 +20,6 @@ from .quests import (
     build_quest_from_json,
     export_quest_json,
     inspect_quest,
-    load_quest,
-    quest_media,
     verify_quest,
 )
 from .game_text import GameTextIssue, lint_game_text
@@ -478,8 +476,6 @@ def _print_quest_issues(result: dict[str, Any]) -> None:
 
 def cmd_quest_info(args: argparse.Namespace) -> int:
     result = inspect_quest(args.source)
-    document = load_quest(args.source)
-    result["media"] = {key: list(value) for key, value in quest_media(document).items()}
     if args.json:
         print_json(result)
     else:
@@ -488,8 +484,23 @@ def cmd_quest_info(args: argparse.Namespace) -> int:
             f"локаций {result['locations']}, переходов {result['jumps']}"
         )
         print(f"Поведение старого TGE: {'да' if result['old_tge_behaviour'] else 'нет'}")
+        print(f"Сложность QMM hardness: {result['hardness']}")
         for kind, values in result["media"].items():
             print(f"{kind}: {len(values)}")
+        print("Локации -> изображения:")
+        for row in result["location_images"]:
+            images = ", ".join(row["images"]) or "<нет>"
+            print(f"  {row['location_id']}: {images}")
+        print(f"Локаций без изображения: {len(result['locations_without_images'])}")
+        repeated = [
+            item
+            for item in result["image_usage"]
+            if item["location_count"] >= result["image_reuse_warning_threshold"]
+        ]
+        if repeated:
+            print("Часто повторяемые кадры:")
+            for item in repeated:
+                print(f"  {item['image']}: {item['location_count']} локаций")
         _print_quest_issues(result)
     return 2 if not result["valid"] else 0
 
@@ -1649,7 +1660,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.4")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.5")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")

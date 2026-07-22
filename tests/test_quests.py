@@ -23,7 +23,10 @@ from srhd_modkit.quests import (
     QuestStrings,
     build_quest_from_json,
     export_quest_json,
+    inspect_quest,
     parse_quest,
+    quest_image_usage,
+    quest_location_images,
     validate_quest,
     verify_quest,
     write_qmm,
@@ -177,6 +180,48 @@ class QuestTests(unittest.TestCase):
         )
         cycle = replace(document, locations=locations, jumps=jumps)
         self.assertTrue(any(item.code == "quest-automatic-cycle" for item in validate_quest(cycle)))
+
+    def test_info_reports_location_image_table_and_missing_locations(self) -> None:
+        document = _document()
+        rows = quest_location_images(document)
+        self.assertEqual(len(rows), 3)
+        self.assertFalse(rows[0]["has_image"])
+        self.assertEqual(rows[1]["images"], ["scene"])
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "quest.qmm"
+            path.write_bytes(write_qmm(document))
+            report = inspect_quest(path)
+        self.assertEqual(report["hardness"], 50)
+        self.assertEqual(report["locations_without_images"], [1, 3])
+        self.assertEqual(len(report["location_images"]), 3)
+
+    def test_reusing_one_frame_in_six_locations_is_a_warning(self) -> None:
+        document = _document()
+        no_changes = document.locations[0].parameter_changes
+        locations = tuple(
+            QuestLocation(
+                False,
+                index,
+                0,
+                index + 1,
+                0,
+                1 if index == 0 else 0,
+                no_changes,
+                (QuestLocationText(f"Локация {index}", QuestMedia("same-frame")),),
+                False,
+                "",
+            )
+            for index in range(6)
+        )
+        repeated = replace(document, locations=locations, jumps=())
+        usage = quest_image_usage(repeated)
+        self.assertEqual(usage[0]["location_count"], 6)
+        self.assertTrue(
+            any(
+                item.code == "quest-location-image-reused-many-times"
+                for item in validate_quest(repeated)
+            )
+        )
 
 
 if __name__ == "__main__":

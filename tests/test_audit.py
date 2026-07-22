@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import tempfile
+import struct
 import unittest
 from pathlib import Path
 
 from srhd_modkit.audit import AuditProfile, audit_mod
 from srhd_modkit.image_codec import RgbaImage, encode_gi
+from srhd_modkit.quests import (
+    HEADER_QMM_7,
+    QuestDocument,
+    QuestLocation,
+    QuestLocationText,
+    QuestMedia,
+    QuestParameter,
+    QuestParameterChange,
+    QuestStrings,
+    write_qmm,
+)
 from srhd_modkit.toolchain import Toolchain
 
 
@@ -16,6 +28,52 @@ def _mod(root: Path) -> None:
         encoding="cp1251",
     )
     (root / "DATA").mkdir()
+
+
+def _jpeg(width: int = 343, height: int = 394, components: int = 3) -> bytes:
+    component_data = b"".join(bytes((index + 1, 0x11, 0)) for index in range(components))
+    sof = bytes((8,)) + struct.pack(">HHB", height, width, components) + component_data
+    return b"\xff\xd8\xff\xc0" + struct.pack(">H", len(sof) + 2) + sof + b"\xff\xd9"
+
+
+def _quest() -> QuestDocument:
+    parameter = QuestParameter(0, 1, 0, True, 0, True, False, "Value", (), "", "0")
+    location = QuestLocation(
+        False,
+        0,
+        0,
+        1,
+        0,
+        1,
+        (QuestParameterChange(),),
+        (QuestLocationText("Start", QuestMedia("USED")),),
+        False,
+        "",
+    )
+    return QuestDocument(
+        HEADER_QMM_7,
+        1,
+        0,
+        "fixture",
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        800,
+        600,
+        16,
+        12,
+        0,
+        60,
+        (parameter,),
+        QuestStrings("to star", None, None, "to planet", "date", "money", "from planet", "from star", "ranger"),
+        "Success",
+        "Task",
+        (location,),
+        (),
+    )
 
 
 class AuditTests(unittest.TestCase):
@@ -116,6 +174,80 @@ class AuditTests(unittest.TestCase):
             check = next(item for item in report.checks if item.name == "text-quests")
             self.assertEqual(check.status, "issues")
             self.assertTrue(any(item.code == "quest-invalid" for item in check.issues))
+
+    def test_python_sources_are_known_and_syntax_checked_without_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            source = root / "SOURCE" / "Tools" / "broken.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("def broken(:\n    pass\n", encoding="utf-8")
+
+            report = audit_mod(root, profile="release")
+            unknown = next(item for item in report.checks if item.name == "unknown-formats")
+            python = next(item for item in report.checks if item.name == "python-sources")
+            self.assertEqual(unknown.status, "passed")
+            self.assertEqual(python.status, "issues")
+            self.assertTrue(any(item.code == "python-syntax-invalid" for item in python.issues))
+
+    def test_release_audits_quest_card_pqi_metadata_and_unused_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            quest = root / "DATA" / "Quest" / "Rus" / "Fixture.qmm"
+            quest.parent.mkdir(parents=True)
+            quest.write_bytes(write_qmm(_quest()))
+            pqi = root / "DATA" / "PQI"
+            pqi.mkdir()
+            (pqi / "USED.jpg").write_bytes(_jpeg())
+            (pqi / "UNUSED.jpg").write_bytes(_jpeg())
+
+            source_cfg = root / "SOURCE" / "CFG"
+            source_cfg.mkdir(parents=True)
+            cache_source = source_cfg / "CacheData.txt"
+            cache_source.write_text(
+                "Bm ^{\n"
+                "  PQI ^{\n"
+                "    USED=Mods\\OtherMods\\AuditFixture\\DATA\\PQI\\USED.jpg\n"
+                "    UNUSED=Mods\\OtherMods\\AuditFixture\\DATA\\PQI\\UNUSED.jpg\n"
+                "  }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            cache = root / "CFG" / "CacheData.dat"
+            cache.parent.mkdir()
+            Toolchain().convert_dat(cache_source, cache)
+
+            lang_source = source_cfg / "Lang_Rus.txt"
+            lang_source.write_text(
+                "PlanetQuest ~{\n"
+                "  ItemForPlanetQuest ~{\n    937=none\n  }\n"
+                "  List ~{\n"
+                "    937 ^{\n"
+                "      Dif=55\n      Image=Bm.PQI.USED\n      Length=4\n      Name=Fixture\n"
+                "    }\n"
+                "  }\n"
+                "  PlanetQuest ~{\n"
+                "    937=Mods\\OtherMods\\AuditFixture\\DATA\\Quest\\Rus\\Fixture.qmm\n"
+                "  }\n"
+                "  StartText ~{\n    937=Start\n  }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            lang = root / "CFG" / "Rus" / "Lang.dat"
+            lang.parent.mkdir()
+            Toolchain().convert_dat(lang_source, lang)
+
+            report = audit_mod(root, profile="release")
+            cards = next(item for item in report.checks if item.name == "quest-cards")
+            media = next(item for item in report.checks if item.name == "quest-media")
+            self.assertEqual(cards.details["cards"][0]["hourglasses_expected"], 4)
+            self.assertEqual(cards.details["cards"][0]["hardness"], 60)
+            unused = [item for item in media.issues if item.code == "quest-pqi-asset-unused"]
+            self.assertEqual([Path(item.path).name for item in unused], ["UNUSED.jpg"])
+            self.assertFalse(
+                any(item.code.startswith("quest-pqi-image-") for item in media.issues)
+            )
 
 
 if __name__ == "__main__":
