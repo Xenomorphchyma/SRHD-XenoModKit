@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.9.3
+# Команды SRHD ModKit 0.9.4
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -79,6 +79,9 @@ Lint также сверяет имена вызовов с API SRHD 2.1.2500, T
 persistent-схему сохранения и смысловую карту диалогов. Предупреждения
 `runtime-cleanup-without-turn-gate` и `runtime-stale-shipgetbad-follow` являются
 intent-sensitive и блокируют только при `--strict`/`--warnings-as-errors`.
+Результаты `GalaxyStar` и `StarRuins` требуют отдельного null-guard перед
+`Star*`, `Ship*`, `Id` и `RelationToRanger`; повторный `ShipTypeN` после
+типизированного `StarRuins(star, 'TYPE')` не нужен.
 
 ## Ресурсы
 

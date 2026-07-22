@@ -1619,6 +1619,140 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-object-api-behind-boolean-guard", codes)
 
+    def test_nullable_engine_handles_require_explicit_guards(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function CountPirateBases(dword ranger)",
+            "{",
+            "    result = 0;",
+            "    for(int i = 0; i < GalaxyStars(); i = i + 1)",
+            "    {",
+            "        dword star = GalaxyStar(i);",
+            "        dword base = StarRuins(star, 'PB');",
+            "        if(base && ShipTypeN(base) == t_PB && RelationToRanger(base, ranger) >= 10)",
+            "            result = result + 1;",
+            "    }",
+            "}",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("raw-handles.rson")))
+        codes = {issue.code for issue in issues}
+        self.assertIn("runtime-object-api-without-explicit-guard", codes)
+        self.assertIn("runtime-object-api-behind-boolean-guard", codes)
+        self.assertIn("runtime-redundant-star-ruins-type-dereference", codes)
+        missing_guards = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-object-api-without-explicit-guard"
+        ]
+        self.assertTrue(any("starruins" in issue.message for issue in missing_guards))
+        self.assertTrue(any("shiptypen" in issue.message for issue in missing_guards))
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function CountPirateBases(dword ranger)",
+            "{",
+            "    result = 0;",
+            "    for(int i = 0; i < GalaxyStars(); i = i + 1)",
+            "    {",
+            "        dword star = GalaxyStar(i);",
+            "        if(!star) continue;",
+            "        dword base = StarRuins(star, 'PB');",
+            "        if(!base) continue;",
+            "        if(RelationToRanger(base, ranger) < 10) continue;",
+            "        result = result + 1;",
+            "    }",
+            "}",
+        ]
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("guarded-handles.rson")))
+        }
+        self.assertNotIn("runtime-object-api-without-explicit-guard", safe_codes)
+        self.assertNotIn("runtime-object-api-behind-boolean-guard", safe_codes)
+        self.assertNotIn("runtime-redundant-star-ruins-type-dereference", safe_codes)
+
+    def test_nullable_handle_rule_covers_nested_and_boolean_forms(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword base = StarRuins(GalaxyStar(i), 'PB');",
+            "if(!base || ShipTypeN(base) != t_PB) exit;",
+            "dword dom = StarRuins(known_star, 'PB');",
+            "if(dom && ranger && RelationToRanger(dom, ranger) == 100) result = 1;",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("nested-handles.rson")))
+        codes = {issue.code for issue in issues}
+        self.assertIn("runtime-object-api-without-explicit-guard", codes)
+        self.assertIn("runtime-object-api-behind-boolean-guard", codes)
+        self.assertIn("runtime-redundant-star-ruins-type-dereference", codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword star = GalaxyStar(i);",
+            "if(!star) exit;",
+            "dword base = StarRuins(star, 'PB');",
+            "if(!base) exit;",
+            "if(base && condition && RelationToRanger(base, ranger) == 100) result = 1;",
+        ]
+        guarded_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("prior-guard.rson")))
+        }
+        self.assertNotIn("runtime-object-api-without-explicit-guard", guarded_codes)
+        self.assertNotIn("runtime-object-api-behind-boolean-guard", guarded_codes)
+
+    def test_nullable_handle_allows_api_in_separately_guarded_if_body(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword star = GalaxyStar(i);",
+            "if(star) result = StarOwner(star);",
+            "dword base = StarRuins(known_star, 'PB');",
+            "if(base) result = Id(base);",
+            "dword other_star = GalaxyStar(i + 1);",
+            "if(other_star)",
+            "    result = StarName(other_star);",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("guarded-body.rson")))
+        }
+        self.assertNotIn("runtime-object-api-without-explicit-guard", codes)
+
+    def test_dialog_injection_reports_late_persistent_turn_gate_as_advisory(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "panel_initialized", "Init": "0", "#": 4}
+        ]
+        group["Operations"][1]["Code"].append("panel_initialized = 1;")
+        group["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "DialogBegin",
+                "Parent": -1,
+                "#": 5,
+                "Code.Type": "DialogBegin",
+                "Code": [
+                    "if(panel_initialized)",
+                    "{",
+                    "    AddDialogInject('ControlPanel', '', 'Open', 60);",
+                    "}",
+                ],
+            }
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("late-dialog.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-dialog-inject-delayed-persistent-gate"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "info")
+
+        group["Operations"][-1]["Code"].insert(0, "panel_initialized = 1;")
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("local-dialog-gate.rson")))
+        }
+        self.assertNotIn("runtime-dialog-inject-delayed-persistent-gate", safe_codes)
+
     def test_dialog_forward_reference_to_persistent_array_is_blocked(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]

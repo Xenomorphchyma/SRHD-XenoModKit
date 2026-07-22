@@ -13,9 +13,11 @@ from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, load_rson
 from srhd_modkit.scripts import inspect_scr
 from srhd_modkit.toolchain import (
     Toolchain,
+    _decompiled_runtime_issue,
     _rscript_failure_diagnostic,
     _rscript_timeout_policy,
 )
+from srhd_modkit.runtime_lint import RuntimeIssue
 
 
 PROJECT = {
@@ -41,6 +43,21 @@ PROJECT = {
 
 
 class ToolchainWorkflowTests(unittest.TestCase):
+    def test_decompiled_runtime_issues_keep_analysis_provenance(self) -> None:
+        sensitive = _decompiled_runtime_issue(
+            RuntimeIssue(
+                "warning",
+                "runtime-turn-direct-world-access",
+                "canonical graph may lose the source gate",
+            )
+        )
+        regular = _decompiled_runtime_issue(
+            RuntimeIssue("error", "runtime-object-api-without-explicit-guard", "unsafe")
+        )
+        self.assertEqual(sensitive["analysis_origin"], "decompiled-rson")
+        self.assertTrue(sensitive["canonicalization_sensitive"])
+        self.assertFalse(regular["canonicalization_sensitive"])
+
     def test_progress_timeout_scales_and_zero_disables_deadlines(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

@@ -421,14 +421,56 @@ _OBJECT_API_ARGUMENTS: dict[str, tuple[int, ...]] = {
     "id": (0,),
     "itemexist": (0,),
     "planettostar": (0,),
+    "relationtoranger": (0, 1),
     "shipcanjump": (0, 1, 2),
+    "shipowner": (0,),
     "shipstar": (0,),
     "shipistakeoff": (0,),
     "shipinnormalspace": (0,),
+    "shiptypen": (0,),
     "starowner": (0,),
     "starplanets": (0,),
+    "starruins": (0,),
     "starships": (0,),
 }
+
+
+# Only producers whose nullable/raw return behaviour is confirmed by game
+# runtime evidence belong here.  Keeping the table explicit avoids guessing
+# from function-name prefixes while still letting the data-flow rule apply to
+# every mod and every executable RSON field.
+_NULLABLE_HANDLE_PRODUCERS: dict[str, str] = {
+    "galaxystar": "star",
+    "starruins": "ship",
+}
+
+_NULLABLE_HANDLE_CONSUMERS: dict[str, dict[int, frozenset[str]]] = {
+    "id": {0: frozenset({"ship", "star"})},
+    "relationtoranger": {
+        0: frozenset({"ship"}),
+        1: frozenset({"ship"}),
+    },
+    "shipowner": {0: frozenset({"ship"})},
+    "shipstar": {0: frozenset({"ship"})},
+    "shiptypen": {0: frozenset({"ship"})},
+    "starbattle": {0: frozenset({"star"})},
+    "starenemythreatlevel": {0: frozenset({"star"})},
+    "starname": {0: frozenset({"star"})},
+    "starnearbystars": {0: frozenset({"star"})},
+    "starowner": {0: frozenset({"star"})},
+    "starplanets": {0: frozenset({"star"})},
+    "starruins": {0: frozenset({"star"})},
+    "starships": {0: frozenset({"star"})},
+}
+
+
+@dataclass(frozen=True)
+class _NullableHandleOrigin:
+    kind: str
+    producer: str
+    line_offset: int
+    type_selector: str | None = None
+    proven_nonzero: bool = False
 
 
 def _iter_parsed_calls(text: str, function_name: str) -> Iterable[tuple[int, list[str], int]]:
@@ -461,6 +503,52 @@ def _boolean_statement(masked: str, position: int) -> tuple[int, int, str]:
     return start, end, masked[start:end]
 
 
+def _call_is_inside_leading_control_condition(statement: str, relative: int) -> bool | None:
+    """Distinguish an if/while condition from its unbraced body statement."""
+
+    match = re.match(r"\s*(?:if|while|for)\s*\(", statement, re.IGNORECASE)
+    if not match:
+        return None
+    depth = 1
+    close = -1
+    for index in range(match.end(), len(statement)):
+        if statement[index] == "(":
+            depth += 1
+        elif statement[index] == ")":
+            depth -= 1
+            if depth == 0:
+                close = index
+                break
+    if close < 0:
+        return None
+    return match.end() <= relative < close
+
+
+def _same_line_positive_control_guard(
+    masked_line: str,
+    call_position: int,
+    variable: str,
+) -> bool:
+    """Recognize ``if(object) Api(object);`` without treating && as proof."""
+
+    match = re.match(r"\s*if\s*\(", masked_line, re.IGNORECASE)
+    if not match:
+        return False
+    depth = 1
+    close = -1
+    for index in range(match.end(), len(masked_line)):
+        if masked_line[index] == "(":
+            depth += 1
+        elif masked_line[index] == ")":
+            depth -= 1
+            if depth == 0:
+                close = index
+                break
+    if close < 0 or call_position <= close:
+        return False
+    return _positive_object_condition(masked_line[match.end() : close], variable)
+
+
 def _same_expression_null_guard(expression: str, variable: str) -> bool:
     wanted = re.escape(variable)
     return bool(
@@ -483,18 +571,117 @@ def _same_expression_positive_guard(expression: str, variable: str) -> bool:
     )
 
 
-def _lint_object_api_behind_boolean_guard(project: RsonProject) -> list[RuntimeIssue]:
+def _negative_null_condition(condition: str, variable: str) -> bool:
+    wanted = re.escape(variable)
+    value = condition.strip()
+    return bool(
+        re.fullmatch(
+            rf"(?:!\s*{wanted}|{wanted}\s*(?:==|<=)\s*0|0\s*(?:==|>=)\s*{wanted})",
+            value,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _positive_object_condition(condition: str, variable: str) -> bool:
+    wanted = re.escape(variable)
+    value = condition.strip()
+    return bool(
+        re.fullmatch(
+            rf"(?:{wanted}|{wanted}\s*(?:!=|>)\s*0|0\s*(?:!=|<)\s*{wanted})",
+            value,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _has_explicit_object_guard(
+    block: FunctionBlock,
+    line_offset: int,
+    variable: str,
+    *,
+    after_line: int = 0,
+) -> bool:
+    """Prove a separate dominating null guard before an object dereference."""
+
+    lines = block.lines
+    depths = _line_depths(lines)
+    first = max(1, after_line + 1)
+
+    # Early-exit form: ``if(!object) continue/exit/return;``.  The condition
+    # must be only the null test; an &&/|| neighbour is deliberately not used
+    # as proof because RScript does not guarantee lazy boolean evaluation.
+    for index in range(first, line_offset):
+        window = "\n".join(lines[index : min(line_offset, index + 8)])
+        condition = _exiting_if_condition(window)
+        if condition is None or not _negative_null_condition(condition, variable):
+            continue
+        if depths[index] > depths[line_offset] or _variable_reassigned(
+            lines, variable, index + 1, line_offset + 1
+        ):
+            continue
+        return True
+
+    # Enclosing positive branch: ``if(object) { ... dereference ... }``.
+    for index in range(first, line_offset):
+        control = re.match(
+            r"\s*if\s*\(([^()]*)\)\s*(.*)$",
+            _mask_non_code(lines[index]),
+            re.IGNORECASE,
+        )
+        if control is None or not _positive_object_condition(control.group(1), variable):
+            continue
+        remainder = control.group(2).strip()
+        if remainder.startswith("{"):
+            if _brace_block_end(lines, index) < line_offset:
+                continue
+        elif remainder:
+            # The one unbraced body statement is already on the guard line,
+            # so it cannot dominate a later call.
+            continue
+        else:
+            next_statement = next(
+                (
+                    candidate
+                    for candidate in range(index + 1, line_offset + 1)
+                    if _mask_non_code(lines[candidate]).strip()
+                ),
+                -1,
+            )
+            if next_statement < 0:
+                continue
+            if _mask_non_code(lines[next_statement]).lstrip().startswith("{"):
+                if _brace_block_end(lines, next_statement) < line_offset:
+                    continue
+            elif next_statement != line_offset:
+                continue
+        if _variable_reassigned(lines, variable, index + 1, line_offset + 1):
+            continue
+        return True
+    return False
+
+
+def _lint_object_api_behind_boolean_guard(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
     """Do not treat neighbouring &&/|| operands as lazy safety guards."""
 
     path = str(project.path) if project.path else None
     issues: list[RuntimeIssue] = []
-    for container in _iter_code_containers(project):
-        text = "\n".join(container.lines)
+    for block in _runtime_analysis_blocks(project, functions).values():
+        text = "\n".join(block.lines[1:])
         masked = _mask_non_code(text)
         reported: set[tuple[int, str, str]] = set()
         for call, indexes in _OBJECT_API_ARGUMENTS.items():
             for position, arguments, _end in _iter_parsed_calls(text, call):
                 statement_start, _statement_end, statement = _boolean_statement(masked, position)
+                in_control_condition = _call_is_inside_leading_control_condition(
+                    statement,
+                    position - statement_start,
+                )
+                if in_control_condition is False:
+                    continue
                 if "&&" not in statement and "||" not in statement:
                     continue
                 for index in indexes:
@@ -511,6 +698,8 @@ def _lint_object_api_behind_boolean_guard(project: RsonProject) -> list[RuntimeI
                     if not guarded:
                         continue
                     line_number = text.count("\n", 0, position) + 1
+                    if _has_explicit_object_guard(block, line_number, variable):
+                        continue
                     key = (line_number, call, variable)
                     if key in reported:
                         continue
@@ -521,10 +710,165 @@ def _lint_object_api_behind_boolean_guard(project: RsonProject) -> list[RuntimeI
                             "runtime-object-api-behind-boolean-guard",
                             f"{call} получает объект {variable}, безопасность которого доказывается только соседним операндом &&/||. RScript runtime не гарантирует короткое замыкание; вынесите проверку объекта в отдельный предшествующий if/exit, а вызов API — в следующую инструкцию",
                             path,
-                            f"{container.location}:{line_number}",
-                            container.lines[line_number - 1].strip(),
+                            f"{block.location} line {block.start_line + line_number}",
+                            block.lines[line_number].strip(),
                         )
                     )
+    return issues
+
+
+def _nullable_handle_producer(expression: str) -> tuple[str, str | None] | None:
+    """Return a confirmed nullable producer when it is the outer assignment call."""
+
+    raw = expression.strip()
+    masked = _mask_non_code(raw).strip()
+    match = CALL_RE.match(masked)
+    if not match:
+        return None
+    producer = match.group(1).casefold()
+    if producer not in _NULLABLE_HANDLE_PRODUCERS:
+        return None
+    parsed = _call_arguments(raw, producer)
+    if not parsed:
+        return None
+    arguments = parsed[0][1]
+    selector = _literal_string(arguments[1]) if producer == "starruins" and len(arguments) > 1 else None
+    return producer, selector
+
+
+def _argument_contains_nullable_producer(argument: str, kinds: frozenset[str]) -> str | None:
+    calls = {call.casefold() for call in _calls(argument)}
+    return next(
+        (
+            producer
+            for producer, kind in _NULLABLE_HANDLE_PRODUCERS.items()
+            if producer in calls and kind in kinds
+        ),
+        None,
+    )
+
+
+def _lint_nullable_handle_dereferences(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Require a separate null guard between a raw handle producer and consumer."""
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool|unknown)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    reported: set[tuple[str, int, str, str]] = set()
+    redundant_reported: set[tuple[str, int, str]] = set()
+
+    for block in _runtime_analysis_blocks(project, functions).values():
+        origins: dict[str, _NullableHandleOrigin] = {}
+        for line_offset, line in enumerate(block.lines[1:], start=1):
+            masked = _mask_non_code(line)
+
+            for position, call, arguments in _line_call_sites(masked):
+                constraints = _NULLABLE_HANDLE_CONSUMERS.get(call, {})
+                for argument_index, kinds in constraints.items():
+                    if argument_index >= len(arguments):
+                        continue
+                    argument = arguments[argument_index]
+                    variable = _simple_identifier(argument)
+                    origin = origins.get(variable) if variable is not None else None
+                    producer = None
+                    guarded = False
+                    if origin is not None and origin.kind in kinds:
+                        producer = origin.producer
+                        guarded = (
+                            origin.proven_nonzero
+                            or _same_line_positive_control_guard(masked, position, variable)
+                            or _has_explicit_object_guard(
+                                block,
+                                line_offset,
+                                variable,
+                                after_line=origin.line_offset,
+                            )
+                        )
+                    elif variable is None:
+                        producer = _argument_contains_nullable_producer(argument, kinds)
+
+                    if producer is not None and not guarded:
+                        label = variable or f"результат {producer}"
+                        key = (block.name.casefold(), line_offset, call, label)
+                        if key not in reported:
+                            reported.add(key)
+                            issues.append(
+                                RuntimeIssue(
+                                    "error",
+                                    "runtime-object-api-without-explicit-guard",
+                                    f"{call} разыменовывает {label}, полученный через nullable/raw producer {producer}, без отдельного доминирующего null-guard. Сначала завершите if(!object) continue/exit/return, затем вызывайте объектный API",
+                                    path,
+                                    f"{block.location} line {block.start_line + line_offset}",
+                                    line.strip(),
+                                )
+                            )
+
+                    selector = origin.type_selector if origin is not None else None
+                    direct_starruins = "starruins" in {
+                        value.casefold() for value in _calls(argument)
+                    }
+                    if call == "shiptypen" and (
+                        (origin is not None and origin.producer == "starruins" and selector is not None)
+                        or direct_starruins
+                    ):
+                        key = (block.name.casefold(), line_offset, variable or "<expression>")
+                        if key not in redundant_reported:
+                            redundant_reported.add(key)
+                            detail = f" с селектором {selector!r}" if selector is not None else " с типовым селектором"
+                            issues.append(
+                                RuntimeIssue(
+                                    "warning",
+                                    "runtime-redundant-star-ruins-type-dereference",
+                                    f"ShipTypeN повторно разыменовывает результат StarRuins{detail}; StarRuins уже выполняет типизированный поиск. После отдельного null-guard используйте найденный объект без лишнего ShipTypeN",
+                                    path,
+                                    f"{block.location} line {block.start_line + line_offset}",
+                                    line.strip(),
+                                )
+                            )
+
+            # Apply assignments only after calls on this line were checked so
+            # a right-hand consumer still sees the previous value of a target.
+            for match in assignment.finditer(masked):
+                target = match.group(1).casefold()
+                # ``masked`` preserves offsets but blanks string contents; use
+                # the original slice so StarRuins' literal type selector is
+                # retained for the redundant ShipTypeN diagnostic.
+                expression = line[match.start(2) : match.end(2)].strip()
+                producer = _nullable_handle_producer(expression)
+                if producer is not None:
+                    producer_name, selector = producer
+                    origins[target] = _NullableHandleOrigin(
+                        _NULLABLE_HANDLE_PRODUCERS[producer_name],
+                        producer_name,
+                        line_offset,
+                        selector,
+                    )
+                    continue
+                alias = _simple_identifier(expression)
+                source = origins.get(alias) if alias is not None else None
+                if source is not None:
+                    origins[target] = _NullableHandleOrigin(
+                        source.kind,
+                        source.producer,
+                        line_offset,
+                        source.type_selector,
+                        source.proven_nonzero
+                        or _has_explicit_object_guard(
+                            block,
+                            line_offset,
+                            alias,
+                            after_line=source.line_offset,
+                        ),
+                    )
+                else:
+                    origins.pop(target, None)
     return issues
 
 
@@ -4508,6 +4852,91 @@ def _lint_dialog_semantics(project: RsonProject) -> list[RuntimeIssue]:
     return issues
 
 
+def _lint_delayed_dialog_injection(project: RsonProject) -> list[RuntimeIssue]:
+    """Flag UI injection gated only by state initialized in a later handler.
+
+    This is deliberately informational: a delayed story dialog can be
+    intentional, but a debug/control panel commonly becomes unavailable on
+    the first visit when its persistent gate is set only by Turn code.
+    """
+
+    path = str(project.path) if project.path else None
+    persistent = _shared_tvars(project)
+    assigned_one_in: dict[str, set[str]] = {name: set() for name in persistent}
+    containers = list(_iter_code_containers(project))
+    for container in containers:
+        code_type = container.code_type or container.field.casefold()
+        text = _mask_non_code("\n".join(container.lines))
+        for match in ASSIGN_ONE_RE.finditer(text):
+            variable = match.group(1).casefold()
+            if variable in assigned_one_in:
+                assigned_one_in[variable].add(code_type)
+
+    issues: list[RuntimeIssue] = []
+    for container in containers:
+        if container.code_type != "dialogbegin":
+            continue
+        for line_index, line in enumerate(container.lines):
+            masked = _mask_non_code(line)
+            injections = [
+                position
+                for position, call, _arguments in _line_call_sites(masked)
+                if call == "adddialoginject"
+            ]
+            if not injections:
+                continue
+            guarded_by: set[str] = set()
+            for index in range(0, line_index + 1):
+                control = re.match(
+                    r"\s*if\s*\(([^()]*)\)\s*(.*)$",
+                    _mask_non_code(container.lines[index]),
+                    re.IGNORECASE,
+                )
+                if control is None:
+                    continue
+                variable = _simple_identifier(control.group(1))
+                if variable not in persistent:
+                    continue
+                remainder = control.group(2).strip()
+                if index == line_index:
+                    if any(position > control.end(1) for position in injections):
+                        guarded_by.add(variable)
+                elif remainder.startswith("{") and _brace_block_end(container.lines, index) >= line_index:
+                    guarded_by.add(variable)
+                elif not remainder:
+                    next_statement = next(
+                        (
+                            candidate
+                            for candidate in range(index + 1, line_index + 1)
+                            if _mask_non_code(container.lines[candidate]).strip()
+                        ),
+                        -1,
+                    )
+                    if next_statement >= 0 and _mask_non_code(
+                        container.lines[next_statement]
+                    ).lstrip().startswith("{"):
+                        if _brace_block_end(container.lines, next_statement) >= line_index:
+                            guarded_by.add(variable)
+                    elif next_statement == line_index:
+                        guarded_by.add(variable)
+
+            for variable in sorted(guarded_by):
+                assignment_types = assigned_one_in.get(variable, set())
+                if "dialogbegin" in assignment_types or "turn" not in assignment_types:
+                    continue
+                issues.append(
+                    RuntimeIssue(
+                        "info",
+                        "runtime-dialog-inject-delayed-persistent-gate",
+                        f"AddDialogInject защищён persistent-флагом {variable}, который устанавливается только в Turn-коде. На первом открытии интерфейса инъекция может отсутствовать или появиться на ход позже; проверьте, что задержка намеренна, либо отделите доступность UI от поздней игровой инициализации",
+                        path,
+                        f"{container.location}:{line_index + 1}",
+                        line.strip(),
+                    )
+                )
+    return issues
+
+
 def _constant_ether_id(expression: str) -> str | None:
     literal = _literal_string(expression)
     if literal is not None:
@@ -4620,12 +5049,14 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     issues.extend(_lint_cross_block_calls(project, functions))
     issues.extend(_lint_unavailable_engine_calls(project, functions))
     issues.extend(_lint_unresolved_user_functions(project, functions))
-    issues.extend(_lint_object_api_behind_boolean_guard(project))
+    issues.extend(_lint_object_api_behind_boolean_guard(project, functions))
+    issues.extend(_lint_nullable_handle_dereferences(project, functions))
     issues.extend(_lint_duplicate_local_declarations(project))
     issues.extend(_lint_rscript_arrays(project))
     issues.extend(_lint_dialog_persistent_arrays(project))
     issues.extend(_lint_persistent_array_migrations(project))
     issues.extend(_lint_dialog_semantics(project))
+    issues.extend(_lint_delayed_dialog_injection(project))
     issues.extend(_lint_rndobject_anchor_types(project, functions))
     issues.extend(_lint_id_to_ship_guards(project, functions))
     issues.extend(_lint_suppressed_shipjoin_state(project, functions))

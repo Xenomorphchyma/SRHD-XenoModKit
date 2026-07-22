@@ -31,6 +31,21 @@ from .legacy_manifest import ensure_legacy_codepage_executable
 
 EMPTY_RSCRIPT_LANG_DAT = b"\xff\xfe"
 MIN_RSCRIPT_ADAPTIVE_TIMEOUT = 600.0
+_DECOMPILE_CANONICALIZATION_SENSITIVE_RUNTIME_CODES = frozenset(
+    {"runtime-turn-direct-world-access"}
+)
+
+
+def _decompiled_runtime_issue(issue: Any) -> dict[str, Any]:
+    """Tag lint evidence recovered from SCR instead of authored RSON."""
+
+    return {
+        **issue.as_dict(),
+        "analysis_origin": "decompiled-rson",
+        "canonicalization_sensitive": (
+            issue.code in _DECOMPILE_CANONICALIZATION_SENSITIVE_RUNTIME_CODES
+        ),
+    }
 
 
 def _rscript_timeout_policy(
@@ -829,7 +844,13 @@ class Toolchain:
                     "diagnostic": diagnostic,
                 },
                 "validation_issues": [item.as_dict() for item in (validation_issues or [])],
-                "runtime_issues": [issue.as_dict() for issue in runtime_issues],
+                "runtime_analysis": {
+                    "origin": "decompiled-rson",
+                    "canonicalization_sensitive_codes": sorted(
+                        _DECOMPILE_CANONICALIZATION_SENSITIVE_RUNTIME_CODES
+                    ),
+                },
+                "runtime_issues": [_decompiled_runtime_issue(issue) for issue in runtime_issues],
                 "timeouts": {
                     "decompile": decompile_policy,
                     "roundtrip": roundtrip_policy,
@@ -1137,7 +1158,13 @@ class Toolchain:
             },
             "phases": phases,
             "stale_transactions_removed": stale_transactions_removed,
-            "runtime_issues": [issue.as_dict() for issue in runtime_issues],
+            "runtime_analysis": {
+                "origin": "decompiled-rson",
+                "canonicalization_sensitive_codes": sorted(
+                    _DECOMPILE_CANONICALIZATION_SENSITIVE_RUNTIME_CODES
+                ),
+            },
+            "runtime_issues": [_decompiled_runtime_issue(issue) for issue in runtime_issues],
         }
 
     def compare_scr(
@@ -1198,6 +1225,7 @@ class Toolchain:
                         "recovered_project",
                         "roundtrip",
                         "deep_roundtrip",
+                        "runtime_analysis",
                         "runtime_issues",
                         "phases",
                         "error",
