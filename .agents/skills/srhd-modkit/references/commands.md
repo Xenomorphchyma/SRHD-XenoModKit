@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.9.4
+# Команды SRHD ModKit 0.9.5
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -43,6 +43,7 @@ python -B srhd.py script decompile "<WORK>/Script.scr" "<OUT>/Script.rson" --lan
 python -B srhd.py script decompile "<WORK>/Script.scr" "<OUT>/Script.rson" --lang-dat "<WORK>/Lang.dat" --fallback-without-lang --json
 python -B srhd.py script decompile "<WORK>/Script.scr" "<OUT>/Script.rson" --deep-roundtrip --json
 python -B srhd.py script compare-scr "<WORK>/Original.scr" "<WORK>/Patched.scr" --json
+python -B srhd.py script compare-storage "<WORK>/Old.rson" "<WORK>/New.rson" --json
 python -B srhd.py script inspect-scr "<OUT>/Script.scr" --json
 ```
 

@@ -33,9 +33,12 @@ from .resources import (
     verify_resource,
 )
 from .runtime_lint import (
+    LiteralCTReference,
     RuntimeIssue,
     compare_storage_schemas,
     dialog_semantic_map,
+    lint_literal_ct_keys,
+    literal_ct_references,
     lint_main_runtime,
     lint_module_runtime,
     lint_rson_runtime,
@@ -137,8 +140,11 @@ __all__ = [
     "inspect_resource",
     "verify_resource",
     "RuntimeIssue",
+    "LiteralCTReference",
     "compare_storage_schemas",
     "dialog_semantic_map",
+    "literal_ct_references",
+    "lint_literal_ct_keys",
     "lint_main_runtime",
     "lint_module_runtime",
     "lint_rson_runtime",
@@ -203,4 +209,4 @@ __all__ = [
     "build_quest_from_json",
 ]
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"

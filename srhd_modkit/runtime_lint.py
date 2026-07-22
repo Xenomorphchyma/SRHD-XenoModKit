@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 from .blockpar import BlockParDocument, BlockParNode
 from .models import ModuleInfo
@@ -81,6 +81,18 @@ class RuntimeIssue:
     path: str | None = None
     location: str | None = None
     evidence: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class LiteralCTReference:
+    key: str
+    path: str | None
+    location: str
+    evidence: str
+    nonempty_sinks: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1289,6 +1301,555 @@ def _newarray_initialized_names(project: RsonProject) -> set[str]:
                 for match in assignment.finditer(_mask_non_code(line))
             )
     return result
+
+
+def _declared_newarray_names(project: RsonProject) -> set[str]:
+    """Return TVars whose graph declaration always creates an array.
+
+    Unlike :func:`_newarray_initialized_names`, this deliberately ignores
+    assignments in executable code.  A ``newarray`` hidden in a migration or
+    another branch does not prove that a clean-start path initialized the
+    value before its first ``Array*`` call.
+    """
+
+    return {
+        str(item.get("Name", "")).strip().casefold()
+        for item in project.iter_objects()
+        if str(item.get("Type", "")).casefold() == "tvar"
+        and str(item.get("Name", "")).strip()
+        and re.search(r"\bnewarray\s*\(", str(item.get("Init", "")), re.IGNORECASE)
+    }
+
+
+_NEWARRAY_ASSIGNMENT_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*newarray\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _condition_sets_for_lines(
+    lines: tuple[str, ...],
+    targets: set[int],
+) -> dict[int, frozenset[str]]:
+    """Return exact enclosing if conditions for selected source lines."""
+
+    result: dict[int, set[str]] = {target: set() for target in targets}
+    for index, line in enumerate(lines):
+        if not re.search(r"\bif\s*\(", _mask_non_code(line), re.IGNORECASE):
+            continue
+        condition = _first_if_condition("\n".join(lines[index : min(len(lines), index + 8)]))
+        body = _statement_body_range(lines, index)
+        if condition is None or body is None:
+            continue
+        normalized = re.sub(r"\s+", "", _mask_non_code(condition)).casefold()
+        for target in targets:
+            if body[0] <= target <= body[1]:
+                result[target].add(normalized)
+    return {index: frozenset(values) for index, values in result.items()}
+
+
+def _lint_array_initialization_paths(project: RsonProject) -> list[RuntimeIssue]:
+    """Find partial array initializers that rely on unrelated migrations.
+
+    The old check accepted a persistent array when ``newarray`` appeared
+    anywhere in the RSON.  That is unsound: an old-save migration may allocate
+    a value while a clean-start initializer reaches ``ArrayClear`` first.  A
+    block that allocates at least one persistent array is treated as an array
+    initializer and every Array* use in it must be dominated by an allocation
+    of the same value (or by a graph-level TVar initializer).
+    """
+
+    functions, _duplicates = _extract_functions(project)
+    # Function boundaries are stable scopes for this proof.  A handler segment
+    # can legitimately mix first-run branches with steady-state code executed
+    # on later turns, so treating the whole segment as one initializer creates
+    # false positives.
+    blocks = functions
+    shared = _shared_tvars(project)
+    declared = _declared_newarray_names(project)
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[str, str]] = set()
+
+    for block in blocks.values():
+        allocation_matches: dict[int, list[re.Match[str]]] = {}
+        call_sites_by_line: dict[int, list[tuple[int, str, list[str]]]] = {}
+        for line_index, line in enumerate(block.lines[1:], start=1):
+            masked = _mask_non_code(line)
+            matches = list(_NEWARRAY_ASSIGNMENT_RE.finditer(masked))
+            if matches:
+                allocation_matches[line_index] = matches
+            call_sites = [
+                value for value in _line_call_sites(masked)
+                if value[1] in _RSCRIPT_ARRAY_CALLS and value[2]
+            ]
+            if call_sites:
+                call_sites_by_line[line_index] = call_sites
+        conditions_by_line = _condition_sets_for_lines(
+            block.lines,
+            set(allocation_matches) | set(call_sites_by_line),
+        )
+        allocations: dict[str, list[tuple[int, int, frozenset[str]]]] = {}
+        for line_index, matches in allocation_matches.items():
+            conditions = conditions_by_line.get(line_index, frozenset())
+            for match in matches:
+                name = match.group(1).casefold()
+                if name in shared:
+                    allocations.setdefault(name, []).append(
+                        (line_index, match.start(), conditions)
+                    )
+        if not allocations:
+            continue
+
+        for line_index, call_sites in call_sites_by_line.items():
+            line = block.lines[line_index]
+            use_conditions = conditions_by_line.get(line_index, frozenset())
+            for position, call, arguments in call_sites:
+                name = _simple_identifier(arguments[0])
+                if name not in shared or name in declared:
+                    continue
+                dominates = any(
+                    (assignment_line < line_index or (
+                        assignment_line == line_index and assignment_position < position
+                    ))
+                    and assignment_conditions.issubset(use_conditions)
+                    for assignment_line, assignment_position, assignment_conditions
+                    in allocations.get(name, ())
+                )
+                if dominates:
+                    continue
+                key = (block.name, name)
+                if key in reported:
+                    continue
+                reported.add(key)
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-persistent-array-use-before-newarray",
+                        f"Функция/обработчик {block.name} инициализирует persistent-массивы, но {call}({name}) достижим без предшествующего newarray(...) того же массива. newarray в другой миграции или ветви не защищает чистый запуск; игра завершит Turn с 'ArrayClear - not array' или аналогичной ошибкой",
+                        path,
+                        f"{block.location} line {block.start_line + line_index}",
+                        line.strip(),
+                    )
+                )
+    return issues
+
+
+def _array_allocation_sizes(project: RsonProject) -> dict[str, set[int]]:
+    result: dict[str, set[int]] = {}
+    direct = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*newarray\s*\(\s*([+-]?\d+)\s*\)",
+        re.IGNORECASE,
+    )
+    for item in project.iter_objects():
+        if str(item.get("Type", "")).casefold() != "tvar":
+            continue
+        name = str(item.get("Name", "")).strip().casefold()
+        init = str(item.get("Init", ""))
+        match = re.fullmatch(r"\s*newarray\s*\(\s*([+-]?\d+)\s*\)\s*;?\s*", init, re.IGNORECASE)
+        if name and match:
+            result.setdefault(name, set()).add(int(match.group(1)))
+    for container in _iter_code_containers(project):
+        for line in container.lines:
+            for match in direct.finditer(_mask_non_code(line)):
+                result.setdefault(match.group(1).casefold(), set()).add(int(match.group(2)))
+    return result
+
+
+def _numeric_variable_bounds(project: RsonProject) -> dict[str, tuple[int, int]]:
+    """Collect conservative literal/RndObject ranges used by loop contracts."""
+
+    values: dict[str, list[tuple[int, int]]] = {}
+    assignment = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+
+    def remember(name: str, low: int, high: int) -> None:
+        values.setdefault(name.casefold(), []).append((min(low, high), max(low, high)))
+
+    for item in project.iter_objects():
+        if str(item.get("Type", "")).casefold() != "tvar":
+            continue
+        name = str(item.get("Name", "")).strip()
+        value = _constant_int(str(item.get("Init", "")))
+        if name and value is not None:
+            remember(name, value, value)
+    for container in _iter_code_containers(project):
+        for line in container.lines:
+            masked = _mask_non_code(line)
+            for match in assignment.finditer(masked):
+                expression = match.group(2).strip()
+                literal = _constant_int(expression)
+                if literal is not None:
+                    remember(match.group(1), literal, literal)
+                    continue
+                calls = _call_arguments(expression, "RndObject")
+                if not calls or len(calls[0][1]) < 2:
+                    continue
+                low = _constant_int(calls[0][1][0])
+                high = _constant_int(calls[0][1][1])
+                if low is not None and high is not None:
+                    remember(match.group(1), low, high)
+    return {
+        name: (min(low for low, _high in ranges), max(high for _low, high in ranges))
+        for name, ranges in values.items()
+    }
+
+
+def _statement_body_range(lines: tuple[str, ...], header: int) -> tuple[int, int] | None:
+    """Return the body range of a braced or single-statement control line."""
+
+    masked = _mask_non_code(lines[header])
+    if "{" in masked:
+        return header, _brace_block_end(lines, header)
+    index = header + 1
+    while index < len(lines) and not _mask_non_code(lines[index]).strip():
+        index += 1
+    if index >= len(lines):
+        return None
+    if "{" in _mask_non_code(lines[index]):
+        return index, _brace_block_end(lines, index)
+    return index, index
+
+
+def _simple_for_range(
+    line: str,
+    bounds: dict[str, tuple[int, int]],
+) -> tuple[str, int, int] | None:
+    match = re.search(r"\bfor\s*\((.*)\)", _mask_non_code(line), re.IGNORECASE)
+    if not match:
+        return None
+    clauses = match.group(1).split(";")
+    if len(clauses) != 3:
+        return None
+    initial = re.fullmatch(
+        r"\s*(?:int\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([+-]?\d+)\s*",
+        clauses[0],
+        re.IGNORECASE,
+    )
+    if not initial:
+        return None
+    iterator = initial.group(1).casefold()
+    low = int(initial.group(2))
+    condition = re.fullmatch(
+        rf"\s*{re.escape(iterator)}\s*(<=|<)\s*([A-Za-z_][A-Za-z0-9_]*|[+-]?\d+)\s*",
+        clauses[1],
+        re.IGNORECASE,
+    )
+    if not condition:
+        return None
+    raw_bound = condition.group(2)
+    if re.fullmatch(r"[+-]?\d+", raw_bound):
+        high = int(raw_bound)
+    else:
+        known = bounds.get(raw_bound.casefold())
+        if known is None:
+            return None
+        high = known[1]
+    if condition.group(1) == "<":
+        high -= 1
+    increment = re.sub(r"\s+", "", clauses[2]).casefold()
+    if increment not in {
+        f"{iterator}={iterator}+1",
+        f"{iterator}++",
+        f"++{iterator}",
+    }:
+        return None
+    return iterator, low, high
+
+
+def _loop_ranges_by_line(
+    lines: tuple[str, ...],
+    bounds: dict[str, tuple[int, int]],
+    fixed_sizes: Mapping[str, int] | None = None,
+) -> dict[int, dict[str, tuple[int, int]]]:
+    result: dict[int, dict[str, tuple[int, int]]] = {}
+    for index, line in enumerate(lines):
+        loop = _simple_for_range(line, bounds)
+        if loop is None and fixed_sizes:
+            match = re.search(
+                r"\bfor\s*\(\s*(?:int\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([+-]?\d+)\s*;\s*"
+                r"\1\s*<\s*ArrayDim\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+                _mask_non_code(line),
+                re.IGNORECASE,
+            )
+            if match and match.group(3).casefold() in fixed_sizes:
+                loop = (
+                    match.group(1).casefold(),
+                    int(match.group(2)),
+                    fixed_sizes[match.group(3).casefold()] - 1,
+                )
+        body = _statement_body_range(lines, index) if loop else None
+        if not loop or not body:
+            continue
+        iterator, low, high = loop
+        for body_index in range(body[0], body[1] + 1):
+            result.setdefault(body_index, {})[iterator] = (low, high)
+    return result
+
+
+def _index_range(
+    expression: str,
+    local_ranges: dict[str, tuple[int, int]],
+    bounds: dict[str, tuple[int, int]],
+) -> tuple[int, int] | None:
+    folded = re.sub(r"\s+", "", expression).casefold()
+    literal = _constant_int(folded)
+    if literal is not None:
+        return literal, literal
+    affine = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)([+-]\d+)?", folded)
+    if not affine:
+        return None
+    base = local_ranges.get(affine.group(1)) or bounds.get(affine.group(1))
+    if base is None:
+        return None
+    offset = int(affine.group(2) or "0")
+    return base[0] + offset, base[1] + offset
+
+
+def _typed_scalar_expression(expression: str) -> bool:
+    folded = _mask_non_code(expression).strip()
+    if _constant_int(folded) is not None:
+        return True
+    if re.search(r"\b(?:Id|CurTurn)\s*\(", folded, re.IGNORECASE):
+        return True
+    return bool(re.fullmatch(r"[+\-\d\s()*/%]+", folded))
+
+
+def _lint_fixed_array_contracts(project: RsonProject) -> list[RuntimeIssue]:
+    """Validate typed slots and statically provable bounds of newarray(N>1)."""
+
+    sizes = {
+        name: next(iter(values))
+        for name, values in _array_allocation_sizes(project).items()
+        if len(values) == 1 and next(iter(values)) > 1
+    }
+    if not sizes:
+        return []
+    path = str(project.path) if project.path else None
+    bounds = _numeric_variable_bounds(project)
+    functions, _duplicates = _extract_functions(project)
+    blocks = _runtime_analysis_blocks(project, functions)
+    shared = _shared_tvars(project)
+    typed_by_allocation: dict[str, list[set[int]]] = {name: [] for name in sizes}
+    read_slots: dict[str, set[int] | None] = {name: set() for name in sizes}
+    issues: list[RuntimeIssue] = []
+    reported_bounds: set[tuple[str, int, str]] = set()
+
+    indexed = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([^]]+)\s*\]")
+    allocation = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*newarray\s*\(\s*([+-]?\d+)\s*\)",
+        re.IGNORECASE,
+    )
+    assignment_tail = re.compile(r"^\s*=(?!=)\s*([^;]+)")
+    runtime_persistent_fixed: set[str] = set()
+    for block in blocks.values():
+        # Code.Type=Init is a shared function library in decompiled projects;
+        # its functions run only when called and do not rebuild arrays on each
+        # load.  Only direct Global initialization is known to be recreated.
+        if block.code_type == "global":
+            continue
+        for line in block.lines:
+            for match in allocation.finditer(_mask_non_code(line)):
+                name = match.group(1).casefold()
+                if name in shared and name in sizes and int(match.group(2)) == sizes[name]:
+                    runtime_persistent_fixed.add(name)
+    reported_terminal: set[str] = set()
+
+    for block in blocks.values():
+        loops = _loop_ranges_by_line(block.lines, bounds, sizes)
+        active_allocations: dict[str, set[int]] = {}
+        for line_index, line in enumerate(block.lines):
+            masked = _mask_non_code(line)
+            dim_loop = re.search(
+                r"\bfor\s*\(\s*(?:int\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]+);\s*"
+                r"\1\s*<=\s*ArrayDim\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+                masked,
+                re.IGNORECASE,
+            )
+            if dim_loop and dim_loop.group(3).casefold() in sizes:
+                iterator = dim_loop.group(1).casefold()
+                name = dim_loop.group(3).casefold()
+                body_range = _statement_body_range(block.lines, line_index)
+                body_text = ""
+                if body_range:
+                    body_text = _mask_non_code(
+                        "\n".join(block.lines[body_range[0] : body_range[1] + 1])
+                    )
+                if re.search(
+                    rf"\b{re.escape(name)}\s*\[\s*{re.escape(iterator)}\s*\]",
+                    body_text,
+                    re.IGNORECASE,
+                ):
+                    key = (block.name, line_index, name)
+                    if key not in reported_bounds:
+                        reported_bounds.add(key)
+                        issues.append(
+                            RuntimeIssue(
+                                "error",
+                                "runtime-fixed-array-index-contract",
+                                f"Цикл допускает {iterator} == ArrayDim({name}) == {sizes[name]}, но последний индекс newarray({sizes[name]}) равен {sizes[name] - 1}. Используйте {iterator} < ArrayDim({name}) или явную верхнюю границу {sizes[name] - 1}",
+                                path,
+                                f"{block.location} line {block.start_line + line_index}",
+                                line.strip(),
+                            )
+                        )
+            for match in allocation.finditer(masked):
+                name = match.group(1).casefold()
+                if name in sizes and int(match.group(2)) == sizes[name]:
+                    slots: set[int] = set()
+                    typed_by_allocation[name].append(slots)
+                    active_allocations[name] = slots
+
+            for match in indexed.finditer(masked):
+                name = match.group(1).casefold()
+                if name not in sizes:
+                    continue
+                direct_dim = re.fullmatch(
+                    rf"\s*ArrayDim\s*\(\s*{re.escape(name)}\s*\)\s*",
+                    match.group(2),
+                    re.IGNORECASE,
+                )
+                if direct_dim:
+                    key = (block.name, line_index, name)
+                    if key not in reported_bounds:
+                        reported_bounds.add(key)
+                        issues.append(
+                            RuntimeIssue(
+                                "error",
+                                "runtime-fixed-array-index-contract",
+                                f"{name}[ArrayDim({name})] всегда обращается к индексу {sizes[name]} за пределами newarray({sizes[name]}); последний допустимый индекс — {sizes[name] - 1}",
+                                path,
+                                f"{block.location} line {block.start_line + line_index}",
+                                line.strip(),
+                            )
+                        )
+                index_bounds = _index_range(match.group(2), loops.get(line_index, {}), bounds)
+                tail = masked[match.end():]
+                assigned = assignment_tail.match(tail)
+                if index_bounds is not None:
+                    low, high = index_bounds
+                    if (
+                        name in runtime_persistent_fixed
+                        and name not in reported_terminal
+                        and low <= sizes[name] - 1 <= high
+                    ):
+                        reported_terminal.add(name)
+                        issues.append(
+                            RuntimeIssue(
+                                "error",
+                                "runtime-persistent-fixed-array-terminal-slot",
+                                f"Persistent fixed-массив {name} создаётся в runtime-коде и использует последний физический слот {sizes[name] - 1} newarray({sizes[name]}). Подтверждённый чистый запуск SRHD передал это обращение движку как внутренний индекс {sizes[name]} и остановил NextDay; оставьте один запасной terminal-слот",
+                                path,
+                                f"{block.location} line {block.start_line + line_index}",
+                                line.strip(),
+                            )
+                        )
+                    if low < 0 or high >= sizes[name]:
+                        key = (block.name, line_index, name)
+                        if key not in reported_bounds:
+                            reported_bounds.add(key)
+                            issues.append(
+                                RuntimeIssue(
+                                    "error",
+                                    "runtime-fixed-array-index-contract",
+                                    f"Индекс {name}[{match.group(2).strip()}] имеет доказанный диапазон {low}..{high}, но newarray({sizes[name]}) допускает только 0..{sizes[name] - 1}",
+                                    path,
+                                    f"{block.location} line {block.start_line + line_index}",
+                                    line.strip(),
+                                )
+                            )
+                    valid = range(max(0, low), min(sizes[name] - 1, high) + 1)
+                else:
+                    valid = ()
+
+                if assigned:
+                    slots = active_allocations.get(name)
+                    if slots is not None and index_bounds is not None and _typed_scalar_expression(assigned.group(1)):
+                        slots.update(valid)
+                    continue
+
+                current = read_slots[name]
+                if index_bounds is None:
+                    read_slots[name] = None
+                elif current is not None:
+                    current.update(valid)
+
+    for name, allocation_slots in sorted(typed_by_allocation.items()):
+        required = read_slots[name]
+        if not allocation_slots or required == set():
+            continue
+        for slots in allocation_slots:
+            missing = (
+                sorted(required - slots)
+                if required is not None
+                else sorted(set(range(sizes[name])) - slots)
+            )
+            if not missing:
+                continue
+            preview = ", ".join(str(value) for value in missing[:8])
+            suffix = "…" if len(missing) > 8 else ""
+            issues.append(
+                RuntimeIssue(
+                    "error",
+                    "runtime-fixed-array-untyped-slot",
+                    f"После newarray({sizes[name]}) массив {name} читается в типизированном выражении, но слоты {preview}{suffix} не доказаны как явно записанные скалярным значением. Ячейки fixed-массива начинаются как unknown, а не как числовой 0",
+                    path,
+                    evidence=f"array={name}; capacity={sizes[name]}; missing={','.join(map(str, missing))}",
+                )
+            )
+            break
+    return issues
+
+
+def _lint_persistent_array_dimension_drift(project: RsonProject) -> list[RuntimeIssue]:
+    """Warn about the save-sensitive dynamic persistent-array lifecycle."""
+
+    sizes = _array_allocation_sizes(project)
+    shared = _shared_tvars(project)
+    dynamic = {
+        name for name, values in sizes.items()
+        if name in shared and 1 in values and not any(value > 1 for value in values)
+    }
+    if not dynamic:
+        return []
+    calls: dict[str, set[str]] = {name: set() for name in dynamic}
+    loops: dict[str, tuple[CodeContainer, int, str]] = {}
+    for container in _iter_code_containers(project):
+        for line_number, line in enumerate(container.lines, start=1):
+            masked = _mask_non_code(line)
+            for _position, call, arguments in _line_call_sites(masked):
+                if call not in {"arrayclear", "arrayadd"} or not arguments:
+                    continue
+                name = _simple_identifier(arguments[0])
+                if name in calls:
+                    calls[name].add(call)
+            match = re.search(
+                r"\bfor\s*\([^;]*;[^;]*ArrayDim\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+                masked,
+                re.IGNORECASE,
+            )
+            if match and match.group(1).casefold() in dynamic:
+                loops.setdefault(match.group(1).casefold(), (container, line_number, line))
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    for name in sorted(dynamic):
+        if calls[name] != {"arrayadd", "arrayclear"} or name not in loops:
+            continue
+        container, line_number, line = loops[name]
+        issues.append(
+            RuntimeIssue(
+                "warning",
+                "runtime-persistent-array-live-dimension-drift",
+                f"Persistent-массив {name} проходит цикл ArrayClear + ArrayAdd и затем обходится по живому ArrayDim. После сохранения движок способен рассинхронизировать размер и доступный последний индекс; для ограниченной таблицы используйте newarray(max + 1), явно типизируйте слоты и фиксируйте границы",
+                path,
+                f"{container.location}:{line_number}",
+                line.strip(),
+            )
+        )
+    return issues
 
 
 def _brace_block_end(lines: tuple[str, ...], start: int) -> int:
@@ -5311,6 +5872,9 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     )
     issues.extend(_lint_duplicate_local_declarations(project))
     issues.extend(_lint_rscript_arrays(project))
+    issues.extend(_lint_array_initialization_paths(project))
+    issues.extend(_lint_fixed_array_contracts(project))
+    issues.extend(_lint_persistent_array_dimension_drift(project))
     issues.extend(_lint_dialog_persistent_arrays(project))
     issues.extend(_lint_persistent_array_migrations(project))
     issues.extend(_lint_dialog_semantics(project))
@@ -5565,11 +6129,40 @@ def compare_storage_schemas(left: RsonProject, right: RsonProject) -> dict[str, 
 
     left_arrays = _rscript_array_names(left) & _shared_tvars(left)
     right_arrays = _rscript_array_names(right) & _shared_tvars(right)
+    left_sizes = {
+        name: sorted(values)
+        for name, values in _array_allocation_sizes(left).items()
+        if name in _shared_tvars(left)
+    }
+    right_sizes = {
+        name: sorted(values)
+        for name, values in _array_allocation_sizes(right).items()
+        if name in _shared_tvars(right)
+    }
     added = sorted(right_arrays - left_arrays)
     removed = sorted(left_arrays - right_arrays)
+    changed = [
+        {
+            "name": name,
+            "old_sizes": left_sizes[name],
+            "new_sizes": right_sizes[name],
+        }
+        for name in sorted(left_sizes.keys() & right_sizes.keys())
+        if left_sizes[name] != right_sizes[name]
+    ]
     right_gates = _persistent_array_first_run_gates(right)
     left_symbols = _shared_tvars(left)
     issues: list[RuntimeIssue] = []
+    for change in changed:
+        issues.append(
+            RuntimeIssue(
+                "error",
+                "runtime-persistent-array-size-changed",
+                f"Размер persistent-массива {change['name']} изменён с {change['old_sizes']} на {change['new_sizes']}. Старое сохранение сохраняет прежний runtime-массив и может упасть на допустимом для нового кода индексе; нужна явная миграция/пересоздание под новой версией схемы либо заявленный отказ от старых сохранений",
+                str(right.path) if right.path else None,
+                evidence=f"array={change['name']}; old={change['old_sizes']}; new={change['new_sizes']}",
+            )
+        )
     for name in added:
         legacy_gates = sorted(right_gates.get(name, set()) & left_symbols)
         if not legacy_gates:
@@ -5586,9 +6179,10 @@ def compare_storage_schemas(left: RsonProject, right: RsonProject) -> dict[str, 
     return {
         "schema": "srhd-modkit-storage-compat-v1",
         "status": "issues" if issues else "passed",
-        "coverage": "version-aware" if added or removed else "no-schema-change",
+        "coverage": "version-aware" if added or removed or changed else "no-schema-change",
         "added_arrays": added,
         "removed_arrays": removed,
+        "changed_arrays": changed,
         "issues": [issue.as_dict() for issue in issues],
     }
 
@@ -5649,6 +6243,132 @@ def _split_call_arguments(text: str, open_paren: int) -> tuple[list[str], int] |
             start = index + 1
         index += 1
     return None
+
+
+def literal_ct_references(project: RsonProject) -> list[LiteralCTReference]:
+    """Extract literal CT keys and fatal text sinks from executable RSON."""
+
+    path = str(project.path) if project.path else None
+    result: list[LiteralCTReference] = []
+    for container in _iter_code_containers(project):
+        text = "\n".join(container.lines)
+        masked = _mask_non_code(text)
+        sink_spans: list[tuple[int, int, str]] = []
+        for match in re.finditer(r"\bAddPlanetNews\s*\(", masked, re.IGNORECASE):
+            open_paren = masked.find("(", match.start())
+            parsed = _split_call_arguments(text, open_paren)
+            if parsed:
+                _arguments, end = parsed
+                sink_spans.append((match.start(), end, "AddPlanetNews"))
+
+        for match in re.finditer(r"\bCT\s*\(", masked, re.IGNORECASE):
+            open_paren = masked.find("(", match.start())
+            parsed = _split_call_arguments(text, open_paren)
+            if not parsed:
+                continue
+            arguments, end = parsed
+            if not arguments or (key := _literal_string(arguments[0])) is None:
+                continue
+            line_number = text.count("\n", 0, match.start()) + 1
+            sinks = tuple(
+                sink for start, stop, sink in sink_spans
+                if start <= match.start() < stop
+            )
+            result.append(
+                LiteralCTReference(
+                    key,
+                    path,
+                    f"{container.location}:{line_number}",
+                    text[match.start():end].strip(),
+                    tuple(dict.fromkeys(sinks)),
+                )
+            )
+    return result
+
+
+def _blockpar_text_key_index(document: BlockParDocument) -> tuple[set[str], set[str]]:
+    keys: set[str] = set()
+    roots: set[str] = set()
+    for node_path, key, _value in _node_parameters(document.roots):
+        dotted = ".".join((*node_path.split("/"), key)).casefold()
+        keys.add(dotted)
+        roots.add(node_path.split("/", 1)[0].casefold())
+    return keys, roots
+
+
+def lint_literal_ct_keys(
+    projects: Sequence[RsonProject],
+    language_documents: Mapping[
+        str,
+        Sequence[tuple[str | Path, BlockParDocument]],
+    ],
+) -> list[RuntimeIssue]:
+    """Check mod-owned literal CT keys in every shipped language artifact.
+
+    Base-game keys are intentionally left alone.  A reference is considered
+    mod-owned when its root block is present in at least one supplied Lang
+    document, or the exact key exists in at least one language.
+    """
+
+    artifacts: list[tuple[str, str, set[str]]] = []
+    local_roots: set[str] = set()
+    local_keys: set[str] = set()
+    for language, documents in language_documents.items():
+        for source, document in documents:
+            keys, roots = _blockpar_text_key_index(document)
+            artifacts.append((language, str(Path(source).resolve()), keys))
+            local_roots.update(roots)
+            local_keys.update(keys)
+    if not artifacts:
+        return []
+
+    references = [reference for project in projects for reference in literal_ct_references(project)]
+    grouped: dict[str, list[LiteralCTReference]] = {}
+    spelling: dict[str, str] = {}
+    for reference in references:
+        folded = reference.key.casefold()
+        root = folded.split(".", 1)[0]
+        if folded not in local_keys and root not in local_roots:
+            continue
+        grouped.setdefault(folded, []).append(reference)
+        spelling.setdefault(folded, reference.key)
+
+    issues: list[RuntimeIssue] = []
+    for folded, key_references in sorted(grouped.items()):
+        missing = [
+            (language, source)
+            for language, source, keys in artifacts
+            if folded not in keys
+        ]
+        if not missing:
+            continue
+        first = key_references[0]
+        missing_label = ", ".join(
+            f"{language}:{Path(source).name}" for language, source in missing
+        )
+        issues.append(
+            RuntimeIssue(
+                "error",
+                "runtime-ct-key-missing",
+                f"Литеральный CT-ключ {spelling[folded]} отсутствует в языковых артефактах: {missing_label}. Для собственного пространства имён мода ключ обязан присутствовать во всех поставляемых Lang TXT/DAT",
+                first.path,
+                first.location,
+                first.evidence,
+            )
+        )
+        for reference in key_references:
+            for sink in reference.nonempty_sinks:
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-empty-text-to-nonempty-sink",
+                        f"Отсутствующий CT-ключ {reference.key} передаётся через вложенное выражение в {sink}; CT вернёт пустую строку, а игра способна остановить Turn с runtime-исключением",
+                        reference.path,
+                        reference.location,
+                        reference.evidence,
+                    )
+                )
+    return issues
 
 
 def _script_run_calls(text: str) -> list[tuple[list[str], str]]:

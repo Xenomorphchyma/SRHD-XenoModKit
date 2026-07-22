@@ -14,6 +14,7 @@ from srhd_modkit.cli import _runtime_lint_target, cmd_script_audit_mod, cmd_scri
 from srhd_modkit.module_info import parse_module_info
 from srhd_modkit.runtime_lint import (
     compare_storage_schemas,
+    lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
     lint_rson_runtime,
@@ -1084,6 +1085,36 @@ class RuntimeLintTests(unittest.TestCase):
             codes = {issue["code"] for issue in result["issues"] if issue["severity"] == "error"}
             self.assertIn("runtime-onstart-unguarded-world", codes)
 
+    def test_runtime_target_checks_literal_ct_keys_in_declared_languages(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "SOURCE"
+            cfg = source / "CFG"
+            cfg.mkdir(parents=True)
+            data = deepcopy(SAFE_RSON)
+            data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+                "AddPlanetNews(CT('OwnMod.Missing'));",
+            ]
+            (source / "literal-ct.rson").write_text(json.dumps(data), encoding="utf-8")
+            (root / "ModuleInfo.txt").write_text(
+                "Name=Test\nLanguages=Rus,Eng\n",
+                encoding="utf-8",
+            )
+            (cfg / "Lang_Rus.txt").write_text(
+                "OwnMod ^{\n    Existing=Есть\n}\n",
+                encoding="utf-8",
+            )
+            (cfg / "Lang_Eng.txt").write_text(
+                "OwnMod ^{\n    Existing=Exists\n    Missing=Ready\n}\n",
+                encoding="utf-8",
+            )
+
+            result = _runtime_lint_target(root)
+            codes = [issue["code"] for issue in result["issues"]]
+            self.assertEqual(codes.count("runtime-ct-key-missing"), 1)
+            self.assertEqual(codes.count("runtime-empty-text-to-nonempty-sink"), 1)
+            self.assertEqual(len(result["language"]), 2)
+
     def test_build_runs_whole_mod_preflight_before_compiler(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -1473,6 +1504,246 @@ class RuntimeLintTests(unittest.TestCase):
             for issue in lint_rson_runtime(RsonProject(data, Path("array-init.rson")))
         }
         self.assertNotIn("runtime-persistent-array-use-without-newarray", initialized_codes)
+
+    def test_partial_storage_initializer_does_not_borrow_newarray_from_migration(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "tank_slots", "Parent": -1, "#": 20},
+            {"Type": "TVar", "Name": "tank_item_ids", "Parent": -1, "#": 21},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function MigrateOldSave()",
+            "{",
+            "    tank_slots = newarray(1);",
+            "    tank_item_ids = newarray(1);",
+            "}",
+            "function InitStorage()",
+            "{",
+            "    tank_slots = newarray(1);",
+            "    ArrayClear(tank_slots);",
+            "    ArrayClear(tank_item_ids);",
+            "}",
+            "InitStorage();",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("partial-storage.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-persistent-array-use-before-newarray"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("tank_item_ids", matching[0].message)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"].insert(
+            8, "    tank_item_ids = newarray(1);"
+        )
+        fixed_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("complete-storage.rson")))
+        }
+        self.assertNotIn("runtime-persistent-array-use-before-newarray", fixed_codes)
+
+    def test_conditional_newarray_does_not_dominate_unconditional_arrayclear(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "queue", "Parent": -1, "#": 20},
+            {"Type": "TVar", "Name": "other", "Parent": -1, "#": 21},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function InitStorage()",
+            "{",
+            "    other = newarray(1);",
+            "    if(reuse_old)",
+            "    {",
+            "        queue = newarray(1);",
+            "    }",
+            "    ArrayClear(queue);",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("conditional-array.rson")))
+        }
+        self.assertIn("runtime-persistent-array-use-before-newarray", codes)
+
+    def test_fixed_array_slots_must_be_typed_before_numeric_read(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "ship_ids", "Parent": -1, "#": 20},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function ResetIds()",
+            "{",
+            "    ship_ids = newarray(7);",
+            "}",
+            "function HasId(int wanted)",
+            "{",
+            "    result = 0;",
+            "    for(int i = 1; i <= 6; i = i + 1)",
+            "        if(ship_ids[i] == wanted) { result = 1; exit; }",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("untyped-fixed.rson")))
+        }
+        self.assertIn("runtime-fixed-array-untyped-slot", codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"][3:3] = [
+            "    for(int reset_i = 0; reset_i <= 6; reset_i = reset_i + 1)",
+            "        ship_ids[reset_i] = 0;",
+        ]
+        fixed_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("typed-fixed.rson")))
+        }
+        self.assertNotIn("runtime-fixed-array-untyped-slot", fixed_codes)
+
+    def test_fixed_array_index_contract_uses_known_loop_bound(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "ship_ids", "Parent": -1, "#": 20},
+            {"Type": "TVar", "Name": "ship_count", "Init": "6", "Parent": -1, "#": 21},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function FillIds()",
+            "{",
+            "    ship_ids = newarray(7);",
+            "    for(int reset_i = 0; reset_i <= 6; reset_i = reset_i + 1)",
+            "        ship_ids[reset_i] = 0;",
+            "    for(int ship_index = 1; ship_index <= ship_count; ship_index = ship_index + 1)",
+            "        ship_ids[ship_index + 1] = ship_index;",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("fixed-oob.rson")))
+        }
+        self.assertIn("runtime-fixed-array-index-contract", codes)
+
+    def test_fixed_array_loop_must_not_include_arraydim_index(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "transport_ids", "Parent": -1, "#": 20},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function ResetIds()",
+            "{",
+            "    transport_ids = newarray(7);",
+            "    for(int reset_i = 0; reset_i < ArrayDim(transport_ids); reset_i = reset_i + 1)",
+            "        transport_ids[reset_i] = 0;",
+            "}",
+            "function IsTransportId(int wanted)",
+            "{",
+            "    result = 0;",
+            "    for(int i = 1; i <= ArrayDim(transport_ids); i = i + 1)",
+            "        if(transport_ids[i] == wanted) { result = 1; exit; }",
+            "}",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("arraydim-oob.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-fixed-array-index-contract"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("последний индекс", matching[0].message)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"][9] = (
+            "    for(int i = 1; i < ArrayDim(transport_ids); i = i + 1)"
+        )
+        fixed_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("arraydim-safe.rson")))
+        }
+        self.assertNotIn("runtime-fixed-array-index-contract", fixed_codes)
+
+    def test_runtime_persistent_fixed_array_reserves_terminal_slot(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "transport_ids", "Parent": -1, "#": 20},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function ResetIds()",
+            "{",
+            "    transport_ids = newarray(7);",
+            "    for(int i = 0; i <= 6; i = i + 1)",
+            "        transport_ids[i] = 0;",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("terminal-slot.rson")))
+        }
+        self.assertIn("runtime-persistent-fixed-array-terminal-slot", codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"][2] = (
+            "    transport_ids = newarray(8);"
+        )
+        reserved_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("terminal-spare.rson")))
+        }
+        self.assertNotIn("runtime-persistent-fixed-array-terminal-slot", reserved_codes)
+
+    def test_dynamic_persistent_array_live_dimension_drift_is_reported(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "ship_ids", "Parent": -1, "#": 20},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function ResetIds()",
+            "{",
+            "    ship_ids = newarray(1);",
+            "    ArrayClear(ship_ids);",
+            "    ArrayAdd(ship_ids, 7);",
+            "}",
+            "for(int i = 1; i < ArrayDim(ship_ids); i = i + 1)",
+            "    if(ship_ids[i] == 7) exit;",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("persistent-drift.rson")))
+        }
+        self.assertIn("runtime-persistent-array-live-dimension-drift", codes)
+
+    def test_literal_ct_keys_are_checked_in_every_language_and_fatal_sink(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "AddPlanetNews(Format(CT('OwnMod.Missing'), '#name#', Name(Player())));",
+            "DText(CT('BaseGame.ExternalKey'));",
+        ]
+        project = RsonProject(data, Path("ct-missing.rson"))
+        russian = parse_blockpar(
+            "OwnMod ^{\n    Existing=Есть\n}\n"
+        )
+        english = parse_blockpar(
+            "OwnMod ^{\n    Existing=Exists\n    Missing=Ready\n}\n"
+        )
+        issues = lint_literal_ct_keys(
+            [project],
+            {
+                "rus": [(Path("Lang_Rus.txt"), russian)],
+                "eng": [(Path("Lang_Eng.txt"), english)],
+            },
+        )
+        codes = [issue.code for issue in issues]
+        self.assertEqual(codes.count("runtime-ct-key-missing"), 1)
+        self.assertEqual(codes.count("runtime-empty-text-to-nonempty-sink"), 1)
+        self.assertIn("rus:Lang_Rus.txt", issues[0].message)
+        self.assertNotIn("BaseGame.ExternalKey", "\n".join(issue.message for issue in issues))
+
+        russian.find_node("OwnMod").set_parameter("Missing", "Готово", create=True)
+        self.assertEqual(
+            lint_literal_ct_keys(
+                [project],
+                {
+                    "rus": [(Path("Lang_Rus.txt"), russian)],
+                    "eng": [(Path("Lang_Eng.txt"), english)],
+                },
+            ),
+            [],
+        )
 
     def test_duplicate_local_names_across_branches_are_rejected(self) -> None:
         data = deepcopy(SAFE_RSON)
@@ -1921,6 +2192,35 @@ class RuntimeLintTests(unittest.TestCase):
         self.assertEqual(
             comparison["issues"][0]["code"],
             "runtime-new-persistent-array-without-storage-migration",
+        )
+
+    def test_storage_comparison_blocks_persistent_array_capacity_change(self) -> None:
+        old_data = deepcopy(SAFE_RSON)
+        old_data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "transport_ids", "Parent": -1, "#": 20},
+        ]
+        old_data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "transport_ids = newarray(1);",
+            "ArrayClear(transport_ids);",
+        ]
+        new_data = deepcopy(old_data)
+        new_data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "transport_ids = newarray(7);",
+            "for(int i = 0; i < ArrayDim(transport_ids); i = i + 1)",
+            "    transport_ids[i] = 0;",
+        ]
+        comparison = compare_storage_schemas(
+            RsonProject(old_data, Path("old-dynamic.rson")),
+            RsonProject(new_data, Path("new-fixed.rson")),
+        )
+        self.assertEqual(comparison["status"], "issues")
+        self.assertEqual(
+            comparison["changed_arrays"],
+            [{"name": "transport_ids", "old_sizes": [1], "new_sizes": [7]}],
+        )
+        self.assertIn(
+            "runtime-persistent-array-size-changed",
+            {issue["code"] for issue in comparison["issues"]},
         )
 
     def test_dialog_targets_transitions_ether_and_warrior_advisories(self) -> None:

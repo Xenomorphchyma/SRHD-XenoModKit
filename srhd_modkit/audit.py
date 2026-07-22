@@ -19,6 +19,7 @@ from .resources import UnsupportedResourceFormat, verify_resource
 from .quests import inspect_quest, load_quest, quest_media, verify_quest
 from .runtime_lint import (
     has_onstart_script_run,
+    lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
     lint_rson_runtime,
@@ -1343,6 +1344,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
             )
 
     runtime_values: list[Any] = []
+    rson_projects = []
     valid_rsons = 0
     for path in rsons:
         try:
@@ -1354,6 +1356,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
             )
             if not any(item.severity == "error" for item in structural):
                 valid_rsons += 1
+                rson_projects.append(project)
                 values = lint_rson_runtime(project)
                 runtime_values.extend(values)
                 issues.extend(
@@ -1365,14 +1368,51 @@ def _script_check(context: AuditContext) -> AuditCheck:
             issues.append(_issue(context, name, "error", "rson-invalid", str(exc), path))
 
     info_path = find_module_info(context.root)
+    module_info = None
     if info_path:
         try:
+            module_info = parse_module_info(info_path)
             issues.extend(
                 AuditIssue.from_value(item, validator=name, mod=context.mod_name)
-                for item in lint_module_runtime(parse_module_info(info_path))
+                for item in lint_module_runtime(module_info)
             )
         except Exception as exc:
             issues.append(_issue(context, name, "error", "runtime-module-load", str(exc), info_path))
+
+    language_documents: dict[str, list[tuple[Path, BlockParDocument]]] = {}
+    if module_info is not None and rson_projects:
+        for language in module_info.languages:
+            candidates = (
+                index.get(f"source/cfg/lang_{language}.txt".casefold()),
+                index.get(f"cfg/{language}/lang.dat".casefold()),
+            )
+            for language_path in dict.fromkeys(path for path in candidates if path is not None):
+                try:
+                    document = (
+                        load_blockpar(language_path)
+                        if language_path.suffix.casefold() == ".txt"
+                        else _load_dat(context, language_path)
+                    )
+                    if document is not None:
+                        language_documents.setdefault(language.casefold(), []).append(
+                            (language_path, document)
+                        )
+                        checked.append(str(language_path))
+                except Exception as exc:
+                    issues.append(
+                        _issue(
+                            context,
+                            name,
+                            "error",
+                            "runtime-lang-load",
+                            str(exc),
+                            language_path,
+                        )
+                    )
+        issues.extend(
+            AuditIssue.from_value(item, validator=name, mod=context.mod_name)
+            for item in lint_literal_ct_keys(rson_projects, language_documents)
+        )
 
     onstart_risks = {
         "runtime-turn-direct-world-access",

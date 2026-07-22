@@ -27,7 +27,9 @@ from .script_artifacts import ScriptArtifactIssue, lint_script_cache
 from .textio import DecodedText, read_text
 from .runtime_lint import (
     RuntimeIssue,
+    compare_storage_schemas,
     has_onstart_script_run,
+    lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
     lint_rson_runtime,
@@ -1002,6 +1004,8 @@ def _runtime_lint_target(
     issues: list[RuntimeIssue] = []
     checked_rson: list[str] = []
     checked_main: list[str] = []
+    checked_language: list[str] = []
+    rson_projects = []
     onstart_script_run = False
 
     if target.is_file():
@@ -1036,6 +1040,7 @@ def _runtime_lint_target(
                     )
                 )
             else:
+                rson_projects.append(project)
                 issues.extend(lint_rson_runtime(project))
             checked_rson.append(str(path))
         except Exception as exc:
@@ -1069,11 +1074,44 @@ def _runtime_lint_target(
         info_path = find_module_info(root)
     else:
         info_path = None
+    module_info = None
     if info_path:
         try:
-            issues.extend(lint_module_runtime(parse_module_info(info_path)))
+            module_info = parse_module_info(info_path)
+            issues.extend(lint_module_runtime(module_info))
         except Exception as exc:
             issues.append(RuntimeIssue("error", "runtime-module-load", str(exc), str(info_path)))
+
+    if target.is_dir() and module_info is not None and rson_projects:
+        language_documents: dict[str, list[tuple[Path, BlockParDocument]]] = {}
+        with tempfile.TemporaryDirectory(prefix="srhd-runtime-lang-") as name:
+            temp = Path(name)
+            for language in module_info.languages:
+                candidates = (
+                    root / "SOURCE" / "CFG" / f"Lang_{language}.txt",
+                    root / "CFG" / language / "Lang.dat",
+                )
+                for index, language_path in enumerate(candidates):
+                    if not language_path.is_file():
+                        continue
+                    try:
+                        workspace = temp / language.casefold() / str(index)
+                        workspace.mkdir(parents=True, exist_ok=True)
+                        document, _source = _load_dat_source(language_path, chain, workspace)
+                        language_documents.setdefault(language.casefold(), []).append(
+                            (language_path, document)
+                        )
+                        checked_language.append(str(language_path.resolve()))
+                    except Exception as exc:
+                        issues.append(
+                            RuntimeIssue(
+                                "error",
+                                "runtime-lang-load",
+                                str(exc),
+                                str(language_path.resolve()),
+                            )
+                        )
+        issues.extend(lint_literal_ct_keys(rson_projects, language_documents))
 
     onstart_risks = {
         "runtime-turn-direct-world-access",
@@ -1094,6 +1132,7 @@ def _runtime_lint_target(
         "target": str(target),
         "rson": checked_rson,
         "main": checked_main,
+        "language": checked_language,
         "module_info": str(info_path) if info_path else None,
         "issues": [issue.as_dict() for issue in issues],
     }
@@ -1124,6 +1163,27 @@ def cmd_script_lint_runtime(args: argparse.Namespace) -> int:
     has_errors = any(issue["severity"] == "error" for issue in issues)
     has_warnings = any(issue["severity"] == "warning" for issue in issues)
     return 2 if has_errors or (args.strict and has_warnings) else 0
+
+
+def cmd_script_compare_storage(args: argparse.Namespace) -> int:
+    left = load_rson(args.left)
+    right = load_rson(args.right)
+    result = compare_storage_schemas(left, right)
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Схема: {result['status']}; покрытие: {result['coverage']}")
+        if result["added_arrays"]:
+            print(f"Добавлены массивы: {', '.join(result['added_arrays'])}")
+        if result["removed_arrays"]:
+            print(f"Удалены массивы: {', '.join(result['removed_arrays'])}")
+        for change in result["changed_arrays"]:
+            print(
+                f"Размер {change['name']}: {change['old_sizes']} -> {change['new_sizes']}"
+            )
+        for issue in result["issues"]:
+            print(f"{issue['severity'].upper():7} {issue['code']}: {issue['message']}")
+    return 2 if result["issues"] else 0
 
 
 def _rson_mutation(source: str, output: str, overwrite: bool):
@@ -1660,7 +1720,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.4")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.5")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -2055,6 +2115,15 @@ def build_parser() -> argparse.ArgumentParser:
     script_runtime.add_argument("--tools-root")
     script_runtime.add_argument("--json", action="store_true")
     script_runtime.set_defaults(func=cmd_script_lint_runtime)
+
+    script_storage = script_sub.add_parser(
+        "compare-storage",
+        help="Сравнить persistent-массивы двух версий RSON и найти несовместимость сохранений",
+    )
+    script_storage.add_argument("left", help="Предыдущая версия RSON")
+    script_storage.add_argument("right", help="Новая версия RSON")
+    script_storage.add_argument("--json", action="store_true")
+    script_storage.set_defaults(func=cmd_script_compare_storage)
 
     script_register = script_sub.add_parser("register", help="Зарегистрировать SCR в CFG/Main.dat без GUI")
     script_register.add_argument("main_dat")

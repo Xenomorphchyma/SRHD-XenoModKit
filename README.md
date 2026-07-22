@@ -1,4 +1,4 @@
-# SRHD XenoModKit 0.9.4
+# SRHD XenoModKit 0.9.5
 
 Headless modding toolkit for **Space Rangers HD: A War Apart** / **Космические рейнджеры HD: Революция**.
 
@@ -22,6 +22,17 @@ Headless modding toolkit for **Space Rangers HD: A War Apart** / **Космич�
 - сохранять неизвестные форматы побайтно и отмечать неполное покрытие.
 
 ModKit не устанавливает моды, не изменяет игру или `ModCFG.txt` и не требует GUI.
+
+### Что изменилось в 0.9.5
+
+- `runtime-persistent-array-use-before-newarray` проверяет конкретную функцию и путь: `newarray(...)` в посторонней миграции больше не прикрывает `ArrayClear`, достижимый на чистом запуске. На восстановленном SCR XenoDomRangersTest 1.0.8 правило точно нашло оба массива, вызвавших `ArrayClear - not array`.
+- Fixed-массивы `newarray(N > 1)` проверяются как диапазон `0..N-1`. `runtime-fixed-array-untyped-slot` требует явной скалярной записи во все читаемые слоты, а `runtime-fixed-array-index-contract` ловит смещение индекса, выход за границу и цикл `i <= ArrayDim(array)`.
+- `runtime-persistent-fixed-array-terminal-slot` блокирует использование последнего физического слота fixed-массива, созданного в runtime и сохраняемого между ходами. На новом сохранении EarthTest 1.0.57 исходный индекс `6` массива `newarray(7)` дошёл до движка как внутренний `7` и оборвал `NextDay`; правило требует запасной terminal-слот.
+- `runtime-persistent-array-live-dimension-drift` предупреждает о save-sensitive сочетании persistent `newarray(1)`, `ArrayClear`, `ArrayAdd` и обхода по живому `ArrayDim`.
+- `script compare-storage OLD.rson NEW.rson --json` и Python API теперь блокируют изменение ёмкости persistent-массива (`newarray(1) → newarray(7)`) как `runtime-persistent-array-size-changed`: старое сохранение не получает новую структуру автоматически.
+- Литеральные `CT('Mod.Key')` собственного пространства имён сверяются со всеми поставляемыми `Lang_*.txt` и `CFG/<Lang>/Lang.dat`. Отсутствующий ключ блокирует аудит как `runtime-ct-key-missing`; вложенная цепочка до `AddPlanetNews` дополнительно получает `runtime-empty-text-to-nonempty-sink`.
+- В справочнике уточнён порядок `Turn`: callback выполняется до визуального перехода календаря. Это учитывается при планировании «через одно действие следующий день», но не превращается в безусловный lint, поскольку результат зависит от порядка обработчиков.
+- Полный набор 0.9.5 состоит из 195 тестов.
 
 ### Что изменилось в 0.9.4
 
@@ -154,6 +165,7 @@ python -B srhd.py script lint-runtime C:\Work\MyMod --strict --json
 python -B srhd.py script decompile C:\Work\Mod_Name.scr C:\Work\Mod_Name.rson `
   --lang-dat C:\Work\Lang.dat --json
 python -B srhd.py script compare-scr C:\Work\Original.scr C:\Work\Patched.scr --json
+python -B srhd.py script compare-storage C:\Work\Old.rson C:\Work\New.rson --json
 python -B srhd.py script set-code C:\Work\Script.rson C:\Work\Script.edited.rson `
   --id 17 --field OnActCode --code-file C:\Work\player-buy-handler.txt
 python -B srhd.py script build C:\Work\Script.rson --scr C:\Work\Script.scr --lang C:\Work\Lang.txt

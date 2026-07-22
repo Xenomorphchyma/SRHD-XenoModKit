@@ -1,4 +1,4 @@
-# SRHD ModKit 0.9.4
+# SRHD ModKit 0.9.5
 
 Публичная GitHub-версия называется **SRHD XenoModKit**. Внутренние имена
 каталога, Python-пакета и CLI не переименованы. Автор и сопровождающий:
@@ -15,6 +15,16 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 Для первого запуска, автоматической установки проверенных DAT/script-кодеков и
 описания внешних зависимостей начните с [основного README](README.md) и
 [THIRD_PARTY_TOOLS_RU.md](THIRD_PARTY_TOOLS_RU.md).
+
+## Новое в 0.9.5
+
+- Runtime-lint больше не считает `newarray(...)` из другой миграции доказательством для чистого запуска: `ArrayClear` до доминирующей инициализации блокируется как `runtime-persistent-array-use-before-newarray`.
+- Fixed-массивы проверяются на неизвестные читаемые слоты, выходы за `0..N-1` и ошибочное `<= ArrayDim(array)`.
+- Runtime-created persistent fixed-массив обязан оставлять запасной terminal-слот: подтверждённый новый запуск EarthTest 1.0.57 передал исходный последний слот движку как индекс за границей.
+- Dynamic persistent-массивы с `ArrayClear + ArrayAdd + live ArrayDim` получают предупреждение о возможном дрейфе состояния сохранения.
+- `script compare-storage` обнаруживает изменение ёмкости persistent-массива между версиями RSON.
+- Собственные литеральные `CT(...)` сверяются со всеми поставляемыми языковыми TXT/DAT; пустой ключ на пути к `AddPlanetNews` считается runtime-fatal.
+- Полный набор 0.9.5 состоит из 195 тестов.
 
 ## Новое в 0.9.4
 
@@ -584,7 +594,7 @@ ModKit через GitHub.
 python -B -m unittest discover -s tests -v
 ```
 
-В наборе из 185 тестов используются нативные PNG/GI/QM/QMM-кодеки и локальные BlockParEditor/RScript:
+В наборе из 195 тестов используются нативные PNG/GI/QM/QMM-кодеки и локальные BlockParEditor/RScript:
 проверяют пиксель-в-пиксель круговой проход RGBA8, все три режима GI, CRC,
 палитры и Adam7, ASCII/Unicode DAT,
 события TState в собранном SCR, runtime-блокировки, граф RSON, аудит/релиз,
