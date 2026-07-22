@@ -418,6 +418,7 @@ def _lint_unavailable_engine_calls(
 
 
 _OBJECT_API_ARGUMENTS: dict[str, tuple[int, ...]] = {
+    "dist": (0, 1),
     "id": (0,),
     "itemexist": (0,),
     "planettostar": (0,),
@@ -445,6 +446,10 @@ _NULLABLE_HANDLE_PRODUCERS: dict[str, str] = {
 }
 
 _NULLABLE_HANDLE_CONSUMERS: dict[str, dict[int, frozenset[str]]] = {
+    "dist": {
+        0: frozenset({"star"}),
+        1: frozenset({"star"}),
+    },
     "id": {0: frozenset({"ship", "star"})},
     "relationtoranger": {
         0: frozenset({"ship"}),
@@ -583,6 +588,47 @@ def _negative_null_condition(condition: str, variable: str) -> bool:
     )
 
 
+def _strip_balanced_outer_parentheses(expression: str) -> str:
+    value = expression.strip()
+    while value.startswith("(") and value.endswith(")"):
+        depth = 0
+        closes_at_end = False
+        for index, char in enumerate(value):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    closes_at_end = index == len(value) - 1
+                    break
+        if not closes_at_end:
+            break
+        value = value[1:-1].strip()
+    return value
+
+
+def _split_top_level_boolean(expression: str, operator: str) -> list[str]:
+    value = _strip_balanced_outer_parentheses(expression)
+    result: list[str] = []
+    depth = 0
+    start = 0
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and value.startswith(operator, index):
+            result.append(value[start:index].strip())
+            index += len(operator)
+            start = index
+            continue
+        index += 1
+    result.append(value[start:].strip())
+    return result
+
+
 def _positive_object_condition(condition: str, variable: str) -> bool:
     wanted = re.escape(variable)
     value = condition.strip()
@@ -595,26 +641,208 @@ def _positive_object_condition(condition: str, variable: str) -> bool:
     )
 
 
+def _predicate_call_for_variable(
+    condition: str,
+    variable: str,
+    nonnull_predicates: dict[str, frozenset[int]],
+) -> bool:
+    value = _strip_balanced_outer_parentheses(condition)
+    match = CALL_RE.match(value)
+    if match is None or match.start() != 0:
+        return False
+    function = match.group(1).casefold()
+    indexes = nonnull_predicates.get(function)
+    if not indexes:
+        return False
+    open_paren = value.find("(", match.start())
+    parsed = _split_call_arguments(value, open_paren)
+    if parsed is None:
+        return False
+    arguments, end = parsed
+    if value[end:].strip():
+        return False
+    return any(
+        index < len(arguments) and _simple_identifier(arguments[index]) == variable.casefold()
+        for index in indexes
+    )
+
+
+def _negative_predicate_call_for_variable(
+    condition: str,
+    variable: str,
+    nonnull_predicates: dict[str, frozenset[int]],
+) -> bool:
+    value = _strip_balanced_outer_parentheses(condition)
+    return value.startswith("!") and _predicate_call_for_variable(
+        value[1:].strip(),
+        variable,
+        nonnull_predicates,
+    )
+
+
+def _condition_calls_are_null_safe_for_variable(
+    condition: str,
+    variable: str,
+    nonnull_predicates: dict[str, frozenset[int]],
+) -> bool:
+    """Allow raw comparisons and proven predicates, reject other dereferences."""
+
+    masked = _mask_non_code(condition)
+    wanted = variable.casefold()
+    for _position, call, arguments in _line_call_sites(masked):
+        safe_indexes = nonnull_predicates.get(call, frozenset())
+        for index, argument in enumerate(arguments):
+            if _simple_identifier(argument) == wanted and index not in safe_indexes:
+                return False
+    return True
+
+
+def _safe_compound_negative_nonnull_condition(
+    condition: str,
+    variable: str,
+    nonnull_predicates: dict[str, frozenset[int]],
+) -> bool:
+    """Prove null rejection in an eager-safe disjunctive exit guard."""
+
+    terms = _split_top_level_boolean(condition, "||")
+    if len(terms) < 2:
+        return False
+    has_null_rejection = any(
+        _negative_null_condition(term, variable)
+        or _negative_predicate_call_for_variable(term, variable, nonnull_predicates)
+        for term in terms
+    )
+    return has_null_rejection and _condition_calls_are_null_safe_for_variable(
+        condition,
+        variable,
+        nonnull_predicates,
+    )
+
+
+def _positive_nonnull_condition(
+    condition: str,
+    variable: str,
+    nonnull_predicates: dict[str, frozenset[int]],
+) -> bool:
+    return _positive_object_condition(condition, variable) or _predicate_call_for_variable(
+        condition,
+        variable,
+        nonnull_predicates,
+    )
+
+
+def _negative_nonnull_condition(
+    condition: str,
+    variable: str,
+    nonnull_predicates: dict[str, frozenset[int]],
+) -> bool:
+    value = _strip_balanced_outer_parentheses(condition)
+    if _negative_null_condition(value, variable) or _safe_compound_negative_nonnull_condition(
+        value,
+        variable,
+        nonnull_predicates,
+    ):
+        return True
+    return _negative_predicate_call_for_variable(value, variable, nonnull_predicates)
+
+
+def _nonnull_predicate_summaries(
+    functions: dict[str, FunctionBlock],
+) -> dict[str, frozenset[int]]:
+    """Infer user predicates whose true result proves an argument is non-null."""
+
+    summaries: dict[str, frozenset[int]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name, block in functions.items():
+            parameters = _function_parameters(block)
+            proven = set(summaries.get(name, ()))
+            for parameter_index, parameter in enumerate(parameters):
+                if parameter_index in proven:
+                    continue
+                zero_lines: list[int] = []
+                nonzero_lines: list[int] = []
+                for line_index, line in enumerate(block.lines[1:], start=1):
+                    for match in re.finditer(
+                        r"\bresult\s*=\s*([+-]?\d+)\s*;",
+                        _mask_non_code(line),
+                        re.IGNORECASE,
+                    ):
+                        if int(match.group(1)) == 0:
+                            zero_lines.append(line_index)
+                        else:
+                            nonzero_lines.append(line_index)
+                if not zero_lines or not nonzero_lines:
+                    continue
+                if _variable_reassigned(block.lines, parameter, 1, len(block.lines)):
+                    continue
+                for guard_line in range(1, len(block.lines)):
+                    if re.match(
+                        r"\s*if\b",
+                        _mask_non_code(block.lines[guard_line]),
+                        re.IGNORECASE,
+                    ) is None:
+                        continue
+                    condition = _exiting_if_condition(
+                        "\n".join(block.lines[guard_line : min(len(block.lines), guard_line + 8)])
+                    )
+                    if condition is None or not _negative_nonnull_condition(
+                        condition,
+                        parameter,
+                        summaries,
+                    ):
+                        continue
+                    unsafe_before_guard = any(
+                        _simple_identifier(argument) == parameter
+                        for prior_line in block.lines[1:guard_line]
+                        for _position, _call, arguments in _line_call_sites(
+                            _mask_non_code(prior_line)
+                        )
+                        for argument in arguments
+                    )
+                    if unsafe_before_guard:
+                        continue
+                    if any(line < guard_line for line in zero_lines) and all(
+                        line > guard_line for line in nonzero_lines
+                    ):
+                        proven.add(parameter_index)
+                        break
+            frozen = frozenset(proven)
+            if frozen != summaries.get(name, frozenset()):
+                summaries[name] = frozen
+                changed = True
+    return summaries
+
+
 def _has_explicit_object_guard(
     block: FunctionBlock,
     line_offset: int,
     variable: str,
     *,
     after_line: int = 0,
+    nonnull_predicates: dict[str, frozenset[int]] | None = None,
 ) -> bool:
     """Prove a separate dominating null guard before an object dereference."""
 
     lines = block.lines
     depths = _line_depths(lines)
     first = max(1, after_line + 1)
+    predicates = nonnull_predicates or {}
 
     # Early-exit form: ``if(!object) continue/exit/return;``.  The condition
     # must be only the null test; an &&/|| neighbour is deliberately not used
     # as proof because RScript does not guarantee lazy boolean evaluation.
     for index in range(first, line_offset):
+        if re.match(r"\s*if\b", _mask_non_code(lines[index]), re.IGNORECASE) is None:
+            continue
         window = "\n".join(lines[index : min(line_offset, index + 8)])
         condition = _exiting_if_condition(window)
-        if condition is None or not _negative_null_condition(condition, variable):
+        if condition is None or not _negative_nonnull_condition(
+            condition,
+            variable,
+            predicates,
+        ):
             continue
         if depths[index] > depths[line_offset] or _variable_reassigned(
             lines, variable, index + 1, line_offset + 1
@@ -629,7 +857,11 @@ def _has_explicit_object_guard(
             _mask_non_code(lines[index]),
             re.IGNORECASE,
         )
-        if control is None or not _positive_object_condition(control.group(1), variable):
+        if control is None or not _positive_nonnull_condition(
+            control.group(1),
+            variable,
+            predicates,
+        ):
             continue
         remainder = control.group(2).strip()
         if remainder.startswith("{"):
@@ -664,6 +896,7 @@ def _has_explicit_object_guard(
 def _lint_object_api_behind_boolean_guard(
     project: RsonProject,
     functions: dict[str, FunctionBlock],
+    nonnull_predicates: dict[str, frozenset[int]],
 ) -> list[RuntimeIssue]:
     """Do not treat neighbouring &&/|| operands as lazy safety guards."""
 
@@ -698,7 +931,12 @@ def _lint_object_api_behind_boolean_guard(
                     if not guarded:
                         continue
                     line_number = text.count("\n", 0, position) + 1
-                    if _has_explicit_object_guard(block, line_number, variable):
+                    if _has_explicit_object_guard(
+                        block,
+                        line_number,
+                        variable,
+                        nonnull_predicates=nonnull_predicates,
+                    ):
                         continue
                     key = (line_number, call, variable)
                     if key in reported:
@@ -751,6 +989,7 @@ def _argument_contains_nullable_producer(argument: str, kinds: frozenset[str]) -
 def _lint_nullable_handle_dereferences(
     project: RsonProject,
     functions: dict[str, FunctionBlock],
+    nonnull_predicates: dict[str, frozenset[int]],
 ) -> list[RuntimeIssue]:
     """Require a separate null guard between a raw handle producer and consumer."""
 
@@ -766,6 +1005,7 @@ def _lint_nullable_handle_dereferences(
 
     for block in _runtime_analysis_blocks(project, functions).values():
         origins: dict[str, _NullableHandleOrigin] = {}
+        unguarded_reported_origins: set[tuple[str, int, str]] = set()
         for line_offset, line in enumerate(block.lines[1:], start=1):
             masked = _mask_non_code(line)
 
@@ -789,12 +1029,22 @@ def _lint_nullable_handle_dereferences(
                                 line_offset,
                                 variable,
                                 after_line=origin.line_offset,
+                                nonnull_predicates=nonnull_predicates,
                             )
                         )
                     elif variable is None:
                         producer = _argument_contains_nullable_producer(argument, kinds)
 
-                    if producer is not None and not guarded:
+                    origin_key = (
+                        variable,
+                        origin.line_offset,
+                        origin.producer,
+                    ) if variable is not None and origin is not None else None
+                    if (
+                        producer is not None
+                        and not guarded
+                        and (origin_key is None or origin_key not in unguarded_reported_origins)
+                    ):
                         label = variable or f"результат {producer}"
                         key = (block.name.casefold(), line_offset, call, label)
                         if key not in reported:
@@ -809,6 +1059,8 @@ def _lint_nullable_handle_dereferences(
                                     line.strip(),
                                 )
                             )
+                            if origin_key is not None:
+                                unguarded_reported_origins.add(origin_key)
 
                     selector = origin.type_selector if origin is not None else None
                     direct_starruins = "starruins" in {
@@ -865,6 +1117,7 @@ def _lint_nullable_handle_dereferences(
                             line_offset,
                             alias,
                             after_line=source.line_offset,
+                            nonnull_predicates=nonnull_predicates,
                         ),
                     )
                 else:
@@ -5044,13 +5297,18 @@ def _lint_warrior_home_release(
 def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     path = str(project.path) if project.path else None
     functions, issues = _extract_functions(project)
+    nonnull_predicates = _nonnull_predicate_summaries(functions)
     issues.extend(_lint_apostrophes_in_line_comments(project))
     issues.extend(_lint_unregistered_tvar_assignments(project, functions))
     issues.extend(_lint_cross_block_calls(project, functions))
     issues.extend(_lint_unavailable_engine_calls(project, functions))
     issues.extend(_lint_unresolved_user_functions(project, functions))
-    issues.extend(_lint_object_api_behind_boolean_guard(project, functions))
-    issues.extend(_lint_nullable_handle_dereferences(project, functions))
+    issues.extend(
+        _lint_object_api_behind_boolean_guard(project, functions, nonnull_predicates)
+    )
+    issues.extend(
+        _lint_nullable_handle_dereferences(project, functions, nonnull_predicates)
+    )
     issues.extend(_lint_duplicate_local_declarations(project))
     issues.extend(_lint_rscript_arrays(project))
     issues.extend(_lint_dialog_persistent_arrays(project))

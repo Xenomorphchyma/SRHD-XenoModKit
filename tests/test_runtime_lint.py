@@ -1715,6 +1715,90 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-object-api-without-explicit-guard", codes)
 
+    def test_nullable_handle_accepts_proven_user_predicate_guard(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function IsLiveStar(dword star)",
+            "{",
+            "    result = 0;",
+            "    if(!star) exit;",
+            "    result = 1;",
+            "}",
+            "function IsFreeStar(dword star)",
+            "{",
+            "    result = 0;",
+            "    if(!IsLiveStar(star)) exit;",
+            "    result = 1;",
+            "}",
+            "dword star = GalaxyStar(i);",
+            "if(!IsLiveStar(star)) continue;",
+            "int owner = StarOwner(star);",
+            "dword other_star = GalaxyStar(i + 1);",
+            "if(!IsFreeStar(other_star) || other_star == star) continue;",
+            "int distance = Dist(star, other_star);",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("predicate-guard.rson")))
+        }
+        self.assertNotIn("runtime-object-api-without-explicit-guard", codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function UnsafePredicate(dword star)",
+            "{",
+            "    result = 0;",
+            "    StarOwner(star);",
+            "    if(!star) exit;",
+            "    result = 1;",
+            "}",
+            "dword star = GalaxyStar(i);",
+            "if(!UnsafePredicate(star)) continue;",
+            "result = StarName(star);",
+        ]
+        unsafe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("unsafe-predicate.rson")))
+        }
+        self.assertIn("runtime-object-api-without-explicit-guard", unsafe_codes)
+
+    def test_nullable_handle_accepts_eager_safe_compound_null_guard(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword star = GalaxyStar(i);",
+            "if(!star || star == source_star) continue;",
+            "result = Id(star);",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("compound-guard.rson")))
+        }
+        self.assertNotIn("runtime-object-api-without-explicit-guard", codes)
+
+    def test_nullable_handle_deduplicates_cascade_but_keeps_dist_root(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function IsLiveStar(dword star)",
+            "{",
+            "    result = 0;",
+            "    if(!star) exit;",
+            "    result = 1;",
+            "}",
+            "dword star = GalaxyStar(i);",
+            "if(!IsLiveStar(star) || StarOwner(star) != 0) continue;",
+            "int threat = StarEnemyThreatLevel(star, 1);",
+            "result = Id(star);",
+            "int distance = Dist(GalaxyStar(j), known_star);",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("root-causes.rson")))
+        missing_guards = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-object-api-without-explicit-guard"
+        ]
+        self.assertEqual(len(missing_guards), 2)
+        self.assertIn("StarOwner(star)", missing_guards[0].evidence)
+        self.assertIn("Dist(GalaxyStar(j)", missing_guards[1].evidence)
+
     def test_dialog_injection_reports_late_persistent_turn_gate_as_advisory(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]
