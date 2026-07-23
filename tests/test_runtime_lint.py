@@ -1052,6 +1052,191 @@ class RuntimeLintTests(unittest.TestCase):
         issue = next(item for item in issues if item.code == "runtime-nested-world-loop")
         self.assertEqual(issue.severity, "error")
 
+    def test_growing_membership_scan_inside_world_pair_is_warning(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        turn = data["Visual.Objects"][0]["Operations"][1]["Code"]
+        turn.extend(
+            [
+                "function ResolveStar(int wanted_id)",
+                "{",
+                "    result = 0;",
+                "    for(int resolve_i = 0; resolve_i < GalaxyStars(); resolve_i = resolve_i + 1)",
+                "    {",
+                "        dword resolve_star = GalaxyStar(resolve_i);",
+                "        if(resolve_star && Id(resolve_star) == wanted_id) { result = resolve_star; exit; }",
+                "    }",
+                "}",
+                "function BuildRoute()",
+                "{",
+                "    unknown queue_ids = newarray(1);",
+                "    ArrayClear(queue_ids);",
+                "    int star_count = GalaxyStars();",
+                "    ArrayAdd(queue_ids, 1);",
+                "    for(int node = 1; node <= star_count; node = node + 1)",
+                "    {",
+                "        dword current = ResolveStar(queue_ids[node]);",
+                "        for(int candidate = 0; candidate < GalaxyStars(); candidate = candidate + 1)",
+                "        {",
+                "            int already_seen = 0;",
+                "            for(int seen = 1; seen < ArrayDim(queue_ids); seen = seen + 1)",
+                "            {",
+                "                if(queue_ids[seen] == Id(GalaxyStar(candidate))) already_seen = 1;",
+                "            }",
+                "            if(!already_seen) ArrayAdd(queue_ids, Id(GalaxyStar(candidate)));",
+                "        }",
+                "    }",
+                "}",
+                "BuildRoute();",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("cubic-route.rson")))
+        membership = next(
+            item for item in issues if item.code == "runtime-hot-growing-membership-scan"
+        )
+        hidden = next(
+            item
+            for item in issues
+            if item.code == "runtime-user-function-world-loop-cost-propagation"
+        )
+        self.assertEqual(membership.severity, "warning")
+        self.assertIn("O(S^3)", membership.message)
+        self.assertIn("Turn -> BuildRoute", membership.message)
+        self.assertEqual(hidden.severity, "info")
+        self.assertIn("BuildRoute -> ResolveStar", hidden.message)
+        self.assertIn("O(S^2)", hidden.message)
+
+    def test_flat_world_pair_pass_is_not_reported_as_cubic(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        turn = data["Visual.Objects"][0]["Operations"][1]["Code"]
+        turn.extend(
+            [
+                "function BuildMatrix()",
+                "{",
+                "    int star_count = GalaxyStars();",
+                "    int pair_limit = star_count * star_count;",
+                "    for(int pair = 0; pair < pair_limit; pair = pair + 1)",
+                "    {",
+                "        int left = pair / star_count;",
+                "        int right = pair - left * star_count;",
+                "        dword left_star = GalaxyStar(left);",
+                "        dword right_star = GalaxyStar(right);",
+                "    }",
+                "}",
+                "BuildMatrix();",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("flat-pair.rson")))
+        hot_codes = {
+            item.code
+            for item in issues
+            if item.code.startswith("runtime-hot-")
+            or item.code == "runtime-user-function-world-loop-cost-propagation"
+        }
+        self.assertEqual(hot_codes, set())
+
+    def test_world_scan_helper_inside_flat_world_pair_warns_about_cubic_cost(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        turn = data["Visual.Objects"][0]["Operations"][1]["Code"]
+        turn.extend(
+            [
+                "function ResolveStar(int wanted_id)",
+                "{",
+                "    result = 0;",
+                "    for(int resolve_i = 0; resolve_i < GalaxyStars(); resolve_i = resolve_i + 1)",
+                "    {",
+                "        dword resolve_star = GalaxyStar(resolve_i);",
+                "        if(resolve_star && Id(resolve_star) == wanted_id) { result = resolve_star; exit; }",
+                "    }",
+                "}",
+                "function BuildMatrix()",
+                "{",
+                "    int star_count = GalaxyStars();",
+                "    int pair_limit = star_count * star_count;",
+                "    for(int pair = 0; pair < pair_limit; pair = pair + 1)",
+                "    {",
+                "        dword star = ResolveStar(pair);",
+                "    }",
+                "}",
+                "BuildMatrix();",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("hidden-cubic.rson")))
+        hidden = next(
+            item
+            for item in issues
+            if item.code == "runtime-user-function-world-loop-cost-propagation"
+        )
+        self.assertEqual(hidden.severity, "warning")
+        self.assertIn("O(S^3)", hidden.message)
+        self.assertIn("Turn -> BuildMatrix -> ResolveStar", hidden.message)
+
+    def test_unreachable_cubic_helper_does_not_create_hot_path_warning(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        turn = data["Visual.Objects"][0]["Operations"][1]["Code"]
+        turn.extend(
+            [
+                "function UnusedRouteBuilder()",
+                "{",
+                "    unknown queue_ids = newarray(1);",
+                "    int star_count = GalaxyStars();",
+                "    for(int node = 0; node < star_count; node = node + 1)",
+                "    {",
+                "        for(int candidate = 0; candidate < GalaxyStars(); candidate = candidate + 1)",
+                "        {",
+                "            for(int seen = 1; seen < ArrayDim(queue_ids); seen = seen + 1)",
+                "            {",
+                "                if(queue_ids[seen] == candidate) result = 1;",
+                "            }",
+                "            ArrayAdd(queue_ids, candidate);",
+                "        }",
+                "    }",
+                "}",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("unused-cubic.rson")))
+        self.assertFalse(
+            any(
+                item.code in {
+                    "runtime-hot-growing-membership-scan",
+                    "runtime-user-function-world-loop-cost-propagation",
+                }
+                for item in issues
+            )
+        )
+
+    def test_rescaling_world_count_does_not_invent_another_dimension(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        turn = data["Visual.Objects"][0]["Operations"][1]["Code"]
+        turn.extend(
+            [
+                "function ScanWorld()",
+                "{",
+                "    for(int scan_i = 0; scan_i < GalaxyStars(); scan_i = scan_i + 1)",
+                "    {",
+                "        dword scan_star = GalaxyStar(scan_i);",
+                "    }",
+                "}",
+                "function RescaledPass()",
+                "{",
+                "    int star_count = GalaxyStars();",
+                "    star_count = star_count * 2;",
+                "    for(int i = 0; i < star_count; i = i + 1)",
+                "    {",
+                "        ScanWorld();",
+                "    }",
+                "}",
+                "RescaledPass();",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("rescaled-world.rson")))
+        hidden = next(
+            item
+            for item in issues
+            if item.code == "runtime-user-function-world-loop-cost-propagation"
+        )
+        self.assertEqual(hidden.severity, "info")
+        self.assertIn("O(S^2)", hidden.message)
+
     def test_module_sections_are_checked_per_language(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             path = Path(name) / "ModuleInfo.txt"

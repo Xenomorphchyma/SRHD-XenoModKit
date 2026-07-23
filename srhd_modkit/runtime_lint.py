@@ -2800,6 +2800,328 @@ def _runtime_loop_depths(
     return result
 
 
+@dataclass(frozen=True)
+class _WorldLoopSite:
+    header: int
+    end: int
+    world_degree: int
+    array_name: str | None
+    evidence: str
+
+
+_WORLD_BOUND_ASSIGNMENT_RE = re.compile(
+    r"\b(?:(?:int|dword|unknown)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+    re.IGNORECASE,
+)
+
+
+def _world_expression_degree(expression: str, bounds: Mapping[str, int]) -> int:
+    """Estimate the GalaxyStars cardinality exponent of a loop bound.
+
+    The estimate is intentionally narrow.  It understands aliases and
+    products such as ``star_count * star_count`` but does not guess the cost of
+    arbitrary arithmetic or engine calls.  This keeps flat, exact SxS loops
+    distinguishable from a third hidden world-sized multiplier.
+    """
+
+    folded = _mask_non_code(expression).casefold()
+    factors = re.split(r"\*", folded)
+    factor_degrees: list[int] = []
+    for factor in factors:
+        degree = 1 if re.search(r"\bgalaxystars\s*\(", factor) else 0
+        for identifier in IDENTIFIER_RE.findall(factor):
+            degree = max(degree, bounds.get(identifier.casefold(), 0))
+        factor_degrees.append(degree)
+    if len(factors) > 1:
+        return sum(factor_degrees)
+    return factor_degrees[0] if factor_degrees else 0
+
+
+def _world_bound_degrees(block: FunctionBlock) -> dict[str, int]:
+    bounds: dict[str, int] = {}
+    assignments: list[tuple[str, str]] = []
+    for line in block.lines[1:]:
+        masked = _mask_non_code(line)
+        assignments.extend(
+            (match.group(1).casefold(), match.group(2))
+            for match in _WORLD_BOUND_ASSIGNMENT_RE.finditer(masked)
+        )
+    # Aliases may be declared before their source in decompiled projects.
+    for _pass in range(max(1, len(assignments))):
+        changed = False
+        for name, expression in assignments:
+            identifiers = {
+                item.casefold() for item in IDENTIFIER_RE.findall(expression)
+            }
+            if name in identifiers and name in bounds:
+                # Updating a bound in place (count=count*2, count=count+1)
+                # does not create another independent world dimension.
+                degree = max(
+                    bounds[name],
+                    1 if re.search(r"\bgalaxystars\s*\(", expression, re.IGNORECASE) else 0,
+                    *(bounds.get(item, 0) for item in identifiers if item != name),
+                )
+            else:
+                degree = _world_expression_degree(expression, bounds)
+            degree = min(3, degree)
+            if degree > bounds.get(name, 0):
+                bounds[name] = degree
+                changed = True
+        if not changed:
+            break
+    return bounds
+
+
+def _world_loop_sites(block: FunctionBlock) -> tuple[_WorldLoopSite, ...]:
+    bounds = _world_bound_degrees(block)
+    sites: list[_WorldLoopSite] = []
+    for index, line in enumerate(block.lines):
+        masked = _mask_non_code(line)
+        match = re.search(r"\bfor\s*\((.*)\)", masked, re.IGNORECASE)
+        if not match:
+            continue
+        clauses = match.group(1).split(";")
+        if len(clauses) != 3:
+            continue
+        condition = clauses[1]
+        upper = re.search(r"(?:<=|<)\s*(.+?)\s*$", condition)
+        if not upper:
+            continue
+        expression = upper.group(1)
+        array = re.fullmatch(
+            r"ArrayDim\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+            expression,
+            re.IGNORECASE,
+        )
+        body = _statement_body_range(block.lines, index)
+        if body is None:
+            continue
+        sites.append(
+            _WorldLoopSite(
+                index,
+                body[1],
+                _world_expression_degree(expression, bounds),
+                array.group(1).casefold() if array else None,
+                line.strip(),
+            )
+        )
+    return tuple(sites)
+
+
+def _loop_world_degree(sites: Sequence[_WorldLoopSite], line: int) -> int:
+    return sum(
+        site.world_degree
+        for site in sites
+        if site.world_degree > 0 and site.header <= line <= site.end
+    )
+
+
+def _runtime_call_path(
+    starts: set[str],
+    graph: Mapping[str, set[str]],
+    functions: Mapping[str, FunctionBlock],
+    target: str,
+) -> str:
+    """Return one shortest runtime call path for a diagnostic message."""
+
+    def display(name: str) -> str:
+        block = functions[name]
+        if name.startswith("__handler_"):
+            return "Turn" if block.code_type == "turn" else "Handler"
+        return block.name
+
+    wanted = target.casefold()
+    incoming = {
+        child
+        for parent in starts
+        for child in graph.get(parent.casefold(), ())
+    }
+    roots = {
+        start.casefold() for start in starts
+        if start.casefold() in functions and start.casefold() not in incoming
+    }
+    if not roots:
+        roots = {start.casefold() for start in starts if start.casefold() in functions}
+    pending: list[tuple[str, tuple[str, ...]]] = [
+        (start, (start,)) for start in sorted(roots)
+    ]
+    visited: set[str] = set()
+    while pending:
+        name, path = pending.pop(0)
+        if name in visited:
+            continue
+        visited.add(name)
+        if name == wanted:
+            labels: list[str] = []
+            for item in path:
+                label = display(item)
+                if not labels or labels[-1] != label:
+                    labels.append(label)
+            return " -> ".join(labels)
+        for child in sorted(graph.get(name, ())):
+            if child in functions and child not in visited:
+                pending.append((child, (*path, child)))
+    return functions[wanted].name if wanted in functions else target
+
+
+def _lint_hot_world_complexity(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Find high-confidence cubic upper bounds without rejecting flat SxS work."""
+
+    path = str(project.path) if project.path else None
+    functions = _runtime_analysis_blocks(project, functions)
+    graph = _call_graph(functions)
+    runtime_starts = {
+        name
+        for name, block in functions.items()
+        if name.startswith("__handler_") and block.code_type == "turn"
+    }
+    reachable = _reachable(runtime_starts, graph)
+    sites_by_function = {
+        name: _world_loop_sites(block) for name, block in functions.items()
+    }
+    issues: list[RuntimeIssue] = []
+
+    allocation = re.compile(
+        r"\b(?:int|dword|unknown)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*"
+        r"=(?!=)\s*newarray\s*\(",
+        re.IGNORECASE,
+    )
+    for name in sorted(reachable):
+        block = functions[name]
+        sites = sites_by_function[name]
+        local_arrays = {
+            match.group(1).casefold()
+            for line in block.lines[1:]
+            for match in allocation.finditer(_mask_non_code(line))
+        }
+        add_lines: dict[str, list[int]] = {}
+        for line_index, line in enumerate(block.lines[1:], start=1):
+            for _position, arguments in _call_arguments(_mask_non_code(line), "ArrayAdd"):
+                if arguments and (array_name := _simple_identifier(arguments[0])):
+                    add_lines.setdefault(array_name, []).append(line_index)
+
+        reported_arrays: set[str] = set()
+        for site in sites:
+            array_name = site.array_name
+            if (
+                not array_name
+                or array_name in reported_arrays
+                or array_name not in local_arrays
+                or array_name not in add_lines
+            ):
+                continue
+            outer_degree = sum(
+                outer.world_degree
+                for outer in sites
+                if outer.world_degree > 0
+                and outer.header < site.header <= outer.end
+            )
+            if outer_degree < 2:
+                continue
+            scan_text = _mask_non_code(
+                "\n".join(block.lines[site.header : site.end + 1])
+            )
+            if not re.search(
+                rf"\b{re.escape(array_name)}\s*\[", scan_text, re.IGNORECASE
+            ) or not re.search(r"==|!=", scan_text):
+                continue
+            if not any(
+                _loop_world_degree(sites, add_line) > 0
+                for add_line in add_lines[array_name]
+            ):
+                continue
+            reported_arrays.add(array_name)
+            complexity = outer_degree + 1
+            call_path = _runtime_call_path(runtime_starts, graph, functions, name)
+            issues.append(
+                RuntimeIssue(
+                    "warning",
+                    "runtime-hot-growing-membership-scan",
+                    f"Верхняя оценка горячего пути {call_path} — O(S^{complexity}): "
+                    f"внутри мирового обхода степени {outer_degree} линейно ищется "
+                    f"элемент в растущем локальном массиве {array_name}. Плоский SxS "
+                    "допустим, но дополнительный ArrayDim-поиск может превысить "
+                    "лимит выражений Turn на большой галактике; используйте таблицу "
+                    "посещённости по индексу или подтвердите допустимость профилированием",
+                    path,
+                    f"{block.location} line {block.start_line + site.header}",
+                    site.evidence,
+                )
+            )
+
+    # Propagate the cardinality of user helpers through their direct call
+    # sites.  Degree two is useful information; degree three is a warning,
+    # because static complexity alone cannot prove that a small or rare path
+    # will exceed the engine's expression budget.
+    summaries = {
+        name: min(3, max(
+            (_loop_world_degree(sites, site.header) for site in sites if site.world_degree),
+            default=0,
+        ))
+        for name, sites in sites_by_function.items()
+    }
+    call_sites: dict[str, list[tuple[int, str]]] = {}
+    for name, block in functions.items():
+        known_calls: list[tuple[int, str]] = []
+        for line_index, line in enumerate(block.lines[1:], start=1):
+            for _position, call, _arguments in _line_call_sites(_mask_non_code(line)):
+                if call in functions:
+                    known_calls.append((line_index, call))
+        call_sites[name] = known_calls
+    for _pass in range(max(1, len(functions))):
+        changed = False
+        for name, sites in sites_by_function.items():
+            for line_index, callee in call_sites[name]:
+                degree = min(
+                    3,
+                    _loop_world_degree(sites, line_index) + summaries.get(callee, 0),
+                )
+                if degree > summaries[name]:
+                    summaries[name] = degree
+                    changed = True
+        if not changed:
+            break
+
+    reported_calls: set[tuple[str, str, int]] = set()
+    for name in sorted(reachable):
+        block = functions[name]
+        sites = sites_by_function[name]
+        for line_index, callee in call_sites[name]:
+            caller_degree = _loop_world_degree(sites, line_index)
+            callee_degree = summaries.get(callee, 0)
+            if caller_degree < 1 or callee_degree < 1:
+                continue
+            degree = min(3, caller_degree + callee_degree)
+            key = (name, callee, degree)
+            if key in reported_calls:
+                continue
+            reported_calls.add(key)
+            call_path = _runtime_call_path(runtime_starts, graph, functions, name)
+            full_path = f"{call_path} -> {functions[callee].name}"
+            evidence = block.lines[line_index].strip()
+            issues.append(
+                RuntimeIssue(
+                    "warning" if degree >= 3 else "info",
+                    "runtime-user-function-world-loop-cost-propagation",
+                    f"Путь {full_path} содержит скрытый мировой обход в пользовательской "
+                    f"функции и оценивается как O(S^{degree}). "
+                    + (
+                        "Третий мировой множитель стоит устранить, свести к O(1) lookup "
+                        "или отдельно подтвердить профилированием"
+                        if degree >= 3
+                        else "Это не блокирует точный SxS, но helper не является O(1)"
+                    ),
+                    path,
+                    f"{block.location} line {block.start_line + line_index}",
+                    evidence,
+                )
+            )
+    return issues
+
+
 def _global_initialization_lines(project: RsonProject) -> list[tuple[int | None, int, str]]:
     result: list[tuple[int | None, int, str]] = []
     for item in project.iter_objects():
@@ -6110,6 +6432,12 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
         )
 
     reachable_runtime = _reachable(runtime_starts, graph)
+    issues.extend(
+        _lint_hot_world_complexity(
+            project,
+            functions,
+        )
+    )
     loop_depths = _runtime_loop_depths(turn_starts, graph, functions)
     for name, (depth, local_depth, evidence) in sorted(loop_depths.items()):
         if depth < 2 or local_depth < 1 or name not in risky or evidence is None:
