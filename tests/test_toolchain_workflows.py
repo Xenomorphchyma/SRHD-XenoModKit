@@ -190,6 +190,14 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertEqual(len(result["comparison"]["changed_blocks"]), 1)
             self.assertEqual(len(result["comparison"]["runtime_issues"]["added"]), 1)
             self.assertEqual(len(result["comparison"]["runtime_issues"]["resolved"]), 1)
+            update_issues = result["comparison"]["update_issues"]
+            self.assertEqual(len(update_issues), 1)
+            self.assertEqual(
+                update_issues[0]["code"],
+                "runtime-saved-script-cache-update-shadow",
+            )
+            self.assertEqual(update_issues[0]["severity"], "warning")
+            self.assertEqual(update_issues[0]["script_name"], "Workflow")
             self.assertFalse(result["comparison"]["temporary_projects_persisted"])
             self.assertTrue(result["right"]["lang_import"]["fallback_used"])
             self.assertFalse(result["right"]["dialogs_imported"])

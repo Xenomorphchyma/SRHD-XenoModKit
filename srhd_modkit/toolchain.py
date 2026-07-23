@@ -1669,6 +1669,7 @@ class Toolchain:
             runtime_changes = {"added": [], "resolved": [], "unchanged": []}
             storage_compatibility: dict[str, Any] | None = None
             dialog_semantics: dict[str, Any] | None = None
+            update_issues: list[dict[str, Any]] = []
             if verified:
                 left_project = load_rson(left_rson)
                 right_project = load_rson(right_rson)
@@ -1685,6 +1686,40 @@ class Toolchain:
                 right_summary = right_project.summary()
                 left_scr_info = inspect_scr(left)
                 right_scr_info = inspect_scr(right)
+                left_script_name = str(left_summary.get("name", "")).strip()
+                right_script_name = str(right_summary.get("name", "")).strip()
+                left_sha256 = left_result.get("source_sha256")
+                right_sha256 = right_result.get("source_sha256")
+                if (
+                    left_script_name
+                    and right_script_name
+                    and left_script_name.casefold() == right_script_name.casefold()
+                    and isinstance(left_sha256, str)
+                    and isinstance(right_sha256, str)
+                    and left_sha256 != right_sha256
+                ):
+                    update_issues.append(
+                        {
+                            "severity": "warning",
+                            "code": "runtime-saved-script-cache-update-shadow",
+                            "message": (
+                                f"SCR изменился, но runtime-имя {right_script_name!r} "
+                                "осталось прежним. Активный экземпляр скрипта и его "
+                                "код могут быть сериализованы в SAV, поэтому замена "
+                                "файла на диске не доказывает обновление уже "
+                                "загруженного сохранения. Для несовместимого "
+                                "runtime-исправления используйте новый epoch/"
+                                "ScriptName и проверенную миграцию"
+                            ),
+                            "script_name": right_script_name,
+                            "left_sha256": left_sha256,
+                            "right_sha256": right_sha256,
+                            "evidence": (
+                                f"{left.name} {left_sha256} -> "
+                                f"{right.name} {right_sha256}"
+                            ),
+                        }
+                    )
                 event_signatures_match = (
                     left_scr_info["event_signatures"] == right_scr_info["event_signatures"]
                 )
@@ -1763,6 +1798,7 @@ class Toolchain:
                     "code_changed": bool(changed_blocks) if verified else None,
                     "changed_blocks": changed_blocks,
                     "runtime_issues": runtime_changes,
+                    "update_issues": update_issues,
                     "storage_compatibility": storage_compatibility,
                     "dialog_semantics": dialog_semantics,
                     "temporary_projects_persisted": False,

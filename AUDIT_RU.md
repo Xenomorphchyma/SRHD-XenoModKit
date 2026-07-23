@@ -141,6 +141,10 @@ QM/QMM. В текущем ModCFG распознаны
 - `compare_storage_schemas()` выявляет новый persistent-массив под старым
   first-run gate; `script compare-scr` публикует эту проверку вместе со
   смысловыми картами диалогов.
+- Только добровольный `script compare-scr OLD NEW` добавляет в `update_issues`
+  предупреждение `runtime-saved-script-cache-update-shadow`, когда SHA-256 SCR
+  различается, а `ScriptName` совпадает. Одиночные `lint-runtime`, `audit` и
+  `release` не делают предположений о содержимом пользовательских SAV.
 - RSON preflight: незакрытые строки/комментарии/скобки и случайный не-ASCII
   текст вне строк и комментариев отсекаются до запуска RScript.
 - Небольшой проект во внешнем RScript получает 60-секундное скользящее окно без

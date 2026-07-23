@@ -1673,6 +1673,10 @@ def cmd_script_compare_scr(args: argparse.Namespace) -> int:
         print(f"Изменённых блоков кода: {len(comparison['changed_blocks'])}")
         runtime = comparison["runtime_issues"]
         print(f"Runtime-замечания: +{len(runtime['added'])}, -{len(runtime['resolved'])}, ={len(runtime['unchanged'])}")
+        update_issues = comparison["update_issues"]
+        print(f"Риски обновления сохранений: {len(update_issues)}")
+        for issue in update_issues:
+            print(f"  {issue['severity'].upper()} {issue['code']}: {issue['message']}")
     if result["verified"]:
         return 0
     return 1 if result.get("operational_failure") else 2

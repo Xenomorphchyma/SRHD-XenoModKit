@@ -498,7 +498,7 @@ class RuntimeLintTests(unittest.TestCase):
         )
         self.assertEqual(lint_main_runtime(safe, "Main.txt"), [])
 
-    def test_onload_same_name_guard_reports_saved_script_cache_shadow(self) -> None:
+    def test_onload_same_name_guard_is_not_reported_without_scr_comparison(self) -> None:
         document = parse_blockpar(
             "BV ^{\n"
             "  OnLoad ^{\n"
@@ -509,27 +509,9 @@ class RuntimeLintTests(unittest.TestCase):
             "  }\n"
             "}\n"
         )
-        matching = [
-            issue
-            for issue in lint_main_runtime(document, "Main.txt")
-            if issue.code == "runtime-saved-script-cache-update-shadow"
-        ]
-        self.assertEqual(len(matching), 1)
-        self.assertEqual(matching[0].severity, "info")
-
-        migrated = parse_blockpar(
-            "BV ^{\n"
-            "  OnLoad ^{\n"
-            "    Runtime ^{\n"
-            "      01=if(!IsScriptActive('Mod_Worker')) "
-            "ScriptRun(ShipStar(Player()), GetShipPlanet(Player()), 'Mod_Worker_v2');\n"
-            "    }\n"
-            "  }\n"
-            "}\n"
-        )
         self.assertNotIn(
             "runtime-saved-script-cache-update-shadow",
-            {issue.code for issue in lint_main_runtime(migrated, "Main.txt")},
+            {issue.code for issue in lint_main_runtime(document, "Main.txt")},
         )
 
     def test_mod_owned_quest_item_without_image_is_deduplicated(self) -> None:

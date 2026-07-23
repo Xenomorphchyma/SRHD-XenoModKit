@@ -7680,7 +7680,6 @@ def _node_parameters(nodes: Iterable[BlockParNode], prefix: str = ""):
 def lint_main_runtime(document: BlockParDocument, path: str | Path | None = None) -> list[RuntimeIssue]:
     issues: list[RuntimeIssue] = []
     source = str(Path(path).resolve()) if path else None
-    cache_shadow_reported: set[str] = set()
     for node_path, key, value in _node_parameters(document.roots):
         for arguments, call in _script_run_calls(value):
             if len(arguments) < 2:
@@ -7721,38 +7720,6 @@ def lint_main_runtime(document: BlockParDocument, path: str | Path | None = None
                         call,
                     )
                 )
-        if "onload" not in {part.casefold() for part in node_path.split("/")}:
-            continue
-        active_names = {
-            literal.casefold(): literal
-            for _position, arguments, _end in _iter_parsed_calls(value, "IsScriptActive")
-            if arguments and (literal := _literal_string(arguments[0])) is not None
-        }
-        run_names = {
-            literal.casefold(): literal
-            for _position, arguments, _end in _iter_parsed_calls(value, "ScriptRun")
-            if len(arguments) >= 3 and (literal := _literal_string(arguments[2])) is not None
-        }
-        for script_name in sorted(
-            (active_names.keys() & run_names.keys()) - cache_shadow_reported
-        ):
-            cache_shadow_reported.add(script_name)
-            label = run_names[script_name]
-            issues.append(
-                RuntimeIssue(
-                    "info",
-                    "runtime-saved-script-cache-update-shadow",
-                    f"OnLoad запускает {label!r} только при "
-                    "!IsScriptActive с тем же именем. Активный экземпляр и его "
-                    "код сериализуются в SAV, поэтому замена одноимённого SCR на "
-                    "диске не доказывает обновление уже загруженного сохранения. "
-                    "Для несовместимого runtime-исправления используйте новый "
-                    "epoch/ScriptName и явную миграцию старого экземпляра",
-                    source,
-                    f"{node_path}/{key}",
-                    value.strip(),
-                )
-            )
     return issues
 
 
