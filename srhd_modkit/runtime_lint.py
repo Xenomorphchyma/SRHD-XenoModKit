@@ -4645,6 +4645,270 @@ def _first_if_condition(text: str) -> str | None:
     return None
 
 
+_SPECIAL_SHIP_OWNER_NAMES = {
+    "kling": 5,
+    "none": 6,
+    "pirateclan": 7,
+}
+
+
+def _special_ship_owner(expression: str) -> tuple[int, str] | None:
+    value = _constant_int(expression)
+    if value is not None and 5 <= value <= 7:
+        return value, str(value)
+    name = expression.strip().casefold()
+    if name in _SPECIAL_SHIP_OWNER_NAMES:
+        return _SPECIAL_SHIP_OWNER_NAMES[name], expression.strip()
+    return None
+
+
+def _ranger_positive_condition_variables(condition: str) -> set[str]:
+    """Return ships proven to be t_Ranger while a condition is true."""
+
+    if len(_split_top_level_boolean(condition, "||")) > 1:
+        return set()
+    result: set[str] = set()
+    patterns = (
+        r"ShipTypeN\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*==\s*t_Ranger",
+        r"t_Ranger\s*==\s*ShipTypeN\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+    )
+    for term in _split_top_level_boolean(condition, "&&"):
+        stripped = _strip_balanced_outer_parentheses(term)
+        for pattern in patterns:
+            if match := re.fullmatch(pattern, stripped, re.IGNORECASE):
+                result.add(match.group(1).casefold())
+    return result
+
+
+def _ranger_after_exiting_condition(condition: str) -> set[str]:
+    """Return ships proven to be t_Ranger after an exiting if branch."""
+
+    result: set[str] = set()
+    patterns = (
+        r"ShipTypeN\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*!=\s*t_Ranger",
+        r"t_Ranger\s*!=\s*ShipTypeN\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+    )
+    # When an OR branch exits, continuing execution proves every OR term false.
+    # An AND condition would not prove which term failed.
+    for term in _split_top_level_boolean(condition, "||"):
+        stripped = _strip_balanced_outer_parentheses(term)
+        for pattern in patterns:
+            if match := re.fullmatch(pattern, stripped, re.IGNORECASE):
+                result.add(match.group(1).casefold())
+    return result
+
+
+def _ranger_variables_by_line(
+    block: FunctionBlock,
+    ranger_parameter_indices: set[int],
+) -> dict[int, frozenset[str]]:
+    """Track local ranger proofs, including positive and exiting type guards."""
+
+    parameters = _function_parameters(block)
+    ranger_depth = {
+        parameters[index]: 0
+        for index in ranger_parameter_indices
+        if 0 <= index < len(parameters)
+    }
+    depths = _line_depths(block.lines)
+    targets = set(range(1, len(block.lines)))
+    enclosing = _condition_sets_for_lines(block.lines, targets)
+    positive_by_line: dict[int, set[str]] = {
+        index: {
+            variable
+            for condition in conditions
+            for variable in _ranger_positive_condition_variables(condition)
+        }
+        for index, conditions in enclosing.items()
+    }
+    post_guard: dict[int, set[str]] = {}
+    for index in range(1, len(block.lines)):
+        header = _mask_non_code(block.lines[index])
+        if re.match(r"\s*if\b", header, re.IGNORECASE) is None:
+            continue
+        window = "\n".join(block.lines[index : min(len(block.lines), index + 10)])
+        condition = _exiting_if_condition(window)
+        if condition is None:
+            continue
+        proven = _ranger_after_exiting_condition(condition)
+        if not proven:
+            continue
+        close = header.rfind(")")
+        inline_exit = close >= 0 and re.match(
+            r"\s*(?:exit|return|continue)\b",
+            header[close + 1 :],
+            re.IGNORECASE,
+        )
+        body = None if inline_exit else _statement_body_range(block.lines, index)
+        activation = body[1] + 1 if body else index + 1
+        post_guard.setdefault(activation, set()).update(proven)
+
+    assignment = re.compile(
+        r"(?:\b(?:int|dword|str|float|double|bool|unknown)\s+)?"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+        re.IGNORECASE,
+    )
+    result: dict[int, frozenset[str]] = {}
+    for index, line in enumerate(block.lines[1:], start=1):
+        depth = depths[index] if index < len(depths) else 0
+        for variable, proof_depth in tuple(ranger_depth.items()):
+            if proof_depth > depth:
+                ranger_depth.pop(variable, None)
+        for variable in post_guard.get(index, ()):
+            ranger_depth[variable] = depth
+        masked = _mask_non_code(line)
+        for match in assignment.finditer(masked):
+            target = match.group(1).casefold()
+            expression = match.group(2)
+            calls = _line_call_sites(expression)
+            direct_source = any(
+                call in {"buyranger", "galaxyranger", "player"}
+                or (call == "galaxyrangers" and bool(arguments and arguments[0]))
+                for _position, call, arguments in calls
+            )
+            alias = _simple_identifier(expression)
+            if direct_source or (alias is not None and alias in ranger_depth):
+                ranger_depth[target] = depth
+            else:
+                ranger_depth.pop(target, None)
+        same_line_condition = _first_if_condition(masked)
+        same_line_positive = (
+            _ranger_positive_condition_variables(same_line_condition)
+            if same_line_condition is not None
+            else set()
+        )
+        result[index] = frozenset(
+            set(ranger_depth) | positive_by_line.get(index, set()) | same_line_positive
+        )
+    return result
+
+
+def _lint_shipowner_class_discriminator_mismatch(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Reject special ShipOwner values for ships proven to be TRanger."""
+
+    path = str(project.path) if project.path else None
+    blocks = _runtime_analysis_blocks(project, functions)
+    graph = _call_graph(blocks)
+    starts = {name for name in blocks if name.startswith("__handler_")}
+    reachable = _reachable(starts, graph)
+    ranger_parameters: dict[str, set[int]] = {name: set() for name in blocks}
+    maps: dict[str, dict[int, frozenset[str]]] = {}
+
+    for _pass in range(max(1, len(blocks))):
+        maps = {
+            name: _ranger_variables_by_line(block, ranger_parameters[name])
+            for name, block in blocks.items()
+        }
+        changed = False
+        for name in sorted(reachable):
+            block = blocks[name]
+            for line_index, line in enumerate(block.lines[1:], start=1):
+                ranger = maps[name].get(line_index, frozenset())
+                for _position, call, arguments in _line_call_sites(_mask_non_code(line)):
+                    if call not in blocks:
+                        continue
+                    for argument_index, argument in enumerate(arguments):
+                        variable = _simple_identifier(argument)
+                        if variable not in ranger:
+                            continue
+                        if argument_index not in ranger_parameters[call]:
+                            ranger_parameters[call].add(argument_index)
+                            changed = True
+        if not changed:
+            break
+
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[str, int, str]] = set()
+    for name in sorted(reachable):
+        block = blocks[name]
+        ranger_by_line = maps.get(name, {})
+        for line_index, line in enumerate(block.lines[1:], start=1):
+            ranger = ranger_by_line.get(line_index, frozenset())
+            for _position, call, arguments in _line_call_sites(_mask_non_code(line)):
+                if call != "shipowner" or len(arguments) < 2:
+                    continue
+                ship = _simple_identifier(arguments[0])
+                special = _special_ship_owner(arguments[1])
+                if ship not in ranger or special is None:
+                    continue
+                key = (name, line_index, ship)
+                if key in reported:
+                    continue
+                reported.add(key)
+                owner_value, owner_label = special
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-shipowner-class-discriminator-mismatch",
+                        f"Корабль {ship} доказан как t_Ranger, но ShipOwner меняет "
+                        f"его владельца на специальный класс {owner_label} ({owner_value}). "
+                        "Движок использует Owner как дискриминатор runtime-класса и "
+                        "может завершить TStar.NextDay с EInvalidCast; для временной "
+                        "боевой стороны используйте ShipStanding и NoTargetToShip, "
+                        "не меняя расовый ShipOwner",
+                        path,
+                        f"{block.location} line {block.start_line + line_index}",
+                        line.strip(),
+                    )
+                )
+    return issues
+
+
+def _lint_nested_localization_wrappers(project: RsonProject) -> list[RuntimeIssue]:
+    """Reject CT(CT(...)) and DAnswer(DAnswer(...)) before RScript runs."""
+
+    path = str(project.path) if project.path else None
+    pattern = re.compile(
+        r"\b(?P<wrapper>CT|DAnswer)\s*\(\s*(?P=wrapper)\s*\(",
+        re.IGNORECASE,
+    )
+    found: dict[str, list[tuple[str, str]]] = {}
+    executable_fields = {"msg", "init"}
+    for item in project.iter_objects():
+        object_id = item.get("#") if isinstance(item.get("#"), int) else None
+        for field, value in item.items():
+            if not (
+                field.casefold().endswith("code")
+                or field.casefold() in executable_fields
+            ):
+                continue
+            if isinstance(value, list):
+                lines = [str(line) for line in value]
+            elif isinstance(value, str):
+                lines = value.splitlines()
+            else:
+                continue
+            for line_number, line in enumerate(lines, start=1):
+                for match in pattern.finditer(_mask_non_code(line)):
+                    wrapper = match.group("wrapper").casefold()
+                    found.setdefault(wrapper, []).append(
+                        (f"object #{object_id} {field}:{line_number}", line.strip())
+                    )
+
+    issues: list[RuntimeIssue] = []
+    labels = {"ct": "CT", "danswer": "DAnswer"}
+    for wrapper, occurrences in sorted(found.items()):
+        label = labels[wrapper]
+        location, evidence = occurrences[0]
+        issues.append(
+            RuntimeIssue(
+                "error",
+                "runtime-nested-localization-wrapper",
+                f"Найдено {len(occurrences)} повторных обёрток {label}({label}(...)). "
+                "Такой код возникает при повторной локализации RSON-заглушек: "
+                "внешний вызов получает уже локализованное значение вместо ключа, "
+                "из-за чего подпись или ответ диалога исчезает. Оставьте ровно одну обёртку",
+                path,
+                location,
+                evidence,
+            )
+        )
+    return issues
+
+
 def _condition_call_polarity(condition: str, call: str, variable: str) -> set[bool]:
     """Return True for positive and False for directly negated call occurrences."""
 
@@ -6242,6 +6506,7 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
         _lint_nullable_handle_dereferences(project, functions, nonnull_predicates)
     )
     issues.extend(_lint_duplicate_local_declarations(project))
+    issues.extend(_lint_nested_localization_wrappers(project))
     issues.extend(_lint_rscript_arrays(project))
     issues.extend(_lint_array_initialization_paths(project))
     issues.extend(_lint_fixed_array_contracts(project))
@@ -6254,6 +6519,7 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     issues.extend(_lint_id_to_ship_guards(project, functions))
     issues.extend(_lint_suppressed_shipjoin_state(project, functions))
     issues.extend(_lint_shipjoin_guarded_by_script_membership(project, functions))
+    issues.extend(_lint_shipowner_class_discriminator_mismatch(project, functions))
     issues.extend(_lint_runtime_cross_block_variables(project))
     issues.extend(_lint_linked_empty_runtime_code(project))
     issues.extend(_lint_persistent_item_handles(project, functions))

@@ -1956,6 +1956,134 @@ class RuntimeLintTests(unittest.TestCase):
             [],
         )
 
+    def test_nested_localization_wrappers_are_rejected_without_cross_wrapper_noise(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Operations"][1]["Code"] = [
+            'result = CT(CT("OwnMod.Button"));',
+            '// CT(CT("OwnMod.Comment"))',
+        ]
+        group["Dialogs"] = [
+            {
+                "Type": "TDialogMsg",
+                "Name": "Message",
+                "Parent": -1,
+                "#": 30,
+                "Msg": 'DAnswer(DAnswer(CT("OwnMod.Answer")));',
+            }
+        ]
+        issues = [
+            issue
+            for issue in lint_rson_runtime(RsonProject(data, Path("nested-lang.rson")))
+            if issue.code == "runtime-nested-localization-wrapper"
+        ]
+        self.assertEqual(len(issues), 2)
+        self.assertTrue(any("CT(CT" in issue.message for issue in issues))
+        self.assertTrue(any("DAnswer(DAnswer" in issue.message for issue in issues))
+
+        group["Operations"][1]["Code"] = ['result = DAnswer(CT("OwnMod.Answer"));']
+        group["Dialogs"][0]["Msg"] = 'DAnswer(CT("OwnMod.Answer"));'
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("single-lang.rson")))
+        }
+        self.assertNotIn("runtime-nested-localization-wrapper", safe_codes)
+
+    def test_special_shipowner_is_rejected_for_guarded_ranger(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword ship = Player();",
+            "if(ShipTypeN(ship) == t_Ranger)",
+            "{",
+            "    ShipOwner(ship, Kling);",
+            "}",
+        ]
+        issues = [
+            issue
+            for issue in lint_rson_runtime(RsonProject(data, Path("ranger-owner.rson")))
+            if issue.code == "runtime-shipowner-class-discriminator-mismatch"
+        ]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, "error")
+        self.assertIn("ShipStanding", issues[0].message)
+
+    def test_ranger_type_proof_flows_through_user_functions(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function MarkRanger(dword ranger)",
+            "{",
+            "    ShipOwner(ranger, 5);",
+            "}",
+            "function PassRanger(dword ranger)",
+            "{",
+            "    MarkRanger(ranger);",
+            "}",
+            "function CheckShip(dword ship)",
+            "{",
+            "    if(ShipTypeN(ship) != t_Ranger || !ship) exit;",
+            "    PassRanger(ship);",
+            "}",
+            "CheckShip(Player());",
+        ]
+        issues = [
+            issue
+            for issue in lint_rson_runtime(RsonProject(data, Path("ranger-callgraph.rson")))
+            if issue.code == "runtime-shipowner-class-discriminator-mismatch"
+        ]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].evidence, "ShipOwner(ranger, 5);")
+
+    def test_ranger_factories_prove_shipowner_class_mismatch(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword bought = BuyRanger(star, 1, 1, 1);",
+            "ShipOwner(bought, None);",
+            "dword existing = GalaxyRangers(index);",
+            "ShipOwner(existing, PirateClan);",
+            "dword player = Player();",
+            "ShipOwner(player, 5);",
+        ]
+        matching = [
+            issue
+            for issue in lint_rson_runtime(RsonProject(data, Path("ranger-factory.rson")))
+            if issue.code == "runtime-shipowner-class-discriminator-mismatch"
+        ]
+        self.assertEqual(len(matching), 3)
+        self.assertTrue(any("None" in (issue.evidence or "") for issue in matching))
+        self.assertTrue(any("PirateClan" in (issue.evidence or "") for issue in matching))
+
+    def test_shipowner_rule_keeps_racial_and_unproven_changes_available(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword ranger = BuyRanger(star, 1, 1, 1);",
+            "ShipOwner(ranger, 4);",
+            "ShipOwner(ranger, racial_owner);",
+            "ShipStanding(ranger, Kling);",
+            "dword unknown_ship = candidate;",
+            "ShipOwner(unknown_ship, None);",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("owner-safe.rson")))
+        }
+        self.assertNotIn("runtime-shipowner-class-discriminator-mismatch", codes)
+
+    def test_conditional_ranger_factory_does_not_prove_all_paths(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword ship = candidate;",
+            "if(use_new_ranger)",
+            "{",
+            "    ship = BuyRanger(star, 1, 1, 1);",
+            "}",
+            "ShipOwner(ship, 5);",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("conditional-ranger.rson")))
+        }
+        self.assertNotIn("runtime-shipowner-class-discriminator-mismatch", codes)
+
     def test_duplicate_local_names_across_branches_are_rejected(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["States"][0]["OnActCode"] = (
