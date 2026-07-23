@@ -99,6 +99,18 @@ class LiteralCTReference:
 
 
 @dataclass(frozen=True)
+class CustomFactionUse:
+    faction: str
+    path: str | None
+    location: str
+    evidence: str
+    reachable: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class FunctionBlock:
     name: str
     object_id: int | None
@@ -4909,6 +4921,158 @@ def _lint_nested_localization_wrappers(project: RsonProject) -> list[RuntimeIssu
     return issues
 
 
+_RESOURCE_FREE_CUSTOM_FACTION = "SubFactionFixedStanding"
+_BASE_CUSTOM_FACTION_EMBLEM_KEYS = frozenset(
+    value.casefold()
+    for value in (
+        "2Blazer",
+        "2Fei",
+        "2Gaal",
+        "2Keller",
+        "2Kling",
+        "2Maloc",
+        "2None",
+        "2Peleng",
+        "2People",
+        "2PirateClan",
+        "2PirateClanFei",
+        "2PirateClanGaal",
+        "2PirateClanMaloc",
+        "2PirateClanPeleng",
+        "2PirateClanPeople",
+        "2Terron",
+    )
+)
+
+
+def literal_custom_faction_uses(project: RsonProject) -> list[CustomFactionUse]:
+    """Extract non-empty literal ShipCustomFaction setters from executable code."""
+
+    functions, _issues = _extract_functions(project)
+    blocks = _runtime_analysis_blocks(project, functions)
+    graph = _call_graph(blocks)
+    reachable = _reachable(
+        {name for name in blocks if name.startswith("__handler_")},
+        graph,
+    )
+    path = str(project.path) if project.path else None
+    result: list[CustomFactionUse] = []
+    pattern = re.compile(r"\bShipCustomFaction\s*\(", re.IGNORECASE)
+    for name, block in blocks.items():
+        text = "\n".join(block.lines[1:])
+        masked = _mask_non_code(text)
+        for match in pattern.finditer(masked):
+            open_paren = masked.find("(", match.start())
+            parsed = _split_call_arguments(text, open_paren)
+            if parsed is None:
+                continue
+            arguments, end = parsed
+            if len(arguments) < 2:
+                continue
+            faction = _literal_string(arguments[1])
+            if faction in {None, "", _RESOURCE_FREE_CUSTOM_FACTION}:
+                continue
+            line_index = text.count("\n", 0, match.start()) + 1
+            result.append(
+                CustomFactionUse(
+                    faction,
+                    path,
+                    f"{block.location} line {block.start_line + line_index}",
+                    text[match.start():end].strip(),
+                    name in reachable,
+                )
+            )
+    return result
+
+
+def _custom_faction_emblem_keys(document: BlockParDocument) -> set[str]:
+    """Return flattened Data/Race/Emblem keys used by the BlockPar path API."""
+
+    result: set[str] = set()
+
+    def collect(node: BlockParNode, prefix: str = "") -> None:
+        for parameter in node.parameters:
+            if parameter.value.strip():
+                result.add((prefix + parameter.key).casefold())
+        for child in node.children:
+            collect(child, prefix + child.name)
+
+    def walk(nodes: Iterable[BlockParNode], path: tuple[str, ...] = ()) -> None:
+        for node in nodes:
+            current = (*path, node.name.casefold())
+            if len(current) >= 2 and current[-2:] == ("race", "emblem"):
+                collect(node)
+            else:
+                walk(node.children, current)
+
+    walk(document.roots)
+    return result
+
+
+def lint_custom_faction_resources(
+    projects: Sequence[RsonProject],
+    main_documents: Sequence[BlockParDocument] | None = None,
+) -> list[RuntimeIssue]:
+    """Match literal custom factions to their mandatory ship emblem registration."""
+
+    uses: dict[str, list[CustomFactionUse]] = {}
+    labels: dict[str, str] = {}
+    for project in projects:
+        for use in literal_custom_faction_uses(project):
+            folded = use.faction.casefold()
+            labels.setdefault(folded, use.faction)
+            uses.setdefault(folded, []).append(use)
+    if not uses:
+        return []
+
+    registrations: set[str] | None = None
+    if main_documents is not None:
+        registrations = set()
+        for document in main_documents:
+            registrations.update(_custom_faction_emblem_keys(document))
+
+    issues: list[RuntimeIssue] = []
+    for folded, faction_uses in sorted(uses.items()):
+        faction = labels[folded]
+        expected_key = f"2{faction}"
+        if expected_key.casefold() in _BASE_CUSTOM_FACTION_EMBLEM_KEYS:
+            continue
+        if registrations is not None and expected_key.casefold() in registrations:
+            continue
+        first = next((use for use in faction_uses if use.reachable), faction_uses[0])
+        count = len(faction_uses)
+        expected_path = f"Data/Race/Emblem/{expected_key}"
+        if registrations is None:
+            severity = "warning"
+            message = (
+                f"Литеральная кастомная фракция {faction!r} используется в "
+                f"{count} вызовах ShipCustomFaction, но Main.dat не передан: "
+                f"регистрацию корабельной эмблемы {expected_path} проверить нельзя. "
+                "Проверяйте каталог мода целиком или передайте --main"
+            )
+        else:
+            severity = "error" if any(use.reachable for use in faction_uses) else "warning"
+            message = (
+                f"Кастомная фракция {faction!r} используется в {count} вызовах "
+                f"ShipCustomFaction, но в Main.dat отсутствует непустая регистрация "
+                f"{expected_path}. При отрисовке видимого корабля движок запрашивает "
+                f"Race.Emblem.{expected_key} и может завершиться EBlockPar/EAccessViolation"
+            )
+            if severity == "warning":
+                message += "; вызовы сейчас недостижимы из обработчиков, поэтому риск не блокирует выпуск"
+        issues.append(
+            RuntimeIssue(
+                severity,
+                "runtime-custom-faction-emblem-unregistered",
+                message,
+                first.path,
+                first.location,
+                first.evidence,
+            )
+        )
+    return issues
+
+
 def _condition_call_polarity(condition: str, call: str, variable: str) -> set[bool]:
     """Return True for positive and False for directly negated call occurrences."""
 
@@ -6490,7 +6654,12 @@ def _lint_warrior_home_release(
     return issues
 
 
-def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
+def lint_rson_runtime(
+    project: RsonProject,
+    *,
+    main_documents: Sequence[BlockParDocument] | None = None,
+    check_custom_factions: bool = True,
+) -> list[RuntimeIssue]:
     path = str(project.path) if project.path else None
     functions, issues = _extract_functions(project)
     nonnull_predicates = _nonnull_predicate_summaries(functions)
@@ -6507,6 +6676,8 @@ def lint_rson_runtime(project: RsonProject) -> list[RuntimeIssue]:
     )
     issues.extend(_lint_duplicate_local_declarations(project))
     issues.extend(_lint_nested_localization_wrappers(project))
+    if check_custom_factions:
+        issues.extend(lint_custom_faction_resources((project,), main_documents))
     issues.extend(_lint_rscript_arrays(project))
     issues.extend(_lint_array_initialization_paths(project))
     issues.extend(_lint_fixed_array_contracts(project))

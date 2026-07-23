@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import struct
 import unittest
@@ -18,6 +19,7 @@ from srhd_modkit.quests import (
     QuestStrings,
     write_qmm,
 )
+from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION
 from srhd_modkit.toolchain import Toolchain
 
 
@@ -77,6 +79,53 @@ def _quest() -> QuestDocument:
 
 
 class AuditTests(unittest.TestCase):
+    def test_release_blocks_reachable_custom_faction_without_emblem(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            source = root / "SOURCE"
+            cfg = source / "CFG"
+            cfg.mkdir(parents=True)
+            (cfg / "Main.txt").write_text(
+                "Data ^{\n  Race ^{\n    Emblem ~{\n    }\n  }\n}\n",
+                encoding="utf-8",
+            )
+            project = {
+                "FileID": RSON_FILE_ID,
+                "FileVersion": RSON_FILE_VERSION,
+                "ScriptName": "CustomFactionFixture",
+                "Visual.Objects": [
+                    {
+                        "Operations": [
+                            {
+                                "Type": "Top",
+                                "Name": "Turn",
+                                "Parent": -1,
+                                "#": 1,
+                                "Code.Type": "Turn",
+                                "Code": [
+                                    "ShipCustomFaction(Player(), 'SubFactionFixture');"
+                                ],
+                            }
+                        ]
+                    }
+                ],
+                "Visual.Links": [],
+            }
+            (source / "custom.rson").write_text(
+                json.dumps(project),
+                encoding="utf-8",
+            )
+
+            report = audit_mod(root, profile="release")
+            issue = next(
+                item
+                for item in report.issues
+                if item.code == "runtime-custom-faction-emblem-unregistered"
+            )
+            self.assertEqual(issue.severity, "error")
+            self.assertIn(issue, report.blocking_issues())
+
     def test_release_deeply_checks_gi_payload(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"

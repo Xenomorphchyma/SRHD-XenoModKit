@@ -920,6 +920,7 @@ class Toolchain:
         lang_base: str | Path | None = None,
         overwrite: bool = False,
         timeout: float | None = None,
+        check_custom_factions: bool = True,
     ) -> dict[str, Any]:
         source = Path(source).resolve()
         scr_output = Path(scr_output).resolve()
@@ -944,7 +945,10 @@ class Toolchain:
         errors = [issue for issue in issues if issue.severity == "error"]
         if errors:
             raise ValueError("RSON не прошёл проверку: " + "; ".join(issue.message for issue in errors[:5]))
-        runtime_issues = lint_rson_runtime(project)
+        runtime_issues = lint_rson_runtime(
+            project,
+            check_custom_factions=check_custom_factions,
+        )
         runtime_errors = [issue for issue in runtime_issues if issue.severity == "error"]
         if runtime_errors:
             raise ValueError(

@@ -19,6 +19,7 @@ from .resources import UnsupportedResourceFormat, verify_resource
 from .quests import inspect_quest, load_quest, quest_media, verify_quest
 from .runtime_lint import (
     has_onstart_script_run,
+    lint_custom_faction_resources,
     lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
@@ -1357,7 +1358,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
             if not any(item.severity == "error" for item in structural):
                 valid_rsons += 1
                 rson_projects.append(project)
-                values = lint_rson_runtime(project)
+                values = lint_rson_runtime(project, check_custom_factions=False)
                 runtime_values.extend(values)
                 issues.extend(
                     AuditIssue.from_value(item, validator=name, mod=context.mod_name, path=path)
@@ -1366,6 +1367,16 @@ def _script_check(context: AuditContext) -> AuditCheck:
             checked.append(str(path))
         except Exception as exc:
             issues.append(_issue(context, name, "error", "rson-invalid", str(exc), path))
+
+    custom_faction_values = lint_custom_faction_resources(
+        rson_projects,
+        (main_document,) if main_document is not None else None,
+    )
+    runtime_values.extend(custom_faction_values)
+    issues.extend(
+        AuditIssue.from_value(item, validator=name, mod=context.mod_name)
+        for item in custom_faction_values
+    )
 
     info_path = find_module_info(context.root)
     module_info = None

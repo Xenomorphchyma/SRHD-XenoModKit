@@ -29,6 +29,7 @@ from .runtime_lint import (
     RuntimeIssue,
     compare_storage_schemas,
     has_onstart_script_run,
+    lint_custom_faction_resources,
     lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
@@ -858,8 +859,16 @@ def cmd_script_info(args: argparse.Namespace) -> int:
 def cmd_script_validate(args: argparse.Namespace) -> int:
     project = load_rson(args.source)
     issues = project.validate()
+    if not any(issue.severity == "error" for issue in issues):
+        issues.extend(lint_custom_faction_resources((project,)))
     if args.json:
-        print_json({"source": str(Path(args.source).resolve()), "valid": not issues, "issues": [item.as_dict() for item in issues]})
+        print_json(
+            {
+                "source": str(Path(args.source).resolve()),
+                "valid": not any(issue.severity == "error" for issue in issues),
+                "issues": [item.as_dict() for item in issues],
+            }
+        )
     elif not issues:
         print("RSON корректен: идентификаторы, родители, связи и массивы кода проверены.")
     else:
@@ -1041,7 +1050,7 @@ def _runtime_lint_target(
                 )
             else:
                 rson_projects.append(project)
-                issues.extend(lint_rson_runtime(project))
+                issues.extend(lint_rson_runtime(project, check_custom_factions=False))
             checked_rson.append(str(path))
         except Exception as exc:
             issues.append(RuntimeIssue("error", "runtime-rson-load", str(exc), str(path)))
@@ -1054,6 +1063,7 @@ def _runtime_lint_target(
             if candidate.is_file():
                 main_candidates.append(candidate.resolve())
 
+    main_documents: list[BlockParDocument] = []
     with tempfile.TemporaryDirectory(prefix="srhd-runtime-lint-") as name:
         temp = Path(name)
         for index, path in enumerate(main_candidates):
@@ -1062,10 +1072,18 @@ def _runtime_lint_target(
                 workspace.mkdir(parents=True, exist_ok=True)
                 document, _ = _load_dat_source(path, chain, workspace)
                 issues.extend(lint_main_runtime(document, path))
+                main_documents.append(document)
                 onstart_script_run = onstart_script_run or has_onstart_script_run(document)
                 checked_main.append(str(path))
             except Exception as exc:
                 issues.append(RuntimeIssue("error", "runtime-main-load", str(exc), str(path)))
+
+    issues.extend(
+        lint_custom_faction_resources(
+            rson_projects,
+            main_documents if main_documents else None,
+        )
+    )
 
     info_path: Path | None
     if module_info_path:
@@ -1512,6 +1530,7 @@ def cmd_script_build(args: argparse.Namespace) -> int:
         lang_base=getattr(args, "lang_base", None),
         overwrite=args.overwrite,
         timeout=getattr(args, "timeout", None),
+        check_custom_factions=preflight is None,
     )
     if preflight is not None:
         result["runtime_preflight"] = preflight

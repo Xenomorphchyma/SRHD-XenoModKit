@@ -10,10 +10,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from srhd_modkit.blockpar import parse_blockpar
-from srhd_modkit.cli import _runtime_lint_target, cmd_script_audit_mod, cmd_script_build
+from srhd_modkit.cli import (
+    _runtime_lint_target,
+    cmd_script_audit_mod,
+    cmd_script_build,
+    cmd_script_validate,
+)
 from srhd_modkit.module_info import parse_module_info
 from srhd_modkit.runtime_lint import (
     compare_storage_schemas,
+    lint_custom_faction_resources,
     lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
@@ -2083,6 +2089,157 @@ class RuntimeLintTests(unittest.TestCase):
             for issue in lint_rson_runtime(RsonProject(data, Path("conditional-ranger.rson")))
         }
         self.assertNotIn("runtime-shipowner-class-discriminator-mismatch", codes)
+
+    def test_custom_faction_requires_registered_ship_emblem(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "ShipCustomFaction(",
+            "    Player(),",
+            "    'SubFactionFixture'",
+            ");",
+        ]
+        project = RsonProject(data, Path("custom-faction.rson"))
+
+        standalone = [
+            issue
+            for issue in lint_rson_runtime(project)
+            if issue.code == "runtime-custom-faction-emblem-unregistered"
+        ]
+        self.assertEqual(len(standalone), 1)
+        self.assertEqual(standalone[0].severity, "warning")
+        self.assertIn("Main.dat не передан", standalone[0].message)
+
+        missing_main = parse_blockpar("Data ^{\n  Race ^{\n    Emblem ~{\n    }\n  }\n}\n")
+        missing = lint_custom_faction_resources((project,), (missing_main,))
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0].severity, "error")
+        self.assertIn("Data/Race/Emblem/2SubFactionFixture", missing[0].message)
+
+    def test_custom_faction_accepts_direct_and_nested_emblem_registration(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "ShipCustomFaction(Player(), 'SubFactionFixture');",
+        ]
+        project = RsonProject(data, Path("custom-faction.rson"))
+        documents = (
+            parse_blockpar(
+                "Data ^{\n  Race ^{\n    Emblem ~{\n"
+                "      2SubFactionFixture=Alpha,Bm.Race.Emblem.2Fixture\n"
+                "    }\n  }\n}\n"
+            ),
+            parse_blockpar(
+                "Data ^{\n  Race ^{\n    Emblem ~{\n"
+                "      2SubFaction ^{\n"
+                "        Fixture=Alpha,Bm.Race.Emblem.2Fixture\n"
+                "      }\n"
+                "    }\n  }\n}\n"
+            ),
+        )
+        for document in documents:
+            with self.subTest(document=document.to_text()):
+                self.assertEqual(
+                    lint_custom_faction_resources((project,), (document,)),
+                    [],
+                )
+
+    def test_exact_resource_free_custom_faction_marker_is_not_generalized(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "ShipCustomFaction(Player(), '');",
+            "ShipCustomFaction(Player(), 'SubFactionFixedStanding');",
+            "ShipCustomFaction(Player(), 'PirateClan');",
+        ]
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("builtin-faction.rson")))
+        }
+        self.assertNotIn("runtime-custom-faction-emblem-unregistered", safe_codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"].append(
+            "ShipCustomFaction(Player(), 'SubFactionFixedStandingSuffix');"
+        )
+        issues = [
+            issue
+            for issue in lint_rson_runtime(RsonProject(data, Path("similar-faction.rson")))
+            if issue.code == "runtime-custom-faction-emblem-unregistered"
+        ]
+        self.assertEqual(len(issues), 1)
+        self.assertIn("2SubFactionFixedStandingSuffix", issues[0].message)
+
+    def test_script_validate_reports_unverified_custom_faction(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            source = Path(name) / "custom.rson"
+            data = deepcopy(SAFE_RSON)
+            data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+                "ShipCustomFaction(Player(), 'SubFactionFixture');",
+            ]
+            source.write_text(json.dumps(data), encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output):
+                result = cmd_script_validate(
+                    SimpleNamespace(source=str(source), json=True)
+                )
+            payload = json.loads(output.getvalue())
+            self.assertEqual(result, 0)
+            self.assertTrue(payload["valid"])
+            self.assertEqual(
+                [issue["code"] for issue in payload["issues"]],
+                ["runtime-custom-faction-emblem-unregistered"],
+            )
+
+    def test_unreachable_custom_faction_is_warning_with_main(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+            [
+                "function UnusedFaction(dword ship)",
+                "{",
+                "    ShipCustomFaction(ship, 'SubFactionUnused');",
+                "}",
+            ]
+        )
+        project = RsonProject(data, Path("unused-faction.rson"))
+        main = parse_blockpar("Data ^{\n  Race ^{\n    Emblem ~{\n    }\n  }\n}\n")
+        matching = lint_custom_faction_resources((project,), (main,))
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "warning")
+        self.assertIn("недостижимы", matching[0].message)
+
+    def test_build_blocks_missing_custom_faction_emblem_before_compiler(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "SOURCE"
+            cfg = source / "CFG"
+            cfg.mkdir(parents=True)
+            data = deepcopy(SAFE_RSON)
+            data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+                "ShipCustomFaction(Player(), 'SubFactionFixture');",
+            ]
+            rson = source / "custom.rson"
+            rson.write_text(json.dumps(data), encoding="utf-8")
+            (root / "ModuleInfo.txt").write_text(
+                "Name=Test\nLanguages=Rus\n",
+                encoding="utf-8",
+            )
+            (cfg / "Main.txt").write_text(
+                "Data ^{\n  Race ^{\n    Emblem ~{\n    }\n  }\n}\n",
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                source=str(rson),
+                scr=str(root / "out.scr"),
+                lang=str(root / "out.lang"),
+                lang_dat=None,
+                lang_base=None,
+                timeout=None,
+                overwrite=False,
+                tools_root=None,
+                json=False,
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "runtime-custom-faction-emblem-unregistered",
+            ):
+                cmd_script_build(args)
 
     def test_duplicate_local_names_across_branches_are_rejected(self) -> None:
         data = deepcopy(SAFE_RSON)
