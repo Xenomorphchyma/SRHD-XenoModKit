@@ -33,6 +33,7 @@ from .runtime_lint import (
     lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
+    lint_quest_item_images,
     lint_rson_runtime,
 )
 from .validation import validate_collection
@@ -1014,6 +1015,7 @@ def _runtime_lint_target(
     checked_rson: list[str] = []
     checked_main: list[str] = []
     checked_language: list[str] = []
+    checked_cache: list[str] = []
     rson_projects = []
     onstart_script_run = False
 
@@ -1064,6 +1066,7 @@ def _runtime_lint_target(
                 main_candidates.append(candidate.resolve())
 
     main_documents: list[BlockParDocument] = []
+    main_runtime_seen: set[tuple[str, str | None]] = set()
     with tempfile.TemporaryDirectory(prefix="srhd-runtime-lint-") as name:
         temp = Path(name)
         for index, path in enumerate(main_candidates):
@@ -1071,7 +1074,12 @@ def _runtime_lint_target(
                 workspace = temp / str(index)
                 workspace.mkdir(parents=True, exist_ok=True)
                 document, _ = _load_dat_source(path, chain, workspace)
-                issues.extend(lint_main_runtime(document, path))
+                for issue in lint_main_runtime(document, path):
+                    key = (issue.code, issue.evidence)
+                    if key in main_runtime_seen:
+                        continue
+                    main_runtime_seen.add(key)
+                    issues.append(issue)
                 main_documents.append(document)
                 onstart_script_run = onstart_script_run or has_onstart_script_run(document)
                 checked_main.append(str(path))
@@ -1100,8 +1108,8 @@ def _runtime_lint_target(
         except Exception as exc:
             issues.append(RuntimeIssue("error", "runtime-module-load", str(exc), str(info_path)))
 
+    language_documents: dict[str, list[tuple[Path, BlockParDocument]]] = {}
     if target.is_dir() and module_info is not None and rson_projects:
-        language_documents: dict[str, list[tuple[Path, BlockParDocument]]] = {}
         with tempfile.TemporaryDirectory(prefix="srhd-runtime-lang-") as name:
             temp = Path(name)
             for language in module_info.languages:
@@ -1131,6 +1139,42 @@ def _runtime_lint_target(
                         )
         issues.extend(lint_literal_ct_keys(rson_projects, language_documents))
 
+    cache_documents: list[tuple[Path, BlockParDocument]] = []
+    if target.is_dir() and rson_projects:
+        with tempfile.TemporaryDirectory(prefix="srhd-runtime-cache-") as name:
+            temp = Path(name)
+            candidates = (
+                root / "SOURCE" / "CFG" / "CacheData.txt",
+                root / "CFG" / "CacheData.txt",
+                root / "CFG" / "CacheData.dat",
+            )
+            for index, cache_path in enumerate(candidates):
+                if not cache_path.is_file():
+                    continue
+                try:
+                    workspace = temp / str(index)
+                    workspace.mkdir(parents=True, exist_ok=True)
+                    document, _source = _load_dat_source(cache_path, chain, workspace)
+                    cache_documents.append((cache_path, document))
+                    checked_cache.append(str(cache_path.resolve()))
+                except Exception as exc:
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "runtime-cachedata-load",
+                            str(exc),
+                            str(cache_path.resolve()),
+                        )
+                    )
+        issues.extend(
+            lint_quest_item_images(
+                root,
+                rson_projects,
+                cache_documents,
+                language_documents,
+            )
+        )
+
     onstart_risks = {
         "runtime-turn-direct-world-access",
         "runtime-turn-before-ui",
@@ -1151,6 +1195,7 @@ def _runtime_lint_target(
         "rson": checked_rson,
         "main": checked_main,
         "language": checked_language,
+        "cachedata": checked_cache,
         "module_info": str(info_path) if info_path else None,
         "issues": [issue.as_dict() for issue in issues],
     }
@@ -1726,6 +1771,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
         "runtime_lint": {
             "rson": runtime_lint["rson"],
             "main": runtime_lint["main"],
+            "cachedata": runtime_lint["cachedata"],
             "module_info": runtime_lint["module_info"],
         },
         "artifact_lint": {

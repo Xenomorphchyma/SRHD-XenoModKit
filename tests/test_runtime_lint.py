@@ -23,6 +23,7 @@ from srhd_modkit.runtime_lint import (
     lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
+    lint_quest_item_images,
     lint_rson_runtime,
 )
 from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, RsonProject
@@ -496,6 +497,171 @@ class RuntimeLintTests(unittest.TestCase):
             "}\n"
         )
         self.assertEqual(lint_main_runtime(safe, "Main.txt"), [])
+
+    def test_onload_same_name_guard_reports_saved_script_cache_shadow(self) -> None:
+        document = parse_blockpar(
+            "BV ^{\n"
+            "  OnLoad ^{\n"
+            "    Runtime ^{\n"
+            "      01=if(!IsScriptActive('Mod_Worker')) "
+            "ScriptRun(ShipStar(Player()), GetShipPlanet(Player()), 'Mod_Worker');\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        matching = [
+            issue
+            for issue in lint_main_runtime(document, "Main.txt")
+            if issue.code == "runtime-saved-script-cache-update-shadow"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "info")
+
+        migrated = parse_blockpar(
+            "BV ^{\n"
+            "  OnLoad ^{\n"
+            "    Runtime ^{\n"
+            "      01=if(!IsScriptActive('Mod_Worker')) "
+            "ScriptRun(ShipStar(Player()), GetShipPlanet(Player()), 'Mod_Worker_v2');\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        self.assertNotIn(
+            "runtime-saved-script-cache-update-shadow",
+            {issue.code for issue in lint_main_runtime(migrated, "Main.txt")},
+        )
+
+    def test_mod_owned_quest_item_without_image_is_deduplicated(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword first = CreateQuestItem('CargoType', 2);",
+            "dword second = CreateQuestItem('CargoType', 2);",
+        ]
+        language = parse_blockpar(
+            "UselessItems ^{\n"
+            "  CargoType ^{\n"
+            "    Name=Cargo\n"
+            "  }\n"
+            "}\n"
+        )
+        project = RsonProject(data, Path("quest-item.rson"))
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            issues = lint_quest_item_images(
+                root,
+                (project,),
+                (),
+                {"rus": ((Path("Lang_Rus.txt"), language),)},
+            )
+            matching = [
+                issue
+                for issue in issues
+                if issue.code == "runtime-quest-item-image-missing"
+            ]
+            self.assertEqual(len(matching), 1)
+            self.assertIn("2 вызовах", matching[0].message)
+            self.assertIn("Usl_FishCont", matching[0].message)
+
+            cache = parse_blockpar(
+                "Bm ^{\n"
+                "  ItemsUseless ^{\n"
+                "    2CargoType_s=DATA\\ItemsUseless\\2CargoType.gi\n"
+                "  }\n"
+                "}\n"
+            )
+            self.assertEqual(
+                lint_quest_item_images(
+                    root,
+                    (project,),
+                    ((Path("CacheData.txt"), cache),),
+                    {"rus": ((Path("Lang_Rus.txt"), language),)},
+                ),
+                [],
+            )
+
+    def test_shared_player_and_npc_state_requires_curship_separation(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Groups"] = [
+            {"Type": "TGroup", "Name": "NPCs", "AddPlayer": False, "#": 10},
+            {"Type": "TGroup", "Name": "RuntimePlayer", "AddPlayer": True, "#": 11},
+        ]
+        group["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "StateRuntime",
+                "Code.Type": "Turn",
+                "Code": ["ShipOwner(CurShip, 2);"],
+                "#": 12,
+            }
+        )
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 10, "End": 3, "Nom": 0, "Arrow": True},
+            {"Type": "TGraphLink", "Begin": 11, "End": 3, "Nom": 0, "Arrow": True},
+            {"Type": "TGraphLink", "Begin": 3, "End": 12, "Nom": 0, "Arrow": True},
+        ]
+        project = RsonProject(data, Path("shared-player-state.rson"))
+        self.assertIn(
+            "runtime-shared-state-mutates-player",
+            {issue.code for issue in lint_rson_runtime(project)},
+        )
+
+        group["Operations"][-1]["Code"] = [
+            "if(CurShip == Player()) exit;",
+            "ShipOwner(CurShip, 2);",
+        ]
+        self.assertNotIn(
+            "runtime-shared-state-mutates-player",
+            {issue.code for issue in lint_rson_runtime(project)},
+        )
+        group["Operations"][-1]["Code"] = [
+            "if(CurShip != Player() || allow_player) ShipOwner(CurShip, 2);",
+        ]
+        self.assertIn(
+            "runtime-shared-state-mutates-player",
+            {issue.code for issue in lint_rson_runtime(project)},
+        )
+
+    def test_recurring_state_shipbad_write_requires_value_change_guard(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Groups"] = [
+            {"Type": "TGroup", "Name": "NPCs", "AddPlayer": False, "#": 10},
+        ]
+        group["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "StateRuntime",
+                "Code.Type": "Turn",
+                "Code": ["ShipSetBad(CurShip, 0);"],
+                "#": 12,
+            }
+        )
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 10, "End": 3, "Nom": 0, "Arrow": True},
+            {"Type": "TGraphLink", "Begin": 3, "End": 12, "Nom": 0, "Arrow": True},
+        ]
+        project = RsonProject(data, Path("state-shipbad.rson"))
+        self.assertIn(
+            "runtime-state-unconditional-shipbad-write",
+            {issue.code for issue in lint_rson_runtime(project)},
+        )
+
+        group["Operations"][-1]["Code"] = [
+            "if(ShipGetBad(CurShip)) ShipSetBad(CurShip, 0);",
+        ]
+        self.assertNotIn(
+            "runtime-state-unconditional-shipbad-write",
+            {issue.code for issue in lint_rson_runtime(project)},
+        )
+        group["Operations"][-1]["Code"] = [
+            "if(force_clear || ShipGetBad(CurShip)) ShipSetBad(CurShip, 0);",
+        ]
+        self.assertIn(
+            "runtime-state-unconditional-shipbad-write",
+            {issue.code for issue in lint_rson_runtime(project)},
+        )
 
     def test_runtime_recursion_and_unbounded_loop_are_reported(self) -> None:
         data = deepcopy(SAFE_RSON)

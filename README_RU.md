@@ -32,7 +32,11 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 - `runtime-shipowner-class-discriminator-mismatch` блокирует смену `ShipOwner` доказанного `t_Ranger` на специальные классы `Kling`/`None`/`PirateClan` (`5..7`). Доказательство переносится через guards, `Player`, `BuyRanger`, `GalaxyRangers(index)` и пользовательские функции; расовые владельцы `0..4` и неизвестные выражения не ограничиваются.
 - `runtime-nested-localization-wrapper` до запуска RScript агрегированно обнаруживает `CT(CT(...))` и `DAnswer(DAnswer(...))`, возникающие при повторной локализации RSON без импортированных диалогов. Штатная форма `DAnswer(CT(...))` разрешена.
 - `runtime-custom-faction-emblem-unregistered` отличает точный встроенный маркер `SubFactionFixedStanding` от пользовательской фракции. Для остальных непустых литералов `ShipCustomFaction` проверяется штатный каталог игры 2.1.2500 и `Data/Race/Emblem/2<фракция>` в Main.dat, включая равнозначные прямую и вложенную BlockPar-записи; достижимый вызов без эмблемы блокирует сборку и релиз.
-- Полный набор 0.9.5 состоит из 220 тестов и 24 подтестов.
+- `runtime-saved-script-cache-update-shadow` сообщает о стабильном `OnLoad`-шаблоне `!IsScriptActive(name) → ScriptRun(..., name)`: активный код хранится в SAV, поэтому одноимённая замена SCR на диске не обновляет уже запущенный экземпляр. Это информационная миграционная проверка, а не ошибка свежего сохранения.
+- `runtime-shared-state-mutates-player` строит граф `TGroup → TState → runtime` и предупреждает, если одно состояние обслуживает `AddPlayer=true` и NPC, но изменяет неразделённый `CurShip` без доказанного отделения `Player()`.
+- `runtime-state-unconditional-shipbad-write` предупреждает о `ShipSetBad(CurShip, ...)` в повторно вызываемом TState без проверки, что значение `ShipGetBad` действительно меняется. Явная проверка текущей цели принимается.
+- `runtime-quest-item-image-missing` сопоставляет собственный литерал `CreateQuestItem` с `UselessItems` в Lang, `Bm/ItemsUseless` в CacheData и `DATA/ItemsUseless`. Отсутствие картинки выдаётся один раз на тип с пояснением о штатной подстановке `Usl_FishCont`.
+- Полный набор 0.9.5 состоит из 225 тестов и 24 подтестов.
 
 ## Новое в 0.9.4
 

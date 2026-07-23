@@ -40,7 +40,11 @@ ModKit не устанавливает моды, не изменяет игру 
 - `runtime-shipowner-class-discriminator-mismatch` блокирует смену `ShipOwner` доказанного `t_Ranger` на `Kling`/`None`/`PirateClan` (`5..7`), которая способна завершить `TStar.NextDay` с `EInvalidCast`. Доказательство типа переносится через guards, штатные источники рейнджеров и пользовательские функции; диапазон рас `0..4` и неизвестные выражения не запрещаются.
 - `runtime-nested-localization-wrapper` агрегированно находит `CT(CT(...))` и `DAnswer(DAnswer(...))` до RScript. Это защищает пересборку RSON без импортированных диалогов от повторной локализации; корректное сочетание `DAnswer(CT(...))` остаётся допустимым.
 - `runtime-custom-faction-emblem-unregistered` считает только точное `SubFactionFixedStanding` встроенным маркером без собственной графики. Другой непустой литерал `ShipCustomFaction` сопоставляется со штатным каталогом игры 2.1.2500 и `Data/Race/Emblem/2<фракция>` в Main.dat; поддерживаются прямые параметры и вложенные BlockPar-узлы. Достижимый вызов без эмблемы блокирует сборку и релиз, недостижимый остаётся предупреждением.
-- Полный набор 0.9.5 состоит из 220 тестов и 24 подтестов.
+- `runtime-saved-script-cache-update-shadow` отмечает стабильный `OnLoad`-шаблон `!IsScriptActive(name) → ScriptRun(..., name)`: активный код сериализуется в SAV, поэтому одноимённая замена SCR на диске не обновляет уже запущенный экземпляр. Это info о совместимости обновлений, а не ошибка свежего сохранения.
+- `runtime-shared-state-mutates-player` проверяет граф `TGroup → TState → runtime` и предупреждает, когда общее состояние `AddPlayer=true`/NPC изменяет неразделённый `CurShip` без доказанного отделения `Player()`.
+- `runtime-state-unconditional-shipbad-write` находит `ShipSetBad(CurShip, ...)` в повторно вызываемом TState без проверки фактического изменения `ShipGetBad`; явный value guard не ограничивается.
+- `runtime-quest-item-image-missing` сопоставляет собственные типы `CreateQuestItem` с Lang `UselessItems`, CacheData `Bm/ItemsUseless` и `DATA/ItemsUseless`. Одно предупреждение на тип прямо сообщает о runtime-подстановке `Usl_FishCont`.
+- Полный набор 0.9.5 состоит из 225 тестов и 24 подтестов.
 
 ### Что изменилось в 0.9.4
 

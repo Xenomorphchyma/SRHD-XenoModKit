@@ -79,6 +79,59 @@ def _quest() -> QuestDocument:
 
 
 class AuditTests(unittest.TestCase):
+    def test_release_warns_when_mod_owned_quest_item_has_no_image(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            source = root / "SOURCE"
+            cfg = source / "CFG"
+            cfg.mkdir(parents=True)
+            (cfg / "Lang_Rus.txt").write_text(
+                "UselessItems ^{\n"
+                "  AuditCargo ^{\n"
+                "    Name=Audit cargo\n"
+                "  }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            project = {
+                "FileID": RSON_FILE_ID,
+                "FileVersion": RSON_FILE_VERSION,
+                "ScriptName": "QuestItemFixture",
+                "Visual.Objects": [
+                    {
+                        "Operations": [
+                            {
+                                "Type": "Top",
+                                "Name": "Turn",
+                                "Parent": -1,
+                                "#": 1,
+                                "Code.Type": "Turn",
+                                "Code": [
+                                    "CreateQuestItem('AuditCargo', 2);",
+                                    "CreateQuestItem('AuditCargo', 2);",
+                                ],
+                            }
+                        ]
+                    }
+                ],
+                "Visual.Links": [],
+            }
+            (source / "quest-item.rson").write_text(
+                json.dumps(project),
+                encoding="utf-8",
+            )
+
+            report = audit_mod(root, profile="release")
+            matching = [
+                item
+                for item in report.issues
+                if item.code == "runtime-quest-item-image-missing"
+            ]
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0].severity, "warning")
+            self.assertIn("Usl_FishCont", matching[0].message)
+
     def test_release_blocks_reachable_custom_faction_without_emblem(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"

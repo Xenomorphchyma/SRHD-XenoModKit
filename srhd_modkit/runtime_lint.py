@@ -5073,6 +5073,141 @@ def lint_custom_faction_resources(
     return issues
 
 
+def _local_useless_item_names(
+    language_documents: Mapping[
+        str,
+        Sequence[tuple[str | Path, BlockParDocument]],
+    ],
+) -> set[str]:
+    """Return useless-item identifiers declared by the mod's own Lang files."""
+
+    result: set[str] = set()
+    for documents in language_documents.values():
+        for _source, document in documents:
+            for node_path, key, _value in _node_parameters(document.roots):
+                parts = [part for part in node_path.split("/") if part]
+                if not parts or parts[0].casefold() != "uselessitems":
+                    continue
+                if len(parts) >= 2:
+                    result.add(parts[1].casefold())
+                else:
+                    result.add(key.casefold())
+    return result
+
+
+def _useless_item_image_keys(
+    cache_documents: Sequence[tuple[str | Path, BlockParDocument]],
+) -> set[str]:
+    result: set[str] = set()
+    for _source, document in cache_documents:
+        for node_path, key, value in _node_parameters(document.roots):
+            parts = tuple(part.casefold() for part in node_path.split("/") if part)
+            if len(parts) >= 2 and parts[-2:] == ("bm", "itemsuseless") and value.strip():
+                result.add(key.casefold())
+    return result
+
+
+def _local_useless_item_image_names(root: Path) -> set[str]:
+    result: set[str] = set()
+    if not root.is_dir():
+        return result
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.casefold() not in {".gi", ".gai"}:
+            continue
+        parts = tuple(part.casefold() for part in path.relative_to(root).parts[:-1])
+        if len(parts) < 2 or parts[-2:] != ("data", "itemsuseless"):
+            continue
+        result.add(path.stem.casefold())
+    return result
+
+
+def _has_useless_item_image(
+    item_name: str,
+    registrations: set[str],
+    image_names: set[str],
+) -> bool:
+    """Accept the direct and race-prefixed names used by SRHD CacheData."""
+
+    folded = item_name.casefold()
+    patterns = (
+        re.compile(rf"^(?:[0-7])?{re.escape(folded)}(?:_s)?$", re.IGNORECASE),
+        re.compile(rf"^(?:[0-7])?{re.escape(folded)}$", re.IGNORECASE),
+    )
+    return any(
+        pattern.fullmatch(candidate)
+        for pattern in patterns
+        for candidate in (*registrations, *image_names)
+    )
+
+
+def lint_quest_item_images(
+    root: str | Path,
+    projects: Sequence[RsonProject],
+    cache_documents: Sequence[tuple[str | Path, BlockParDocument]],
+    language_documents: Mapping[
+        str,
+        Sequence[tuple[str | Path, BlockParDocument]],
+    ],
+) -> list[RuntimeIssue]:
+    """Warn once per mod-owned CreateQuestItem type without an image.
+
+    SRHD treats these values as ``UselessItems`` identifiers.  When neither a
+    direct ``DATA/ItemsUseless`` asset nor ``Bm/ItemsUseless`` CacheData entry
+    exists, the engine logs the failure for every created item and substitutes
+    ``Usl_FishCont``.  Local Lang ownership keeps base-game identifiers and
+    dependency-provided items out of this single-mod advisory.
+    """
+
+    owned = _local_useless_item_names(language_documents)
+    if not owned:
+        return []
+    registrations = _useless_item_image_keys(cache_documents)
+    image_names = _local_useless_item_image_names(Path(root).resolve())
+    uses: dict[str, list[tuple[str, str, str]]] = {}
+    labels: dict[str, str] = {}
+    for project in projects:
+        source = str(project.path) if project.path else str(Path(root).resolve())
+        for container in _iter_code_containers(project):
+            text = "\n".join(container.lines)
+            for position, arguments, end in _iter_parsed_calls(text, "CreateQuestItem"):
+                if not arguments or (item_name := _literal_string(arguments[0])) is None:
+                    continue
+                folded = item_name.casefold()
+                if folded not in owned:
+                    continue
+                line_number = text.count("\n", 0, position) + 1
+                labels.setdefault(folded, item_name)
+                uses.setdefault(folded, []).append(
+                    (
+                        source,
+                        f"{container.location}:{line_number}",
+                        text[position:end].strip(),
+                    )
+                )
+
+    issues: list[RuntimeIssue] = []
+    for folded, occurrences in sorted(uses.items()):
+        if _has_useless_item_image(folded, registrations, image_names):
+            continue
+        item_name = labels[folded]
+        source, location, evidence = occurrences[0]
+        issues.append(
+            RuntimeIssue(
+                "warning",
+                "runtime-quest-item-image-missing",
+                f"Собственный тип CreateQuestItem {item_name!r} используется в "
+                f"{len(occurrences)} вызовах, но для него не найдено изображения "
+                "в DATA/ItemsUseless или непустой регистрации Bm/ItemsUseless "
+                "в CacheData. Игра продолжит работу, однако запишет повторяющееся "
+                "«Can not find image for useless item» и подставит Usl_FishCont",
+                source,
+                location,
+                evidence,
+            )
+        )
+    return issues
+
+
 def _condition_call_polarity(condition: str, call: str, variable: str) -> set[bool]:
     """Return True for positive and False for directly negated call occurrences."""
 
@@ -6654,6 +6789,341 @@ def _lint_warrior_home_release(
     return issues
 
 
+def _runtime_object_graph(
+    project: RsonProject,
+) -> tuple[dict[int, dict[str, Any]], dict[int, set[int]]]:
+    objects = {
+        item["#"]: item
+        for item in project.iter_objects()
+        if isinstance(item.get("#"), int)
+    }
+    outgoing: dict[int, set[int]] = {object_id: set() for object_id in objects}
+    links = project.data.get("Visual.Links", [])
+    if isinstance(links, list):
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            begin, end = link.get("Begin"), link.get("End")
+            if begin in objects and end in objects:
+                outgoing[begin].add(end)
+    for object_id, item in objects.items():
+        parent = item.get("Parent")
+        if parent in objects:
+            outgoing[parent].add(object_id)
+    return objects, outgoing
+
+
+def _reachable_object_ids(starts: Iterable[int], outgoing: Mapping[int, set[int]]) -> set[int]:
+    pending = [value for value in starts if value in outgoing]
+    result: set[int] = set()
+    while pending:
+        object_id = pending.pop()
+        if object_id in result:
+            continue
+        result.add(object_id)
+        pending.extend(outgoing.get(object_id, ()))
+    return result
+
+
+def _leading_if_condition(line: str) -> tuple[str, int] | None:
+    masked = _mask_non_code(line)
+    match = re.search(r"\bif\s*\(", masked, re.IGNORECASE)
+    if not match:
+        return None
+    start = masked.find("(", match.start()) + 1
+    depth = 1
+    for index in range(start, len(masked)):
+        char = masked[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return masked[start:index], index
+    return None
+
+
+def _compact_expression(value: str) -> str:
+    return re.sub(r"\s+", "", _mask_non_code(value)).casefold()
+
+
+def _condition_proves_player(condition: str, *, equal: bool) -> bool:
+    folded = _compact_expression(condition)
+    if equal:
+        return folded in {
+            "curship==player()",
+            "player()==curship",
+            "isplayer(curship)",
+        }
+    if "||" in folded:
+        return False
+    return (
+        "curship!=player()" in folded
+        or "player()!=curship" in folded
+        or folded == "!isplayer(curship)"
+    )
+
+
+def _range_has_unconditional_exit(
+    lines: tuple[str, ...],
+    start: int,
+    end: int,
+) -> bool:
+    if start == end:
+        return bool(
+            re.search(
+                r"\b(?:exit|return)\s*;",
+                _mask_non_code(lines[start]),
+                re.IGNORECASE,
+            )
+        )
+    depth = 0
+    opened = False
+    for index in range(start, min(end + 1, len(lines))):
+        masked = _mask_non_code(lines[index])
+        before = depth
+        if index == start:
+            opened = "{" in masked
+        if opened and before == 1 and re.fullmatch(
+            r"\s*(?:exit|return)\s*;\s*",
+            masked,
+            re.IGNORECASE,
+        ):
+            return True
+        depth += masked.count("{") - masked.count("}")
+    return False
+
+
+def _player_is_excluded_before(
+    lines: tuple[str, ...],
+    line_index: int,
+) -> bool:
+    """Prove that a CurShip mutation cannot execute for Player()."""
+
+    current = _leading_if_condition(lines[line_index])
+    if current is not None and _condition_proves_player(current[0], equal=False):
+        return True
+
+    for header in range(0, line_index + 1):
+        parsed = _leading_if_condition(lines[header])
+        if parsed is None:
+            continue
+        condition, close = parsed
+        body = _statement_body_range(lines, header)
+        if _condition_proves_player(condition, equal=False):
+            if header == line_index and _mask_non_code(lines[header])[close + 1 :].strip():
+                return True
+            if body is not None and body[0] <= line_index <= body[1]:
+                return True
+        if not _condition_proves_player(condition, equal=True):
+            continue
+        same_line_tail = _mask_non_code(lines[header])[close + 1 :]
+        same_line_exit = bool(
+            re.search(r"\b(?:exit|return)\s*;", same_line_tail, re.IGNORECASE)
+        )
+        if same_line_exit and header < line_index:
+            return True
+        if body is not None and body[1] < line_index and _range_has_unconditional_exit(
+            lines, body[0], body[1]
+        ):
+            return True
+    return False
+
+
+_CURSHIP_MUTATOR_MIN_ARGS = {
+    "shipowner": 2,
+    "shipstanding": 2,
+    "shipcustomfaction": 2,
+    "notargettoship": 2,
+    "shipsetbad": 2,
+    "chameleon": 2,
+    "setname": 2,
+    "shipjointoscript": 2,
+    "shipout": 1,
+    "shipfreeflight": 1,
+}
+
+
+def _is_curship_mutator(call: str, arguments: Sequence[str]) -> bool:
+    if not arguments or _simple_identifier(arguments[0]) != "curship":
+        return False
+    minimum = _CURSHIP_MUTATOR_MIN_ARGS.get(call)
+    if minimum is not None:
+        return len(arguments) >= minimum
+    return call.startswith("order")
+
+
+def _state_runtime_containers(
+    project: RsonProject,
+    state_id: int,
+    outgoing: Mapping[int, set[int]],
+) -> tuple[CodeContainer, ...]:
+    reachable = _reachable_object_ids((state_id,), outgoing)
+    return tuple(
+        container
+        for container in _iter_code_containers(project)
+        if container.object_id in reachable
+    )
+
+
+def _lint_shared_state_mutates_player(project: RsonProject) -> list[RuntimeIssue]:
+    """Find shared player/NPC TState paths that mutate unqualified CurShip."""
+
+    path = str(project.path) if project.path else None
+    objects, outgoing = _runtime_object_graph(project)
+    player_groups = {
+        object_id
+        for object_id, item in objects.items()
+        if str(item.get("Type", "")).casefold() == "tgroup"
+        and item.get("AddPlayer") is True
+    }
+    npc_groups = {
+        object_id
+        for object_id, item in objects.items()
+        if str(item.get("Type", "")).casefold() == "tgroup"
+        and item.get("AddPlayer") is not True
+    }
+    if not player_groups or not npc_groups:
+        return []
+    state_ids = {
+        object_id
+        for object_id, item in objects.items()
+        if str(item.get("Type", "")).casefold() == "tstate"
+    }
+    player_states = _reachable_object_ids(player_groups, outgoing) & state_ids
+    npc_states = _reachable_object_ids(npc_groups, outgoing) & state_ids
+
+    issues: list[RuntimeIssue] = []
+    for state_id in sorted(player_states & npc_states):
+        mutations: list[tuple[CodeContainer, int, str, str]] = []
+        for container in _state_runtime_containers(project, state_id, outgoing):
+            for line_index, line in enumerate(container.lines):
+                for _position, call, arguments in _line_call_sites(_mask_non_code(line)):
+                    if not _is_curship_mutator(call, arguments):
+                        continue
+                    if _player_is_excluded_before(container.lines, line_index):
+                        continue
+                    mutations.append((container, line_index, call, line.strip()))
+        if not mutations:
+            continue
+        container, line_index, _call, evidence = mutations[0]
+        state_name = str(objects[state_id].get("Name", f"#{state_id}"))
+        calls = ", ".join(sorted({call for _container, _line, call, _evidence in mutations}))
+        issues.append(
+            RuntimeIssue(
+                "warning",
+                "runtime-shared-state-mutates-player",
+                f"TState {state_name} достижим и от AddPlayer=true, и от NPC-группы, "
+                f"но его runtime-ветка изменяет неразделённый CurShip через {calls}. "
+                "Для RuntimePlayer это сам игрок: добавьте доминирующий "
+                "CurShip == Player() exit либо выполняйте мутации только внутри "
+                "CurShip != Player()",
+                path,
+                f"{container.location}:{line_index + 1}",
+                evidence,
+            )
+        )
+    return issues
+
+
+def _shipbad_condition_proves_change(condition: str, new_value: str) -> bool:
+    folded = _compact_expression(condition)
+    if "||" in folded:
+        return False
+    new = _compact_expression(new_value)
+    bad = r"shipgetbad\(curship\)"
+    if re.search(rf"{bad}!={re.escape(new)}(?:\b|$)", folded):
+        return True
+    if new == "0":
+        return bool(
+            re.fullmatch(bad, folded)
+            or re.search(rf"{bad}(?:!=|>)0(?:\b|$)", folded)
+            or re.search(rf"0(?:!=|<){bad}", folded)
+        )
+    return bool(
+        re.fullmatch(rf"!{bad}", folded)
+        or re.search(rf"{bad}==0(?:\b|$)", folded)
+        or re.search(rf"0=={bad}", folded)
+    )
+
+
+def _shipbad_write_is_change_guarded(
+    lines: tuple[str, ...],
+    line_index: int,
+    new_value: str,
+) -> bool:
+    current = _leading_if_condition(lines[line_index])
+    if current is not None and _shipbad_condition_proves_change(current[0], new_value):
+        return True
+    for header in range(0, line_index):
+        parsed = _leading_if_condition(lines[header])
+        if parsed is None or not _shipbad_condition_proves_change(parsed[0], new_value):
+            continue
+        body = _statement_body_range(lines, header)
+        if body is not None and body[0] <= line_index <= body[1]:
+            return True
+    return False
+
+
+def _lint_state_unconditional_shipbad_write(project: RsonProject) -> list[RuntimeIssue]:
+    """Warn about target writes that may retrigger the same recurring state."""
+
+    path = str(project.path) if project.path else None
+    objects, outgoing = _runtime_object_graph(project)
+    state_ids = {
+        object_id
+        for object_id, item in objects.items()
+        if str(item.get("Type", "")).casefold() == "tstate"
+    }
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[int, int | None, int]] = set()
+    for state_id in sorted(state_ids):
+        containers = _state_runtime_containers(project, state_id, outgoing)
+        state_text = _mask_non_code(
+            "\n".join(line for container in containers for line in container.lines)
+        ).casefold()
+        amplified = "starships(" in state_text or "relationtoranger(" in state_text
+        for container in containers:
+            for line_index, line in enumerate(container.lines):
+                for _position, call, arguments in _line_call_sites(_mask_non_code(line)):
+                    if (
+                        call != "shipsetbad"
+                        or len(arguments) < 2
+                        or _simple_identifier(arguments[0]) != "curship"
+                        or _shipbad_write_is_change_guarded(
+                            container.lines, line_index, arguments[1]
+                        )
+                    ):
+                        continue
+                    key = (state_id, container.object_id, line_index)
+                    if key in reported:
+                        continue
+                    reported.add(key)
+                    state_name = str(objects[state_id].get("Name", f"#{state_id}"))
+                    amplification = (
+                        " В этой же ветке есть обход StarShips/отношений, поэтому "
+                        "повторный вход дополнительно умножает стоимость."
+                        if amplified
+                        else ""
+                    )
+                    issues.append(
+                        RuntimeIssue(
+                            "warning",
+                            "runtime-state-unconditional-shipbad-write",
+                            f"TState {state_name} записывает ShipSetBad(CurShip, ...) "
+                            "без доказательства, что цель действительно меняется. "
+                            "Код состояния может исполняться несколько раз за ход, "
+                            "а запись цели способна назначить новый проход AI; "
+                            "сначала сравните ShipGetBad(CurShip) с новым значением."
+                            + amplification,
+                            path,
+                            f"{container.location}:{line_index + 1}",
+                            line.strip(),
+                        )
+                    )
+    return issues
+
+
 def lint_rson_runtime(
     project: RsonProject,
     *,
@@ -6708,6 +7178,8 @@ def lint_rson_runtime(
     issues.extend(_lint_group_shipout_iteration(project, functions, ship_effects))
     issues.extend(_lint_ether_semantics(project, functions))
     issues.extend(_lint_warrior_home_release(project, functions))
+    issues.extend(_lint_shared_state_mutates_player(project))
+    issues.extend(_lint_state_unconditional_shipbad_write(project))
     graph = _call_graph(functions)
     risky = _risky_functions(functions, graph)
 
@@ -7208,6 +7680,7 @@ def _node_parameters(nodes: Iterable[BlockParNode], prefix: str = ""):
 def lint_main_runtime(document: BlockParDocument, path: str | Path | None = None) -> list[RuntimeIssue]:
     issues: list[RuntimeIssue] = []
     source = str(Path(path).resolve()) if path else None
+    cache_shadow_reported: set[str] = set()
     for node_path, key, value in _node_parameters(document.roots):
         for arguments, call in _script_run_calls(value):
             if len(arguments) < 2:
@@ -7248,6 +7721,38 @@ def lint_main_runtime(document: BlockParDocument, path: str | Path | None = None
                         call,
                     )
                 )
+        if "onload" not in {part.casefold() for part in node_path.split("/")}:
+            continue
+        active_names = {
+            literal.casefold(): literal
+            for _position, arguments, _end in _iter_parsed_calls(value, "IsScriptActive")
+            if arguments and (literal := _literal_string(arguments[0])) is not None
+        }
+        run_names = {
+            literal.casefold(): literal
+            for _position, arguments, _end in _iter_parsed_calls(value, "ScriptRun")
+            if len(arguments) >= 3 and (literal := _literal_string(arguments[2])) is not None
+        }
+        for script_name in sorted(
+            (active_names.keys() & run_names.keys()) - cache_shadow_reported
+        ):
+            cache_shadow_reported.add(script_name)
+            label = run_names[script_name]
+            issues.append(
+                RuntimeIssue(
+                    "info",
+                    "runtime-saved-script-cache-update-shadow",
+                    f"OnLoad запускает {label!r} только при "
+                    "!IsScriptActive с тем же именем. Активный экземпляр и его "
+                    "код сериализуются в SAV, поэтому замена одноимённого SCR на "
+                    "диске не доказывает обновление уже загруженного сохранения. "
+                    "Для несовместимого runtime-исправления используйте новый "
+                    "epoch/ScriptName и явную миграцию старого экземпляра",
+                    source,
+                    f"{node_path}/{key}",
+                    value.strip(),
+                )
+            )
     return issues
 
 

@@ -233,6 +233,20 @@ if(current_cargo) ItemExist(current_cargo);
 Анализ межпроцедурный: передача сырого `cargo` в функцию-сеттер, которая пишет
 параметр в общий `TVar` или `ArrayAdd`, также считается ошибкой.
 
+### Изображение собственного CreateQuestItem
+
+Строковый первый аргумент `CreateQuestItem('CargoType', owner)` является типом
+`UselessItems`. Если мод объявляет этот тип в собственном `Lang`, он должен
+поставить изображение в `DATA/ItemsUseless` либо зарегистрировать непустой ключ
+`Bm/ItemsUseless/<race><CargoType>_s` в `CacheData`.
+
+При отсутствии изображения игра не падает: для каждого созданного предмета она
+записывает `Can not find image for useless item` и подставляет
+`Usl_FishCont`. `runtime-quest-item-image-missing` поэтому имеет уровень
+warning и агрегируется один раз на тип, независимо от числа вызовов
+`CreateQuestItem`. Базовые типы, не объявленные собственным Lang мода, это
+правило не присваивает моду автоматически.
+
 ### ABI динамических массивов RScript
 
 Фиксированный `newarray(N)`, где `N > 1`, остаётся обычным массивом с индексами
@@ -298,6 +312,22 @@ for(int i = 1; i < ArrayDim(ids); i = i + 1) Use(ids[i]);
 недействительную `Planet`, `Star` или `Ship`; первый `PlanetToStar`, `StarOwner`
 или другой вызов, разыменовывающий такую ссылку, способен завершиться
 `EAccessViolation`.
+
+Активный экземпляр RScript также сериализуется в SAV вместе с кодом и
+состоянием. Поэтому конструкция в `BV/OnLoad`
+
+```text
+if(!IsScriptActive('Mod_Worker'))
+    ScriptRun(ShipStar(Player()), GetShipPlanet(Player()), 'Mod_Worker');
+```
+
+защищает от второго экземпляра, но одновременно оставляет старый код активным
+после установки одноимённого нового SCR. ModKit сообщает об этом как
+`runtime-saved-script-cache-update-shadow` уровня info: одиночный аудит не
+имеет предыдущего SCR и не утверждает, что код изменился. Для несовместимого
+runtime-исправления используйте новый epoch/ScriptName и проверенную миграцию
+объектов/состояния; проверка SHA-256 файла на диске не доказывает, какой worker
+исполняет загруженное сохранение.
 
 `runtime-persistent-world-object-handle` требует для долгоживущего состояния:
 
@@ -667,6 +697,33 @@ distance = Dist(source_star, target_star);
 `runtime-shipowner-class-discriminator-mismatch` переносит доказательство типа
 через guards и пользовательские функции, но не запрещает неизвестные выражения,
 если класс или диапазон владельца статически не доказан.
+
+Если один `TState` связан и с обычной NPC-группой, и с группой
+`AddPlayer=true`, то `CurShip` в той же runtime-ветке может быть игроком.
+`runtime-shared-state-mutates-player` прослеживает связи до downstream Top и
+предупреждает о setter-вызовах `ShipOwner`, `ShipStanding`,
+`ShipCustomFaction`, `NoTargetToShip`, `ShipSetBad`, приказах и переносах на
+неразделённом `CurShip`. Перед NPC-мутациями нужен доминирующий барьер:
+
+```text
+if(CurShip == Player()) exit;
+```
+
+или явно ограниченная ветка `if(CurShip != Player())`. Составное условие с
+`||` не считается доказательством: оно может быть истинно и для игрока.
+
+Runtime-код за `TState` может вызываться несколько раз за ход. Безусловная
+запись `ShipSetBad(CurShip, value)` способна назначить новый проход AI даже
+когда значение не меняется. `runtime-state-unconditional-shipbad-write`
+остаётся предупреждением, поскольку сама функция допустима, и принимает
+явный value guard:
+
+```text
+if(ShipGetBad(CurShip)) ShipSetBad(CurShip, 0);
+```
+
+Проверка постороннего флага (`if(GetData(...)) ShipSetBad(...)`) не доказывает
+идемпотентность цели.
 
 `ShipCustomFaction(ship, 'SubFactionFixedStanding')` — точный встроенный маркер,
 не требующий собственной эмблемы. Любой другой непустой строковый литерал,

@@ -23,6 +23,7 @@ from .runtime_lint import (
     lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
+    lint_quest_item_images,
     lint_rson_runtime,
 )
 from .script_artifacts import lint_script_cache
@@ -1457,6 +1458,15 @@ def _script_check(context: AuditContext) -> AuditCheck:
     issues.extend(
         AuditIssue.from_value(item, validator=name, mod=context.mod_name)
         for item in lint_script_cache(context.root, scripts, registrations, cache_documents)
+    )
+    issues.extend(
+        AuditIssue.from_value(item, validator=name, mod=context.mod_name)
+        for item in lint_quest_item_images(
+            context.root,
+            rson_projects,
+            cache_documents,
+            language_documents,
+        )
     )
 
     semantic_complete = not scripts or valid_rsons > 0

@@ -50,6 +50,7 @@ from .runtime_lint import (
     literal_ct_references,
     lint_main_runtime,
     lint_module_runtime,
+    lint_quest_item_images,
     lint_rson_runtime,
 )
 from .script_artifacts import ScriptArtifactIssue, lint_script_cache
@@ -161,6 +162,7 @@ __all__ = [
     "lint_literal_ct_keys",
     "lint_main_runtime",
     "lint_module_runtime",
+    "lint_quest_item_images",
     "lint_rson_runtime",
     "ScriptArtifactIssue",
     "lint_script_cache",
