@@ -1621,12 +1621,24 @@ def _index_range(
 
 
 def _typed_scalar_expression(expression: str) -> bool:
+    raw = expression.strip()
+    if _literal_string(raw) is not None:
+        return True
     folded = _mask_non_code(expression).strip()
     if _constant_int(folded) is not None:
         return True
-    if re.search(r"\b(?:Id|CurTurn)\s*\(", folded, re.IGNORECASE):
+    if re.fullmatch(r"(?:true|false)", folded, re.IGNORECASE):
         return True
-    return bool(re.fullmatch(r"[+\-\d\s()*/%]+", folded))
+    if re.search(
+        r"\b(?:Id|CurTurn|CT|Format|GalaxyMoney|RndObject)\s*\(",
+        folded,
+        re.IGNORECASE,
+    ):
+        return True
+    return bool(
+        re.search(r"\d", folded)
+        and re.fullmatch(r"[+\-\d.\s()*/%]+", folded)
+    )
 
 
 def _lint_fixed_array_contracts(project: RsonProject) -> list[RuntimeIssue]:
@@ -1767,7 +1779,10 @@ def _lint_fixed_array_contracts(project: RsonProject) -> list[RuntimeIssue]:
                             )
                         )
                 index_bounds = _index_range(match.group(2), loops.get(line_index, {}), bounds)
-                tail = masked[match.end():]
+                # The masked line preserves offsets but removes string
+                # literals entirely.  Inspect the original tail so a direct
+                # string assignment proves that the slot is typed.
+                tail = line[match.end():]
                 assigned = assignment_tail.match(tail)
                 if index_bounds is not None:
                     low, high = index_bounds
@@ -3405,6 +3420,176 @@ def _dialog_code_object_ids(project: RsonProject) -> set[int]:
         elif str(item.get("Type", "")).casefold().startswith("tdialog"):
             result.add(object_id)
     return result
+
+
+def _lint_dialog_message_eager_expressions(project: RsonProject) -> list[RuntimeIssue]:
+    """Check expressions evaluated from Msg before dialog action handlers."""
+
+    path = str(project.path) if project.path else None
+    sizes = {
+        name: next(iter(values))
+        for name, values in _array_allocation_sizes(project).items()
+        if len(values) == 1 and next(iter(values)) > 0
+    }
+    bounds = _numeric_variable_bounds(project)
+    shared = _shared_tvars(project)
+    dialog_objects = _dialog_scoped_turn_objects(project)
+    dialog_assignments: set[str] = set()
+    transition_preassignments: dict[int, list[set[str]]] = {}
+    assignment = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*[^;]+",
+        re.IGNORECASE,
+    )
+    for container in _iter_code_containers(project):
+        if container.object_id not in dialog_objects and container.code_type != "dialogbegin":
+            continue
+        for line in container.lines:
+            dialog_assignments.update(
+                match.group(1).casefold()
+                for match in assignment.finditer(_mask_non_code(line))
+            )
+        text = "\n".join(container.lines)
+        for position, arguments, _end in _iter_parsed_calls(text, "DChange"):
+            if not arguments or (number := _constant_int(arguments[0])) is None:
+                continue
+            prefix = _mask_non_code(text[:position])
+            immediate = re.search(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*[^;{}]*;\s*$",
+                prefix,
+                re.IGNORECASE,
+            )
+            transition_preassignments.setdefault(number, []).append(
+                {immediate.group(1).casefold()} if immediate else set()
+            )
+
+    template_expression = re.compile(r"<([^<>]+)>")
+    indexed = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([^]]+)\s*\]")
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[int | None, str, str]] = set()
+    for item in project.iter_objects():
+        if str(item.get("Type", "")).casefold() not in {"tdialogmsg", "tdialoganswer"}:
+            continue
+        message = item.get("Msg")
+        if not isinstance(message, str) or "<" not in message:
+            continue
+        object_id = item.get("#") if isinstance(item.get("#"), int) else None
+        location = f"object #{object_id} Msg" if object_id is not None else "dialog Msg"
+        for placeholder in template_expression.finditer(message):
+            expression = placeholder.group(1).strip()
+            for match in indexed.finditer(expression):
+                name = match.group(1).casefold()
+                if name not in sizes:
+                    continue
+                key = (object_id, "array", f"{name}[{match.group(2)}]".casefold())
+                if key in reported:
+                    continue
+                reported.add(key)
+                index_bounds = _index_range(match.group(2), {}, bounds)
+                if index_bounds is None:
+                    issues.append(
+                        RuntimeIssue(
+                            "warning",
+                            "runtime-dialog-msg-eager-array-index-unproven",
+                            f"Поле Msg содержит раннее выражение {match.group(0)!r}, но диапазон индекса не доказан внутри 0..{sizes[name] - 1}. Поля сообщения вычисляются до связанного action-handler. До DChange подготовьте одну строковую переменную для Msg либо оставьте Msg пустым и сформируйте всю реплику одним DText после инициализации и guard",
+                            path,
+                            location,
+                            placeholder.group(0),
+                        )
+                    )
+                    continue
+                low, high = index_bounds
+                if low < 0 or high >= sizes[name]:
+                    issues.append(
+                        RuntimeIssue(
+                            "error",
+                            "runtime-dialog-msg-eager-array-index",
+                            f"Поле Msg заранее вычисляет {match.group(0)!r} с диапазоном индекса {low}..{high}, но {name}=newarray({sizes[name]}) допускает только 0..{sizes[name] - 1}. Связанный обработчик ещё не успел изменить индекс; игра может завершить вызов сообщения ошибкой массива. До DChange подготовьте одну строковую переменную для Msg либо оставьте Msg пустым и сформируйте всю реплику одним DText",
+                            path,
+                            location,
+                            placeholder.group(0),
+                        )
+                    )
+
+            simple = _simple_identifier(expression)
+            if (
+                simple is None
+                or simple not in shared
+                or simple not in dialog_assignments
+            ):
+                continue
+            message_number = _constant_int(str(item.get("DMsg.Num", "")))
+            transitions = transition_preassignments.get(message_number, [])
+            if transitions and all(simple in names for names in transitions):
+                continue
+            key = (object_id, "scalar", simple)
+            if key in reported:
+                continue
+            reported.add(key)
+            issues.append(
+                RuntimeIssue(
+                    "warning",
+                    "runtime-dialog-msg-eager-mutable-value",
+                    f"Поле Msg подставляет изменяемую в диалоговых обработчиках переменную {simple} раньше этих обработчиков. Текст способен показать начальное или устаревшее значение. Рассчитайте строку до DChange либо оставьте Msg пустым и сформируйте всю реплику одним DText",
+                    path,
+                    location,
+                    placeholder.group(0),
+                )
+            )
+    return issues
+
+
+def _lint_dialog_handler_dtext_overwrite(project: RsonProject) -> list[RuntimeIssue]:
+    """Warn when a linked DText replaces an already populated dialog Msg."""
+
+    path = str(project.path) if project.path else None
+    objects = {
+        item["#"]: item
+        for item in project.iter_objects()
+        if isinstance(item.get("#"), int)
+    }
+    outgoing: dict[int, set[int]] = {object_id: set() for object_id in objects}
+    links = project.data.get("Visual.Links", [])
+    if isinstance(links, list):
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            begin, end = link.get("Begin"), link.get("End")
+            if begin in objects and end in objects:
+                outgoing[begin].add(end)
+
+    containers = {
+        container.object_id: container
+        for container in _iter_code_containers(project)
+        if container.object_id is not None
+    }
+    issues: list[RuntimeIssue] = []
+    for object_id, item in objects.items():
+        if str(item.get("Type", "")).casefold() != "tdialogmsg":
+            continue
+        message = item.get("Msg")
+        if not isinstance(message, str) or not message.strip():
+            continue
+        for target_id in sorted(outgoing.get(object_id, ())):
+            container = containers.get(target_id)
+            if container is None:
+                continue
+            text = "\n".join(container.lines)
+            call = next(_iter_parsed_calls(text, "DText"), None)
+            if call is None:
+                continue
+            position, _arguments, end = call
+            line_number = text.count("\n", 0, position) + 1
+            issues.append(
+                RuntimeIssue(
+                    "warning",
+                    "runtime-dialog-handler-dtext-overwrite",
+                    f"TDialogMsg #{object_id} уже содержит Msg, а связанный handler #{target_id} вызывает DText. DText заменяет текущую реплику, а не дописывает её, поэтому начало текста и разметка/цвет из Msg могут исчезнуть. Сформируйте всю реплику одним Msg либо одним DText",
+                    path,
+                    f"{container.location}:{line_number}",
+                    text[position:end],
+                )
+            )
+    return issues
 
 
 def _lint_dialog_persistent_arrays(project: RsonProject) -> list[RuntimeIssue]:
@@ -7152,6 +7337,8 @@ def lint_rson_runtime(
     issues.extend(_lint_array_initialization_paths(project))
     issues.extend(_lint_fixed_array_contracts(project))
     issues.extend(_lint_persistent_array_dimension_drift(project))
+    issues.extend(_lint_dialog_message_eager_expressions(project))
+    issues.extend(_lint_dialog_handler_dtext_overwrite(project))
     issues.extend(_lint_dialog_persistent_arrays(project))
     issues.extend(_lint_persistent_array_migrations(project))
     issues.extend(_lint_dialog_semantics(project))

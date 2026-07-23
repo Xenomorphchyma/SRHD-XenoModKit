@@ -1938,6 +1938,28 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-fixed-array-untyped-slot", fixed_codes)
 
+    def test_fixed_array_direct_float_and_string_writes_are_typed(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "values", "Parent": -1, "#": 20},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "values = newarray(3);",
+            "values[0] = 0.6;",
+            'values[1] = "ready";',
+            'values[2] = CT("Script.RuntimeSafe.1");',
+            "result = values[0];",
+            "result = values[1];",
+            "result = values[2];",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(
+                RsonProject(data, Path("typed-direct-fixed.rson"))
+            )
+        }
+        self.assertNotIn("runtime-fixed-array-untyped-slot", codes)
+
     def test_fixed_array_index_contract_uses_known_loop_bound(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Variables"] = [
@@ -2751,6 +2773,129 @@ class RuntimeLintTests(unittest.TestCase):
             for issue in lint_rson_runtime(RsonProject(data, Path("local-dialog-gate.rson")))
         }
         self.assertNotIn("runtime-dialog-inject-delayed-persistent-gate", safe_codes)
+
+    def test_dialog_msg_rejects_eager_invalid_index_and_warns_about_late_value(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {
+                "Type": "TVar",
+                "Name": "descriptions",
+                "Init": "newarray(5)",
+                "Parent": -1,
+                "#": 20,
+            },
+            {
+                "Type": "TVar",
+                "Name": "level",
+                "Init": "0",
+                "Parent": -1,
+                "#": 21,
+            },
+            {
+                "Type": "TVar",
+                "Name": "cost",
+                "Init": "0",
+                "Parent": -1,
+                "#": 22,
+            },
+        ]
+        group["Dialogs"] = [
+            {"Type": "TDialog", "Name": "Upgrade", "Parent": -1, "#": 10},
+            {
+                "Type": "TDialogMsg",
+                "Name": "Details",
+                "Parent": -1,
+                "#": 11,
+                "DMsg.Num": "13",
+                "Msg": "Hull <descriptions[level-1]>, cost <cost>",
+            },
+        ]
+        group["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "PrepareUpgrade",
+                "Parent": 10,
+                "#": 12,
+                "Code.Type": "Turn",
+                "Code": [
+                    "DChange(13);",
+                    "level = 1;",
+                    "cost = GalaxyMoney(0);",
+                ],
+            }
+        )
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 10, "End": 12, "Nom": 0, "Arrow": True}
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("eager-dialog-msg.rson")))
+        by_code = {issue.code: issue for issue in issues}
+        self.assertEqual(
+            by_code["runtime-dialog-msg-eager-array-index"].severity,
+            "error",
+        )
+        self.assertIn("-1", by_code["runtime-dialog-msg-eager-array-index"].message)
+        self.assertEqual(
+            by_code["runtime-dialog-msg-eager-mutable-value"].severity,
+            "warning",
+        )
+
+        group["Dialogs"][1]["Msg"] = "Cost <cost>"
+        group["Operations"][-1]["Code"] = [
+            "cost = GalaxyMoney(0);",
+            "DChange(13);",
+        ]
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("handler-text.rson")))
+        }
+        self.assertNotIn("runtime-dialog-msg-eager-array-index", safe_codes)
+        self.assertNotIn("runtime-dialog-msg-eager-mutable-value", safe_codes)
+
+    def test_linked_dtext_warns_when_dialog_message_already_has_text(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Dialogs"] = [
+            {
+                "Type": "TDialogMsg",
+                "Name": "Details",
+                "Parent": -1,
+                "#": 10,
+                "DMsg.Num": "13",
+                "Msg": "Full highlighted reply",
+            },
+        ]
+        group["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "DetailsHandler",
+                "Parent": -1,
+                "#": 11,
+                "Code.Type": "Turn",
+                "Code": ['DText("only suffix");'],
+            }
+        )
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 10, "End": 11, "Nom": 0, "Arrow": True}
+        ]
+        matching = [
+            issue
+            for issue in lint_rson_runtime(
+                RsonProject(data, Path("dialog-dtext-overwrite.rson"))
+            )
+            if issue.code == "runtime-dialog-handler-dtext-overwrite"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "warning")
+
+        group["Dialogs"][0]["Msg"] = ""
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(
+                RsonProject(data, Path("dialog-dtext-only.rson"))
+            )
+        }
+        self.assertNotIn("runtime-dialog-handler-dtext-overwrite", safe_codes)
 
     def test_dialog_forward_reference_to_persistent_array_is_blocked(self) -> None:
         data = deepcopy(SAFE_RSON)
