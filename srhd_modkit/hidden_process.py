@@ -41,6 +41,48 @@ class HiddenProcessResult:
     last_progress_seconds: float = 0.0
 
 
+class HiddenProcessTimeout(TimeoutError):
+    """Timeout with the private-desktop evidence preserved for JSON callers."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        timeout_kind: str,
+        exit_code: int,
+        elapsed_seconds: float,
+        window_text: Sequence[str],
+        window_diagnostics: Sequence[str],
+        dialog_controls: Sequence[str],
+        control_diagnostics: Sequence[str],
+        progress_updates: int,
+        last_progress_seconds: float,
+    ):
+        super().__init__(message)
+        self.timeout_kind = timeout_kind
+        self.exit_code = exit_code
+        self.elapsed_seconds = elapsed_seconds
+        self.window_text = tuple(window_text)
+        self.window_diagnostics = tuple(window_diagnostics)
+        self.dialog_controls = tuple(dialog_controls)
+        self.control_diagnostics = tuple(control_diagnostics)
+        self.progress_updates = progress_updates
+        self.last_progress_seconds = last_progress_seconds
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "timeout_kind": self.timeout_kind,
+            "exit_code": self.exit_code,
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "window_text": list(self.window_text),
+            "window_diagnostics": list(self.window_diagnostics),
+            "dialog_controls": list(self.dialog_controls),
+            "control_diagnostics": list(self.control_diagnostics),
+            "progress_updates": self.progress_updates,
+            "last_progress_seconds": round(self.last_progress_seconds, 3),
+        }
+
+
 @dataclass(frozen=True)
 class HiddenControlAction:
     """Click or type into one control on a private invisible desktop."""
@@ -440,11 +482,13 @@ def run_on_hidden_desktop(
             last_progress_at = at
             progress_updates += 1
 
-        def abort_for_timeout(message: str) -> None:
+        def abort_for_timeout(message: str, timeout_kind: str) -> None:
             nonlocal captured_window_text
             captured_window_text = _read_desktop_window_text(user32, desktop)
-            windows = "; ".join(_read_desktop_window_diagnostics(user32, desktop))
-            controls = "; ".join(_read_hidden_dialog_controls(user32, desktop))
+            window_diagnostics = _read_desktop_window_diagnostics(user32, desktop)
+            dialog_controls = _read_hidden_dialog_controls(user32, desktop)
+            windows = "; ".join(window_diagnostics)
+            controls = "; ".join(dialog_controls)
             terminate_process_tree(124)
             details = "; ".join(captured_window_text)
             suffix = f"; скрытое окно: {details}" if details else ""
@@ -456,8 +500,20 @@ def run_on_hidden_desktop(
                 if control_actions
                 else ""
             )
-            raise TimeoutError(
+            full_message = (
                 f"{message}{suffix}{window_suffix}{control_suffix}{automation}"
+            )
+            raise HiddenProcessTimeout(
+                full_message,
+                timeout_kind=timeout_kind,
+                exit_code=124,
+                elapsed_seconds=time.monotonic() - started,
+                window_text=captured_window_text,
+                window_diagnostics=window_diagnostics,
+                dialog_controls=dialog_controls,
+                control_diagnostics=button_diagnostics,
+                progress_updates=progress_updates,
+                last_progress_seconds=max(0.0, last_progress_at - started),
             )
 
         while True:
@@ -553,12 +609,14 @@ def run_on_hidden_desktop(
                 abort_for_timeout(
                     f"Процесс не показал подтверждённого прогресса за "
                     f"{progress_timeout:.0f} секунд (последний прогресс через "
-                    f"{last_progress_at - started:.1f} с после запуска)"
+                    f"{last_progress_at - started:.1f} с после запуска)",
+                    "progress",
                 )
             if timeout is not None and now - started >= timeout:
                 abort_for_timeout(
                     f"Процесс превысил общий аварийный лимит {timeout:.0f} секунд, "
-                    f"несмотря на {progress_updates} обновлений прогресса"
+                    f"несмотря на {progress_updates} обновлений прогресса",
+                    "hard",
                 )
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(process.hProcess, ctypes.byref(exit_code)):

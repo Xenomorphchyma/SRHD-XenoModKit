@@ -127,10 +127,15 @@ def _rscript_timeout_policy(
     }
 
 
-def _rscript_failure_diagnostic(exc: Exception) -> dict[str, Any] | None:
+def _rscript_failure_diagnostic(
+    exc: Exception,
+    *,
+    operation: str | None = None,
+) -> dict[str, Any] | None:
     """Extract stable machine-readable facts from legacy modal diagnostics."""
 
     message = str(exc)
+    folded = message.casefold()
     match = re.search(
         r"TFileEC\.Open\.\s*FileName=(.+?\.txt)\.",
         message,
@@ -166,13 +171,49 @@ def _rscript_failure_diagnostic(exc: Exception) -> dict[str, Any] | None:
             "lock_status": "unknown",
             "suggested_retry": "Повторите без --lang-dat или явно разрешите --fallback-without-lang",
         }
-    if any(marker in message.casefold() for marker in ("скрытое окно", "контролы диалога", "окно ошибки")):
+    if (
+        operation == "compile"
+        and isinstance(exc, TimeoutError)
+        and "rscript" in folded
+        and "build" in folded
+        and ("dat files params" in folded or "script params" in folded)
+        and (
+            "подтверждённого прогресса" in folded
+            or "аварийный лимит" in folded
+            or "timeout" in folded
+        )
+    ):
+        return {
+            "code": "rscript-build-silent-main-window-stall",
+            "message": message,
+            "compiler_output_created": False,
+            "classification": (
+                "RScript вернулся к главному окну Build, не создал SCR и не "
+                "показывал подтверждённого прогресса"
+            ),
+            "suggested_retry": (
+                "Сравните RSON с последней успешно собранной версией; validate "
+                "и runtime-lint не доказывают компилируемость внешним RScript"
+            ),
+        }
+    if any(marker in folded for marker in ("скрытое окно", "контролы диалога", "окно ошибки")):
         return {
             "code": "rscript-modal-error",
             "message": message,
             "suggested_retry": "Если сбой возник при импорте Lang.dat, повторите без --lang-dat или явно разрешите --fallback-without-lang",
         }
     return None
+
+
+class ScriptBuildFailure(ValueError):
+    """Machine-readable failure from the headless RScript build workflow."""
+
+    def __init__(self, message: str, report: dict[str, Any]):
+        super().__init__(message)
+        self.report = report
+
+    def as_dict(self) -> dict[str, Any]:
+        return self.report
 
 
 def _project_graph_sha256(project: Any) -> str:
@@ -712,36 +753,117 @@ class Toolchain:
             staged_scr = temp / scr_output.name
             staged_lang = temp / lang_output.name
             shutil.copy2(source, staged_source)
-            process_result = run_on_hidden_desktop(
-                tool.path,
-                [
-                    "--cli",
-                    "--build",
-                    "--full",
-                    str(staged_source),
-                    str(staged_scr),
-                    str(staged_lang),
-                ],
-                cwd=tool.path.parent,
-                timeout=timeout_seconds,
-                expected_outputs=[staged_scr, staged_lang],
-                progress_timeout=timeout_policy["progress_seconds"],
-                abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
-            )
-            if not staged_scr.is_file():
-                raise RuntimeError(f"RScript CLI не создал SCR (код {process_result.exit_code})")
-            if not staged_lang.is_file():
-                raise RuntimeError(
-                    f"RScript CLI не создал языковой фрагмент (код {process_result.exit_code})"
+            process_result = None
+            compiler_started = time.monotonic()
+            try:
+                process_result = run_on_hidden_desktop(
+                    tool.path,
+                    [
+                        "--cli",
+                        "--build",
+                        "--full",
+                        str(staged_source),
+                        str(staged_scr),
+                        str(staged_lang),
+                    ],
+                    cwd=tool.path.parent,
+                    timeout=timeout_seconds,
+                    expected_outputs=[staged_scr, staged_lang],
+                    progress_timeout=timeout_policy["progress_seconds"],
+                    abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
                 )
-            lang_fragment = inspect_rscript_lang_fragment(staged_lang)
-            _reject_invalid_rscript_lang_fragment(lang_fragment)
-            scr_info = inspect_scr(staged_scr)
-            if not scr_info["supported_version"]:
-                raise RuntimeError(f"RScript создал SCR неподдерживаемой версии {scr_info['version']}")
-            scr_info["lang_fragment"] = lang_fragment.as_dict()
-            _replace_cross_device_safe(staged_scr, scr_output)
-            _replace_cross_device_safe(staged_lang, lang_output)
+                if not staged_scr.is_file():
+                    raise RuntimeError(
+                        f"RScript CLI не создал SCR (код {process_result.exit_code})"
+                    )
+                if not staged_lang.is_file():
+                    raise RuntimeError(
+                        "RScript CLI не создал языковой фрагмент "
+                        f"(код {process_result.exit_code})"
+                    )
+                lang_fragment = inspect_rscript_lang_fragment(staged_lang)
+                _reject_invalid_rscript_lang_fragment(lang_fragment)
+                scr_info = inspect_scr(staged_scr)
+                if not scr_info["supported_version"]:
+                    raise RuntimeError(
+                        f"RScript создал SCR неподдерживаемой версии {scr_info['version']}"
+                    )
+                scr_info["lang_fragment"] = lang_fragment.as_dict()
+                _replace_cross_device_safe(staged_scr, scr_output)
+                _replace_cross_device_safe(staged_lang, lang_output)
+            except Exception as exc:
+                diagnostic = _rscript_failure_diagnostic(exc, operation="compile")
+                if diagnostic is None:
+                    if isinstance(exc, TimeoutError):
+                        code = "rscript-build-timeout"
+                    elif not staged_scr.is_file():
+                        code = "rscript-build-output-missing"
+                    else:
+                        code = "rscript-build-output-invalid"
+                    diagnostic = {"code": code, "message": str(exc)}
+                process_failure = (
+                    exc.as_dict()
+                    if callable(getattr(exc, "as_dict", None))
+                    else None
+                )
+                if process_failure is not None:
+                    diagnostic["process"] = process_failure
+                elapsed = (
+                    getattr(process_result, "elapsed_seconds", None)
+                    if process_result is not None
+                    else getattr(
+                        exc,
+                        "elapsed_seconds",
+                        time.monotonic() - compiler_started,
+                    )
+                )
+                report = {
+                    "schema": "srhd-modkit-script-build-v1",
+                    "status": "failed",
+                    "source": str(source),
+                    "source_sha256": sha256_file(source),
+                    "preflight_passed": True,
+                    "compiler_started": True,
+                    "compiler_output_created": staged_scr.is_file(),
+                    "language_output_created": staged_lang.is_file(),
+                    "published_outputs": False,
+                    "compiler": {
+                        "name": "RScript",
+                        "version": "4.10f",
+                        "executable": str(tool.path),
+                        "exit_code": (
+                            getattr(process_result, "exit_code", None)
+                            if process_result is not None
+                            else getattr(exc, "exit_code", None)
+                        ),
+                        "seconds": round(float(elapsed), 3),
+                        "progress_updates": (
+                            getattr(process_result, "progress_updates", None)
+                            if process_result is not None
+                            else getattr(exc, "progress_updates", None)
+                        ),
+                        "last_progress_seconds": (
+                            round(
+                                float(
+                                    getattr(
+                                        process_result,
+                                        "last_progress_seconds",
+                                        0.0,
+                                    )
+                                ),
+                                3,
+                            )
+                            if process_result is not None
+                            else round(
+                                float(getattr(exc, "last_progress_seconds", 0.0)),
+                                3,
+                            )
+                        ),
+                        "timeout": timeout_policy,
+                    },
+                    "failure": diagnostic,
+                }
+                raise ScriptBuildFailure(str(exc), report) from exc
         return process_result, scr_info, timeout_policy
 
     def _load_script_lang_base(
@@ -1030,6 +1152,8 @@ class Toolchain:
                 }
             )
         return {
+            "schema": "srhd-modkit-script-build-v1",
+            "status": "passed",
             "source": str(source),
             "scr": str(scr_output),
             "lang": str(legacy_lang),
@@ -1042,6 +1166,11 @@ class Toolchain:
                 "warnings": language_warnings,
             },
             "compiler_exit_code": process_result.exit_code,
+            "preflight_passed": True,
+            "compiler_started": True,
+            "compiler_output_created": True,
+            "language_output_created": True,
+            "published_outputs": True,
             "compiler_was_waiting_after_output": process_result.forced_after_outputs,
             "compiler_seconds": round(process_result.elapsed_seconds, 3),
             "compiler_queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),

@@ -15,7 +15,9 @@ from srhd_modkit.cli import (
     cmd_script_audit_mod,
     cmd_script_build,
     cmd_script_validate,
+    main,
 )
+from srhd_modkit.image_codec import RgbaImage, encode_gi
 from srhd_modkit.module_info import parse_module_info
 from srhd_modkit.runtime_lint import (
     compare_storage_schemas,
@@ -27,6 +29,7 @@ from srhd_modkit.runtime_lint import (
     lint_rson_runtime,
 )
 from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, RsonProject
+from srhd_modkit.toolchain import ScriptBuildFailure
 
 
 SAFE_RSON = {
@@ -588,8 +591,40 @@ class RuntimeLintTests(unittest.TestCase):
                 tools_root=None,
                 json=False,
             )
-            with self.assertRaisesRegex(ValueError, "runtime-linked-empty-code"):
+            with self.assertRaisesRegex(
+                ScriptBuildFailure,
+                "runtime-linked-empty-code",
+            ) as caught:
                 cmd_script_build(args)
+            report = caught.exception.as_dict()
+            self.assertEqual(report["schema"], "srhd-modkit-script-build-v1")
+            self.assertEqual(report["status"], "failed")
+            self.assertFalse(report["preflight_passed"])
+            self.assertFalse(report["compiler_started"])
+            self.assertFalse(report["compiler_output_created"])
+            self.assertEqual(
+                report["failure"]["code"],
+                "script-build-runtime-preflight-failed",
+            )
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = main(
+                    [
+                        "script",
+                        "build",
+                        str(rson),
+                        "--scr",
+                        str(root / "json.scr"),
+                        "--lang",
+                        str(root / "json.lang"),
+                        "--json",
+                    ]
+                )
+            payload = json.loads(output.getvalue())
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(payload["status"], "failed")
+            self.assertFalse(payload["preflight_passed"])
+            self.assertFalse(payload["compiler_output_created"])
 
     def test_player_script_run_must_use_actual_player_planet(self) -> None:
         unsafe = parse_blockpar(
@@ -770,6 +805,135 @@ class RuntimeLintTests(unittest.TestCase):
                     {"rus": ((Path("Lang_Rus.txt"), language),)},
                 ),
                 [],
+            )
+
+    def test_quest_item_static_target_is_verified_without_requiring_external_assets(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "CreateQuestItem('CargoType', 2);",
+        ]
+        language = parse_blockpar(
+            "UselessItems ^{\n"
+            "  CargoType ^{\n"
+            "    Name=Cargo\n"
+            "  }\n"
+            "}\n"
+        )
+        project = RsonProject(data, Path("quest-item-target.rson"))
+
+        def cache(value: str):
+            return parse_blockpar(
+                "Bm ^{\n"
+                "  ItemsUseless ^{\n"
+                f"    2CargoType_s={value}\n"
+                "  }\n"
+                "}\n"
+            )
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "QuestFixture"
+            root.mkdir()
+            (root / "ModuleInfo.txt").write_text(
+                "Name=QuestFixture\n"
+                "Section=Test\n"
+                "Languages=Rus\n"
+                "Dependence=SharedIcons\n",
+                encoding="cp1251",
+            )
+            image = root / "DATA" / "ItemsUseless" / "Cargo.gi"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(
+                encode_gi(
+                    RgbaImage(2, 2, bytes((20, 40, 60, 255)) * 4),
+                    "0_32",
+                )
+            )
+            common = (
+                (project,),
+                {"rus": ((Path("Lang_Rus.txt"), language),)},
+            )
+
+            own = cache(
+                r"Mods\OtherMods\QuestFixture\DATA\ItemsUseless\Cargo.gi"
+            )
+            self.assertEqual(
+                lint_quest_item_images(
+                    root,
+                    common[0],
+                    ((Path("CacheData.txt"), own),),
+                    common[1],
+                ),
+                [],
+            )
+
+            missing = cache(
+                r"Mods\OtherMods\QuestFixture\DATA\ItemsUseless\Missing.gi"
+            )
+            missing_issues = lint_quest_item_images(
+                root,
+                common[0],
+                ((Path("CacheData.txt"), missing),),
+                common[1],
+            )
+            self.assertEqual(
+                missing_issues[0].code,
+                "runtime-quest-item-image-target-missing",
+            )
+            self.assertEqual(missing_issues[0].severity, "warning")
+
+            image.write_bytes(b"not a gi")
+            invalid_issues = lint_quest_item_images(
+                root,
+                common[0],
+                ((Path("CacheData.txt"), own),),
+                common[1],
+            )
+            self.assertEqual(
+                invalid_issues[0].code,
+                "runtime-quest-item-image-target-invalid",
+            )
+
+            base = cache(r"DATA\ItemsUseless\2Usl_FishCont.gi")
+            dependency = cache(
+                r"Mods\OtherMods\SharedIcons\DATA\ItemsUseless\Cargo.gi"
+            )
+            for document in (base, dependency):
+                self.assertEqual(
+                    lint_quest_item_images(
+                        root,
+                        common[0],
+                        ((Path("CacheData.txt"), document),),
+                        common[1],
+                    ),
+                    [],
+                )
+
+            undeclared = cache(
+                r"Mods\OtherMods\AccidentalIcons\DATA\ItemsUseless\Cargo.gi"
+            )
+            undeclared_issues = lint_quest_item_images(
+                root,
+                common[0],
+                ((Path("CacheData.txt"), undeclared),),
+                common[1],
+            )
+            self.assertEqual(
+                undeclared_issues[0].code,
+                "runtime-quest-item-image-target-external-undeclared",
+            )
+
+            animated = cache(
+                r"Mods\OtherMods\QuestFixture\DATA\ItemsUseless\Cargo.gai"
+            )
+            animated_issues = lint_quest_item_images(
+                root,
+                common[0],
+                ((Path("CacheData.txt"), animated),),
+                common[1],
+            )
+            self.assertEqual(
+                animated_issues[0].code,
+                "runtime-quest-item-image-target-format-invalid",
             )
 
     def test_shared_player_and_npc_state_requires_curship_separation(self) -> None:

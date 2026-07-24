@@ -139,7 +139,12 @@ class ToolchainIntegrationTests(unittest.TestCase):
             project.save(rson)
             scr = root / "events.scr"
             lang = root / "events.txt"
-            self.chain.compile_rson(rson, scr, lang)
+            result = self.chain.compile_rson(rson, scr, lang)
+            self.assertEqual(result["schema"], "srhd-modkit-script-build-v1")
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(result["preflight_passed"])
+            self.assertTrue(result["compiler_output_created"])
+            self.assertTrue(result["published_outputs"])
             self.assertIn(
                 "[t_OnEnteringForm,t_OnPlayerBuyEq|]",
                 inspect_scr(scr)["event_signatures"],

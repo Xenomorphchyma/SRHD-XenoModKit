@@ -13,6 +13,7 @@ from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, load_rson
 from srhd_modkit.scripts import inspect_scr
 from srhd_modkit.blockpar import parse_blockpar
 from srhd_modkit.toolchain import (
+    ScriptBuildFailure,
     Toolchain,
     _decompiled_runtime_issue,
     _rscript_failure_diagnostic,
@@ -20,6 +21,7 @@ from srhd_modkit.toolchain import (
     inspect_rscript_lang_fragment,
 )
 from srhd_modkit.runtime_lint import RuntimeIssue
+from srhd_modkit.hidden_process import HiddenProcessTimeout
 
 
 PROJECT = {
@@ -274,6 +276,60 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertTrue(result["lang_import"]["fallback_used"])
             self.assertEqual(result["lang_import"]["status"], "failed-fallback")
             self.assertEqual(recover_calls, [lang.resolve(), None])
+
+    def test_silent_rscript_main_window_stall_has_complete_failure_report(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "source.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+            rscript = root / "RScript" / "RScript.exe"
+            rscript.parent.mkdir()
+            rscript.write_bytes(b"fixture")
+            chain = Toolchain(root)
+            timeout = HiddenProcessTimeout(
+                "Процесс не показал подтверждённого прогресса; "
+                "скрытое окно: RScript 4.10f; RScript; OK; Build; "
+                "Dat files params (optional); Script params",
+                timeout_kind="progress",
+                exit_code=124,
+                elapsed_seconds=60.0,
+                window_text=("RScript 4.10f", "Build", "Script params"),
+                window_diagnostics=("RScript / #32770",),
+                dialog_controls=("OK", "Build"),
+                control_diagnostics=(),
+                progress_updates=1,
+                last_progress_seconds=1.3,
+            )
+            with patch(
+                "srhd_modkit.toolchain.run_on_hidden_desktop",
+                side_effect=timeout,
+            ), self.assertRaises(ScriptBuildFailure) as caught:
+                chain._compile_rson_with_rscript(
+                    source,
+                    root / "out.scr",
+                    root / "lang.txt",
+                    timeout=1,
+                )
+
+            report = caught.exception.as_dict()
+            self.assertEqual(report["schema"], "srhd-modkit-script-build-v1")
+            self.assertEqual(report["status"], "failed")
+            self.assertTrue(report["preflight_passed"])
+            self.assertTrue(report["compiler_started"])
+            self.assertFalse(report["compiler_output_created"])
+            self.assertFalse(report["published_outputs"])
+            self.assertEqual(
+                report["failure"]["code"],
+                "rscript-build-silent-main-window-stall",
+            )
+            self.assertEqual(report["compiler"]["version"], "4.10f")
+            self.assertIn("timeout", report["compiler"])
+            self.assertEqual(report["compiler"]["exit_code"], 124)
+            self.assertEqual(report["compiler"]["last_progress_seconds"], 1.3)
+            self.assertEqual(
+                report["failure"]["process"]["window_diagnostics"],
+                ["RScript / #32770"],
+            )
 
     def test_rscript_lang_fragment_is_classified_without_treating_it_as_dat(self) -> None:
         with tempfile.TemporaryDirectory() as name:

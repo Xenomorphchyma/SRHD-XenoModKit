@@ -17,6 +17,7 @@ from .validation import validate_collection, validate_mod
 from .toolchain import (
     ConversionItem,
     RScriptLangFragment,
+    ScriptBuildFailure,
     Toolchain,
     inspect_rscript_lang_fragment,
     is_empty_rscript_lang_dat,
@@ -95,7 +96,11 @@ from .image_codec import (
     write_gi,
     write_png,
 )
-from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
+from .hidden_process import (
+    HiddenProcessTimeout,
+    inspect_hidden_processes,
+    terminate_hidden_processes,
+)
 from .quest_formula import FormulaNode, QuestFormulaError, parse_quest_formula, validate_quest_formula
 from .quests import (
     QuestDocument,
@@ -134,6 +139,7 @@ __all__ = [
     "Toolchain",
     "ConversionItem",
     "RScriptLangFragment",
+    "ScriptBuildFailure",
     "inspect_rscript_lang_fragment",
     "is_empty_rscript_lang_dat",
     "BlockParDocument",
@@ -212,6 +218,7 @@ __all__ = [
     "encode_png",
     "read_png",
     "write_png",
+    "HiddenProcessTimeout",
     "inspect_hidden_processes",
     "terminate_hidden_processes",
     "FormulaNode",

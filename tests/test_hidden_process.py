@@ -12,7 +12,11 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from srhd_modkit.cli import main
-from srhd_modkit.hidden_process import inspect_hidden_processes, run_on_hidden_desktop
+from srhd_modkit.hidden_process import (
+    HiddenProcessTimeout,
+    inspect_hidden_processes,
+    run_on_hidden_desktop,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,13 +38,18 @@ class HiddenProcessTests(unittest.TestCase):
             timeout=5,
         )
         self.assertEqual(completed.exit_code, 0)
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(HiddenProcessTimeout) as caught:
             run_on_hidden_desktop(
                 sys.executable,
                 ["-B", "-c", "import time;time.sleep(30)"],
                 cwd=ROOT,
                 timeout=0.2,
             )
+        diagnostic = caught.exception.as_dict()
+        self.assertEqual(diagnostic["timeout_kind"], "hard")
+        self.assertEqual(diagnostic["exit_code"], 124)
+        self.assertGreaterEqual(diagnostic["elapsed_seconds"], 0.2)
+        self.assertIn("window_text", diagnostic)
         self.assert_clean()
 
     def test_progress_window_slides_but_hard_deadline_remains(self) -> None:

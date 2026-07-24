@@ -40,8 +40,9 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 - `runtime-saved-script-cache-update-shadow` выдаётся только добровольной командой `script compare-scr OLD NEW`, когда бинарники различаются, а `ScriptName` остался прежним. Обычные `lint-runtime`, `audit` и `release` этим предположением не засоряются; сравнение предупреждает, что активный код может храниться в SAV и одноимённая замена SCR не доказывает обновление уже запущенного экземпляра.
 - `runtime-shared-state-mutates-player` строит граф `TGroup → TState → runtime` и предупреждает, если одно состояние обслуживает `AddPlayer=true` и NPC, но изменяет неразделённый `CurShip` без доказанного отделения `Player()`.
 - `runtime-state-unconditional-shipbad-write` предупреждает о `ShipSetBad(CurShip, ...)` в повторно вызываемом TState без проверки, что значение `ShipGetBad` действительно меняется. Явная проверка текущей цели принимается.
-- Собственная статическая иконка `CreateQuestItem('Type')` считается зарегистрированной только точным непустым ключом `Bm/ItemsUseless/2Type_s`. `runtime-quest-item-image-registration-key-invalid` находит похожие, но нерабочие `2Type`, `_c` и неверный цифровой префикс; один GI в `DATA/ItemsUseless` больше не маскирует ошибку. Полное отсутствие ключа остаётся `runtime-quest-item-image-missing`, оба предупреждения сообщают о runtime-подстановке `Usl_FishCont`.
-- Полный набор 0.9.5 состоит из 238 тестов и 24 подтестов.
+- Собственная статическая иконка `CreateQuestItem('Type')` считается зарегистрированной только точным непустым ключом `Bm/ItemsUseless/2Type_s`. `runtime-quest-item-image-registration-key-invalid` находит похожие, но нерабочие `2Type`, `_c` и неверный цифровой префикс; один GI в `DATA/ItemsUseless` больше не маскирует ошибку. Цель `_s` должна быть GI: собственный путь `Mods\...\<Name>\...` проверяется на наличие и декодируется, `DATA\...` остаётся допустимой ссылкой на базовый PKG, а чужой мод должен быть объявлен через `Dependence`. Эти проблемы остаются warning с fallback `Usl_FishCont`, поэтому базовые и зависимые ресурсы не запрещаются.
+- `script build --json` использует схему `srhd-modkit-script-build-v1` и выдаёт полноценный отчёт также при неуспехе. `preflight_passed`, `compiler_started`, `compiler_output_created` и `published_outputs` не смешивают успешный lint с созданием SCR. Возврат RScript к главному окну Build без SCR и прогресса классифицируется как `rscript-build-silent-main-window-stall`.
+- Полный набор 0.9.5 состоит из 240 тестов и 24 подтестов.
 
 ## Новое в 0.9.4
 
@@ -623,7 +624,7 @@ ModKit через GitHub.
 python -B -m unittest discover -s tests -v
 ```
 
-В наборе из 220 тестов используются нативные PNG/GI/QM/QMM-кодеки и локальные BlockParEditor/RScript:
+В наборе из 240 тестов используются нативные PNG/GI/QM/QMM-кодеки и локальные BlockParEditor/RScript:
 проверяют пиксель-в-пиксель круговой проход RGBA8, все три режима GI, CRC,
 палитры и Adam7, ASCII/Unicode DAT,
 события TState в собранном SCR, runtime-блокировки, граф RSON, аудит/релиз,

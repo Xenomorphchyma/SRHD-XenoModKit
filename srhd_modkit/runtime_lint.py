@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
 
 from .blockpar import BlockParDocument, BlockParNode
+from .module_info import find_module_info, parse_module_info
 from .models import ModuleInfo
+from .resources import verify_resource
 from .rscript_api import RSCRIPT_RUNTIME_CALLS
 from .scripts import RsonProject
 
@@ -5367,6 +5369,149 @@ def _nearby_useless_item_registration_keys(
     )
 
 
+def _quest_item_image_target_issue(
+    root: Path,
+    *,
+    module_name: str,
+    dependencies: set[str],
+    expected_key: str,
+    value: str,
+    source: str,
+) -> tuple[bool, RuntimeIssue | None]:
+    r"""Resolve one static quest-item icon without assuming an installed game.
+
+    ``DATA\...`` is a base-game namespace whose files normally live inside
+    PKG containers, so a standalone mod audit cannot use ``Path.exists`` for
+    it.  A declared dependency is likewise allowed to be absent from a release
+    workspace.  Only a path that explicitly names the current module can be
+    resolved completely and verified without external state.
+    """
+
+    target = value.strip()
+    windows = PureWindowsPath(target)
+    parts = tuple(windows.parts)
+    folded_parts = tuple(part.casefold() for part in parts)
+    evidence = f"Bm/ItemsUseless/{expected_key}={target}"
+    if (
+        not target
+        or windows.is_absolute()
+        or windows.drive
+        or windows.root
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return False, RuntimeIssue(
+            "warning",
+            "runtime-quest-item-image-target-unsafe",
+            f"Регистрация {expected_key} содержит небезопасный путь {target!r}. "
+            "Разрешены только относительные игровые пути DATA\\... или Mods\\...",
+            source,
+            f"Bm/ItemsUseless/{expected_key}",
+            evidence,
+        )
+    if windows.suffix.casefold() != ".gi":
+        return False, RuntimeIssue(
+            "warning",
+            "runtime-quest-item-image-target-format-invalid",
+            f"Статический ключ {expected_key} должен вести на GI, но указан "
+            f"{windows.suffix or 'файл без расширения'}. Анимированный GAI "
+            "регистрируется отдельным ключом _c; игра иначе подставит Usl_FishCont",
+            source,
+            f"Bm/ItemsUseless/{expected_key}",
+            evidence,
+        )
+    if not folded_parts:
+        return False, None
+    if folded_parts[0] == "data":
+        # Base resources are packed into DATA/*.pkg in a normal installation.
+        # Their absence as loose files is not evidence of a broken reference.
+        return True, None
+    if folded_parts[0] != "mods":
+        return True, RuntimeIssue(
+            "info",
+            "runtime-quest-item-image-target-unresolved",
+            f"Источник {target!r} не относится к стандартным пространствам DATA "
+            "или Mods. Одиночный аудит не может доказать наличие ресурса; "
+            "проверьте его в активном наборе модов",
+            source,
+            f"Bm/ItemsUseless/{expected_key}",
+            evidence,
+        )
+
+    data_index = next(
+        (
+            index
+            for index, part in enumerate(folded_parts[1:], start=1)
+            if part == "data"
+        ),
+        None,
+    )
+    if data_index is None or data_index <= 1:
+        return True, RuntimeIssue(
+            "info",
+            "runtime-quest-item-image-target-unresolved",
+            f"Путь мода {target!r} не содержит стандартную границу "
+            "Mods\\...\\<мод>\\DATA. Одиночный аудит не может надёжно "
+            "определить владельца ресурса",
+            source,
+            f"Bm/ItemsUseless/{expected_key}",
+            evidence,
+        )
+    target_module_index = data_index - 1
+    target_module = folded_parts[target_module_index]
+    if target_module == module_name.casefold():
+        tail = parts[target_module_index + 1 :]
+        if not tail:
+            return False, RuntimeIssue(
+                "warning",
+                "runtime-quest-item-image-target-missing",
+                f"Регистрация {expected_key} указывает на каталог текущего мода, "
+                "а не на GI-файл. Игра подставит Usl_FishCont",
+                source,
+                f"Bm/ItemsUseless/{expected_key}",
+                evidence,
+            )
+        local = root.joinpath(*tail)
+        if not local.is_file():
+            return False, RuntimeIssue(
+                "warning",
+                "runtime-quest-item-image-target-missing",
+                f"Регистрация {expected_key} указывает на собственный файл "
+                f"{target!r}, но в моде отсутствует {local}. Игра подставит "
+                "Usl_FishCont",
+                source,
+                f"Bm/ItemsUseless/{expected_key}",
+                evidence,
+            )
+        try:
+            verify_resource(local)
+        except Exception as exc:
+            return False, RuntimeIssue(
+                "warning",
+                "runtime-quest-item-image-target-invalid",
+                f"Собственный ресурс {target!r} найден, но не проходит проверку GI: "
+                f"{exc}. Игра может подставить Usl_FishCont",
+                str(local),
+                f"Bm/ItemsUseless/{expected_key}",
+                evidence,
+            )
+        return True, None
+
+    if target_module in dependencies:
+        # A release workspace is allowed not to contain declared dependencies.
+        # Their activation and actual files belong to audit_collection/compat.
+        return True, None
+    return True, RuntimeIssue(
+        "warning",
+        "runtime-quest-item-image-target-external-undeclared",
+        f"Регистрация {expected_key} использует ресурс другого мода {target!r}, "
+        "но соответствующее имя отсутствует в Dependence. Ссылка может работать "
+        "только при случайно активном стороннем моде",
+        source,
+        f"Bm/ItemsUseless/{expected_key}",
+        evidence,
+    )
+
+
 def lint_quest_item_images(
     root: str | Path,
     projects: Sequence[RsonProject],
@@ -5398,6 +5543,18 @@ def lint_quest_item_images(
     )
     registrations = _useless_item_image_registrations(effective_cache)
     image_names = _local_useless_item_image_names(resolved_root)
+    module_name = resolved_root.name
+    dependencies: set[str] = set()
+    info_path = find_module_info(resolved_root)
+    if info_path is not None:
+        try:
+            module = parse_module_info(info_path)
+            module_name = module.name or module_name
+            dependencies = {value.casefold() for value in module.dependencies}
+        except Exception:
+            # ModuleInfo has its own validator.  Resource checking remains
+            # useful with the directory name as a conservative fallback.
+            pass
     uses: dict[str, list[tuple[str, str, str]]] = {}
     labels: dict[str, str] = {}
     for project in projects:
@@ -5425,7 +5582,27 @@ def lint_quest_item_images(
         item_name = labels[folded]
         expected_key = f"2{item_name}_s"
         exact = registrations.get(expected_key.casefold(), ())
-        if any(value.strip() for _key, value, _source in exact):
+        target_issues: list[RuntimeIssue] = []
+        accepted_target = False
+        for _key, value, registration_source in exact:
+            if not value.strip():
+                continue
+            accepted, target_issue = _quest_item_image_target_issue(
+                resolved_root,
+                module_name=module_name,
+                dependencies=dependencies,
+                expected_key=expected_key,
+                value=value,
+                source=registration_source,
+            )
+            accepted_target |= accepted
+            if target_issue is not None:
+                target_issues.append(target_issue)
+        if accepted_target:
+            issues.extend(target_issues)
+            continue
+        if target_issues:
+            issues.append(target_issues[0])
             continue
         source, location, evidence = occurrences[0]
         nearby = [

@@ -12,7 +12,7 @@ from .files import build_manifest, compare_trees, find_collisions, find_duplicat
 from .formats import format_catalog, inspect_file, scan_formats
 from .modcfg import parse_modcfg, validate_modcfg
 from .module_info import find_module_info, parse_module_info
-from .toolchain import Toolchain, is_empty_rscript_lang_dat
+from .toolchain import ScriptBuildFailure, Toolchain, is_empty_rscript_lang_dat
 from .blockpar import BlockParDocument, BlockParNode, load_blockpar
 from .scripts import inspect_scr, load_rson
 from .resources import build_gai, build_pkg, extract_resource, inspect_resource, verify_resource
@@ -1583,14 +1583,39 @@ def cmd_script_build(args: argparse.Namespace) -> int:
     source = Path(args.source).resolve()
     mod_root = _find_mod_root(source)
     preflight: dict[str, Any] | None = None
+    artifact_preflight: dict[str, Any] | None = None
+    text_preflight: dict[str, Any] | None = None
+
+    def stop_before_compiler(code: str, message: str) -> None:
+        report: dict[str, Any] = {
+            "schema": "srhd-modkit-script-build-v1",
+            "status": "failed",
+            "source": str(source),
+            "source_sha256": sha256_file(source) if source.is_file() else None,
+            "preflight_passed": False,
+            "compiler_started": False,
+            "compiler_output_created": False,
+            "language_output_created": False,
+            "published_outputs": False,
+            "failure": {"code": code, "message": message},
+        }
+        if preflight is not None:
+            report["runtime_preflight"] = preflight
+        if artifact_preflight is not None:
+            report["artifact_preflight"] = artifact_preflight
+        if text_preflight is not None:
+            report["text_preflight"] = text_preflight
+        raise ScriptBuildFailure(message, report)
+
     if mod_root is not None:
         preflight = _runtime_lint_target(mod_root, tools_root=args.tools_root)
         runtime_errors = [issue for issue in preflight["issues"] if issue["severity"] == "error"]
         if runtime_errors:
             first = runtime_errors[0]
-            raise ValueError(
+            stop_before_compiler(
+                "script-build-runtime-preflight-failed",
                 "Сборка остановлена runtime-lint всего мода "
-                f"({first['code']}): {first['message']}"
+                f"({first['code']}): {first['message']}",
             )
         artifact_preflight = _script_artifact_lint_target(
             mod_root,
@@ -1600,28 +1625,64 @@ def cmd_script_build(args: argparse.Namespace) -> int:
         artifact_errors = [issue for issue in artifact_preflight["issues"] if issue["severity"] == "error"]
         if artifact_errors:
             first = artifact_errors[0]
-            raise ValueError(
+            stop_before_compiler(
+                "script-build-artifact-preflight-failed",
                 "Сборка остановлена проверкой Main/CacheData/SCR "
-                f"({first['code']}): {first['message']}"
+                f"({first['code']}): {first['message']}",
             )
         text_preflight = _game_text_lint_target(mod_root, tools_root=args.tools_root)
         text_errors = [issue for issue in text_preflight["issues"] if issue["severity"] == "error"]
         if text_errors:
             first = text_errors[0]
-            raise ValueError(
+            stop_before_compiler(
+                "script-build-text-preflight-failed",
                 "Сборка остановлена проверкой кодировки игрового текста "
-                f"({first['code']}): {first['message']}"
+                f"({first['code']}): {first['message']}",
             )
-    result = Toolchain(args.tools_root).compile_rson(
-        source,
-        args.scr,
-        args.lang,
-        lang_dat_output=getattr(args, "lang_dat", None),
-        lang_base=getattr(args, "lang_base", None),
-        overwrite=args.overwrite,
-        timeout=getattr(args, "timeout", None),
-        check_custom_factions=preflight is None,
-    )
+    try:
+        result = Toolchain(args.tools_root).compile_rson(
+            source,
+            args.scr,
+            args.lang,
+            lang_dat_output=getattr(args, "lang_dat", None),
+            lang_base=getattr(args, "lang_base", None),
+            overwrite=args.overwrite,
+            timeout=getattr(args, "timeout", None),
+            check_custom_factions=preflight is None,
+        )
+    except ScriptBuildFailure as exc:
+        report = dict(exc.as_dict())
+        report["preflight_passed"] = True
+        if preflight is not None:
+            report["runtime_preflight"] = preflight
+        if artifact_preflight is not None:
+            report["artifact_preflight"] = artifact_preflight
+        if text_preflight is not None:
+            report["text_preflight"] = text_preflight
+        raise ScriptBuildFailure(str(exc), report) from exc
+    except Exception as exc:
+        report = {
+            "schema": "srhd-modkit-script-build-v1",
+            "status": "failed",
+            "source": str(source),
+            "source_sha256": sha256_file(source) if source.is_file() else None,
+            "preflight_passed": True if preflight is not None else None,
+            "compiler_started": None,
+            "compiler_output_created": None,
+            "language_output_created": None,
+            "published_outputs": False,
+            "failure": {
+                "code": "script-build-operation-failed",
+                "message": str(exc),
+            },
+        }
+        if preflight is not None:
+            report["runtime_preflight"] = preflight
+        if artifact_preflight is not None:
+            report["artifact_preflight"] = artifact_preflight
+        if text_preflight is not None:
+            report["text_preflight"] = text_preflight
+        raise ScriptBuildFailure(str(exc), report) from exc
     if preflight is not None:
         result["runtime_preflight"] = preflight
         result["artifact_preflight"] = artifact_preflight
@@ -2390,6 +2451,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Операция прервана.", file=sys.stderr)
         return 130
     except Exception as exc:
+        if getattr(args, "json", False) and callable(getattr(exc, "as_dict", None)):
+            print_json(exc.as_dict())
+            return 1
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
 
