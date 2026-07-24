@@ -13,7 +13,12 @@ from .blockpar import BlockParDocument, load_blockpar
 from .discovery import discover_mods, load_mod
 from .files import iter_files
 from .formats import get_format_spec, inspect_file
-from .game_text import lint_game_text
+from .game_text import (
+    lint_blockpar_display_text,
+    lint_game_text,
+    lint_key_value_display_text,
+    lint_rson_display_text,
+)
 from .module_info import find_module_info, parse_module_info
 from .resources import UnsupportedResourceFormat, verify_resource
 from .quests import inspect_quest, load_quest, quest_media, verify_quest
@@ -531,10 +536,15 @@ def _text_check(context: AuditContext) -> AuditCheck:
     info_path = find_module_info(context.root)
     if info_path:
         try:
+            decoded = read_text(info_path)
             values = lint_game_text(
-                read_text(info_path),
+                decoded,
                 info_path,
                 allowed_encodings={"cp1251", "utf-16-le", "utf-16-be"},
+                check_display_compatibility=False,
+            )
+            values.extend(
+                lint_key_value_display_text(decoded.text, info_path)
             )
             issues.extend(AuditIssue.from_value(item, validator=name, mod=context.mod_name) for item in values)
             checked.append(str(info_path.resolve()))
@@ -546,9 +556,18 @@ def _text_check(context: AuditContext) -> AuditCheck:
         folded_parts = [part.casefold() for part in relative.parts]
         if path.suffix.casefold() == ".rson":
             try:
+                decoded = read_text(path)
                 issues.extend(
                     AuditIssue.from_value(item, validator=name, mod=context.mod_name)
-                    for item in lint_game_text(read_text(path), path)
+                    for item in lint_game_text(
+                        decoded,
+                        path,
+                        check_display_compatibility=False,
+                    )
+                )
+                issues.extend(
+                    AuditIssue.from_value(item, validator=name, mod=context.mod_name)
+                    for item in lint_rson_display_text(load_rson(path).data, path)
                 )
                 checked.append(str(path))
             except Exception as exc:
@@ -563,6 +582,10 @@ def _text_check(context: AuditContext) -> AuditCheck:
                     path,
                     require_cp1251=final_cfg and russian,
                     require_cp1251_representable=not (final_cfg and russian),
+                    check_display_compatibility=False,
+                )
+                values.extend(
+                    lint_key_value_display_text(decoded.text, path)
                 )
                 issues.extend(AuditIssue.from_value(item, validator=name, mod=context.mod_name) for item in values)
                 checked.append(str(path))
@@ -576,7 +599,16 @@ def _text_check(context: AuditContext) -> AuditCheck:
         decoded = DecodedText(document.to_text(include_raw=False), document.encoding, document.had_bom)
         issues.extend(
             AuditIssue.from_value(item, validator=name, mod=context.mod_name)
-            for item in lint_game_text(decoded, path, require_cp1251=True)
+            for item in lint_game_text(
+                decoded,
+                path,
+                require_cp1251=True,
+                check_display_compatibility=False,
+            )
+        )
+        issues.extend(
+            AuditIssue.from_value(item, validator=name, mod=context.mod_name)
+            for item in lint_blockpar_display_text(document, path)
         )
         checked.append(str(path))
     return AuditCheck(name, _status(issues), tuple(issues), tuple(dict.fromkeys(checked)))

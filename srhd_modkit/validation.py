@@ -13,6 +13,7 @@ def validate_mod(mod: ModRecord) -> list[Issue]:
         read_text(mod.module.path),
         mod.module.path,
         allowed_encodings={"cp1251", "utf-16-le", "utf-16-be"},
+        check_display_compatibility=False,
     ):
         details = f" {text_issue.evidence}" if text_issue.evidence else ""
         issues.append(

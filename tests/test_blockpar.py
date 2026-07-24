@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -152,6 +153,33 @@ class BlockParCliIntegrationTests(unittest.TestCase):
             source.write_text("Data ^{\n    Text=Цена 10 → 20\n}\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Windows-1251"):
                 self.chain.convert_dat(source, root / "Lang.dat")
+
+    def test_dat_validate_warns_about_limited_display_notation(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            source = Path(name) / "Lang.txt"
+            source.write_text(
+                "Data ^{\n"
+                "    Range=80–100%\n"
+                "    Progress=этап 3/48\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            output = StringIO()
+            args = SimpleNamespace(source=str(source), tools_root=None, json=True)
+            with redirect_stdout(output):
+                self.assertEqual(cmd_dat_validate(args), 0)
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["valid"])
+            self.assertEqual(
+                {
+                    issue["code"]
+                    for issue in payload["issues"]
+                },
+                {
+                    "game-text-typographic-number-range",
+                    "game-text-numeric-slash-notation",
+                },
+            )
 
     def test_empty_rscript_lang_dat_is_validated_headlessly(self) -> None:
         with tempfile.TemporaryDirectory() as name:

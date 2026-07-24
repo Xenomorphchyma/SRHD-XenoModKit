@@ -54,7 +54,14 @@ from .runtime_lint import (
     lint_rson_runtime,
 )
 from .script_artifacts import ScriptArtifactIssue, lint_script_cache
-from .game_text import GameTextIssue, lint_game_text
+from .game_text import (
+    GameTextIssue,
+    lint_blockpar_display_text,
+    lint_game_display_text,
+    lint_game_text,
+    lint_key_value_display_text,
+    lint_rson_display_text,
+)
 from .audit import (
     AuditCheck,
     AuditIssue,
@@ -167,7 +174,11 @@ __all__ = [
     "ScriptArtifactIssue",
     "lint_script_cache",
     "GameTextIssue",
+    "lint_blockpar_display_text",
+    "lint_game_display_text",
     "lint_game_text",
+    "lint_key_value_display_text",
+    "lint_rson_display_text",
     "AuditCheck",
     "AuditIssue",
     "AuditProfile",

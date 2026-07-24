@@ -22,7 +22,13 @@ from .quests import (
     inspect_quest,
     verify_quest,
 )
-from .game_text import GameTextIssue, lint_game_text
+from .game_text import (
+    GameTextIssue,
+    lint_blockpar_display_text,
+    lint_game_text,
+    lint_key_value_display_text,
+    lint_rson_display_text,
+)
 from .script_artifacts import ScriptArtifactIssue, lint_script_cache
 from .textio import DecodedText, read_text
 from .runtime_lint import (
@@ -819,6 +825,7 @@ def cmd_dat_validate(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="srhd-dat-validate-") as name:
         document, exported = _load_dat_source(args.source, chain, Path(name))
         nodes = list(_walk_blockpar(document.roots))
+        text_issues = lint_blockpar_display_text(document, source)
         result = {
             "source": str(Path(args.source).resolve()),
             "encoding": document.encoding,
@@ -826,6 +833,7 @@ def cmd_dat_validate(args: argparse.Namespace) -> int:
             "nodes": len(nodes),
             "parameters": sum(len(node.parameters) for _, node in nodes),
             "valid": True,
+            "issues": [issue.as_dict() for issue in text_issues],
             "temporary_export": str(exported) if Path(args.source).suffix.casefold() == ".txt" else None,
         }
         if args.json:
@@ -833,13 +841,18 @@ def cmd_dat_validate(args: argparse.Namespace) -> int:
         else:
             print(f"BlockPar корректен: корней {result['roots']}, блоков {result['nodes']}, параметров {result['parameters']}")
             print(f"Кодировка текстового представления: {result['encoding']}")
+            for issue in text_issues:
+                suffix = f" [{issue.location}]" if issue.location else ""
+                print(f"{issue.severity.upper():7} {issue.code}: {issue.message}{suffix}")
     return 0
 
 
 def cmd_script_info(args: argparse.Namespace) -> int:
     project = load_rson(args.source)
+    issues = project.validate()
+    issues.extend(lint_rson_display_text(project.data, args.source))
     value = project.summary()
-    value["issues"] = [issue.as_dict() for issue in project.validate()]
+    value["issues"] = [issue.as_dict() for issue in issues]
     if args.json:
         print_json(value)
     else:
@@ -852,9 +865,9 @@ def cmd_script_info(args: argparse.Namespace) -> int:
                 f"События TState #{subscription['object_id']} {subscription['name']}: "
                 + ", ".join(subscription["events"])
             )
-        for issue in project.validate():
+        for issue in issues:
             print(f"{issue.severity.upper():7} {issue.code}: {issue.message}")
-    return 2 if any(issue.severity == "error" for issue in project.validate()) else 0
+    return 2 if any(issue.severity == "error" for issue in issues) else 0
 
 
 def cmd_script_validate(args: argparse.Namespace) -> int:
@@ -862,6 +875,7 @@ def cmd_script_validate(args: argparse.Namespace) -> int:
     issues = project.validate()
     if not any(issue.severity == "error" for issue in issues):
         issues.extend(lint_custom_faction_resources((project,)))
+    issues.extend(lint_rson_display_text(project.data, args.source))
     if args.json:
         print_json(
             {
@@ -1467,12 +1481,17 @@ def _game_text_lint_target(
     module_info = root / "ModuleInfo.txt"
     if module_info.is_file():
         try:
+            decoded = read_text(module_info)
             issues.extend(
                 lint_game_text(
-                    read_text(module_info),
+                    decoded,
                     module_info,
                     allowed_encodings={"cp1251", "utf-16-le", "utf-16-be"},
+                    check_display_compatibility=False,
                 )
+            )
+            issues.extend(
+                lint_key_value_display_text(decoded.text, module_info)
             )
             checked.append(str(module_info.resolve()))
         except Exception as exc:
@@ -1490,7 +1509,11 @@ def _game_text_lint_target(
                         decoded,
                         path,
                         require_cp1251_representable=russian_target,
+                        check_display_compatibility=False,
                     )
+                )
+                issues.extend(
+                    lint_key_value_display_text(decoded.text, path)
                 )
                 checked.append(str(path.resolve()))
             except Exception as exc:
@@ -1498,7 +1521,14 @@ def _game_text_lint_target(
 
     for path in sorted(root.rglob("*.rson")):
         try:
-            issues.extend(lint_game_text(read_text(path), path))
+            issues.extend(
+                lint_game_text(
+                    read_text(path),
+                    path,
+                    check_display_compatibility=False,
+                )
+            )
+            issues.extend(lint_rson_display_text(load_rson(path).data, path))
             checked.append(str(path.resolve()))
         except Exception as exc:
             issues.append(GameTextIssue("error", "game-text-load", str(exc), str(path.resolve())))
@@ -1522,7 +1552,22 @@ def _game_text_lint_target(
                         )
                     else:
                         decoded = read_text(path)
-                    issues.extend(lint_game_text(decoded, path, require_cp1251=True))
+                    issues.extend(
+                        lint_game_text(
+                            decoded,
+                            path,
+                            require_cp1251=True,
+                            check_display_compatibility=False,
+                        )
+                    )
+                    if path.suffix.casefold() == ".dat":
+                        issues.extend(
+                            lint_blockpar_display_text(document, path)
+                        )
+                    else:
+                        issues.extend(
+                            lint_key_value_display_text(decoded.text, path)
+                        )
                     checked.append(str(path.resolve()))
                 except Exception as exc:
                     issues.append(GameTextIssue("error", "game-text-load", str(exc), str(path.resolve())))

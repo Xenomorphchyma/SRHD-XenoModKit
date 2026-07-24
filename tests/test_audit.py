@@ -79,6 +79,41 @@ def _quest() -> QuestDocument:
 
 
 class AuditTests(unittest.TestCase):
+    def test_release_warns_about_limited_game_text_notation(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            source = root / "SOURCE" / "CFG"
+            source.mkdir(parents=True)
+            (source / "Lang_Rus.txt").write_text(
+                "Status=80–100%: 4–6 транспортов; этап 3/48\n",
+                encoding="utf-8",
+            )
+
+            report = audit_mod(root, profile="release")
+            text_codes = [
+                item.code
+                for item in report.issues
+                if item.validator == "game-text"
+            ]
+            self.assertIn("game-text-typographic-number-range", text_codes)
+            self.assertIn("game-text-numeric-slash-notation", text_codes)
+            self.assertEqual(
+                text_codes.count("game-text-typographic-number-range"),
+                2,
+            )
+            self.assertEqual(
+                text_codes.count("game-text-numeric-slash-notation"),
+                1,
+            )
+            self.assertFalse(
+                any(
+                    item.severity == "error"
+                    and item.code.startswith("game-text-")
+                    for item in report.issues
+                )
+            )
+
     def test_release_warns_when_mod_owned_quest_item_has_no_image(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"
