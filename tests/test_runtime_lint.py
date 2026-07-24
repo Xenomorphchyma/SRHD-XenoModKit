@@ -206,6 +206,123 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertIn("runtime-turn-direct-world-access", codes)
 
+    def test_modal_dialog_reachable_from_nextday_is_rejected(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Dialogs"] = [
+            {
+                "Type": "TDialog",
+                "Name": "WarningDialog",
+                "Parent": -1,
+                "#": 10,
+            }
+        ]
+        group["Operations"][1]["Code"] = [
+            "function ShowWarning()",
+            "{",
+            "    Dialog(WarningDialog, Player());",
+            "}",
+            "ShowWarning();",
+        ]
+        matching = [
+            issue
+            for issue in lint_rson_runtime(
+                RsonProject(data, Path("nextday-dialog.rson"))
+            )
+            if issue.code == "runtime-modal-dialog-from-nextday"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "error")
+        self.assertIn("ShowWarning", matching[0].message)
+
+        data["Visual.Links"] = [
+            {
+                "Type": "TGraphLink",
+                "Begin": 10,
+                "End": 2,
+                "Nom": 0,
+                "Arrow": True,
+            }
+        ]
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(
+                RsonProject(data, Path("user-dialog.rson"))
+            )
+        }
+        self.assertNotIn("runtime-modal-dialog-from-nextday", safe_codes)
+
+    def test_truce_reachable_from_tstate_is_rejected_but_dialog_action_is_allowed(
+        self,
+    ) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "StateReconcile",
+                "Parent": -1,
+                "#": 10,
+                "Code.Type": "Turn",
+                "Code": [
+                    "function ReconcileShips()",
+                    "{",
+                    "    TruceBetweenShips(Player(), CurShip);",
+                    "}",
+                    "if(GetData(3) == 1) exit;",
+                    "SetData(1, 3);",
+                    "ReconcileShips();",
+                    "SetData(0, 3);",
+                ],
+            }
+        )
+        data["Visual.Links"] = [
+            {
+                "Type": "TGraphLink",
+                "Begin": 3,
+                "End": 10,
+                "Nom": 0,
+                "Arrow": True,
+            }
+        ]
+        matching = [
+            issue
+            for issue in lint_rson_runtime(
+                RsonProject(data, Path("state-truce.rson"))
+            )
+            if issue.code == "runtime-truce-state-reentry-cycle"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "error")
+        self.assertIn("ReconcileShips", matching[0].message)
+
+        group["Dialogs"] = [
+            {
+                "Type": "TDialogAnswer",
+                "Name": "Sorry",
+                "Parent": -1,
+                "#": 11,
+                "AMsg.Num": "0",
+                "Msg": "Sorry",
+            }
+        ]
+        data["Visual.Links"] = [
+            {
+                "Type": "TGraphLink",
+                "Begin": 11,
+                "End": 10,
+                "Nom": 0,
+                "Arrow": True,
+            }
+        ]
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(
+                RsonProject(data, Path("dialog-truce.rson"))
+            )
+        }
+        self.assertNotIn("runtime-truce-state-reentry-cycle", safe_codes)
+
     def test_state_handler_cannot_call_function_from_top_code(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][0]["Code.Type"] = "Init"

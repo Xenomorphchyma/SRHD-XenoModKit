@@ -7309,6 +7309,129 @@ def _lint_state_unconditional_shipbad_write(project: RsonProject) -> list[Runtim
     return issues
 
 
+def _lint_synchronous_runtime_reentry(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Find engine calls that can synchronously re-enter background runtime.
+
+    ``Dialog`` is modal.  When reached from a non-dialog Turn graph it opens
+    while the engine is still processing the day/state callback.  Likewise,
+    ``TruceBetweenShips`` immediately executes the state logic of both ships;
+    reaching it from a TState can therefore re-enter the same state graph.
+    """
+
+    path = str(project.path) if project.path else None
+    blocks = _runtime_analysis_blocks(project, functions)
+    graph = _call_graph(blocks)
+    dialog_scoped = _dialog_scoped_turn_objects(project)
+    background_roots = {
+        name
+        for name, block in blocks.items()
+        if name.startswith("__handler_")
+        and block.code_type == "turn"
+        and block.object_id not in dialog_scoped
+    }
+    issues: list[RuntimeIssue] = []
+
+    for name in sorted(_reachable(background_roots, graph)):
+        block = blocks[name]
+        for offset, line in enumerate(block.lines[1:], start=1):
+            for _position, call, _arguments in _line_call_sites(
+                _mask_non_code(line)
+            ):
+                if call != "dialog":
+                    continue
+                call_path = _runtime_call_path(
+                    background_roots,
+                    graph,
+                    blocks,
+                    name,
+                )
+                issues.append(
+                    RuntimeIssue(
+                        "error",
+                        "runtime-modal-dialog-from-nextday",
+                        "Модальный Dialog достижим из фонового Turn-графа "
+                        f"({call_path}). Он открывается синхронно, пока движок ещё "
+                        "выполняет TGalaxy.NextDay/логику состояния, и способен "
+                        "повторно войти в AI или остановить расчёт дня. В Turn "
+                        "сохраните pending-флаг, а разговор показывайте только из "
+                        "последующего пользовательского контакта",
+                        path,
+                        f"{block.location} line {block.start_line + offset}",
+                        line.strip(),
+                    )
+                )
+
+    objects, outgoing = _runtime_object_graph(project)
+    state_ids = {
+        object_id
+        for object_id, item in objects.items()
+        if str(item.get("Type", "")).casefold() == "tstate"
+    }
+    truce_sites: dict[
+        tuple[str, int],
+        dict[str, Any],
+    ] = {}
+    for state_id in sorted(state_ids):
+        state_runtime_ids = _reachable_object_ids((state_id,), outgoing)
+        state_roots = {
+            name
+            for name, block in blocks.items()
+            if name.startswith("__handler_")
+            and block.object_id in state_runtime_ids
+        }
+        if not state_roots:
+            continue
+        state_name = str(objects[state_id].get("Name", f"#{state_id}"))
+        for name in sorted(_reachable(state_roots, graph)):
+            block = blocks[name]
+            for offset, line in enumerate(block.lines[1:], start=1):
+                for _position, call, _arguments in _line_call_sites(
+                    _mask_non_code(line)
+                ):
+                    if call != "trucebetweenships":
+                        continue
+                    key = (name, offset)
+                    site = truce_sites.setdefault(
+                        key,
+                        {
+                            "block": block,
+                            "line": line.strip(),
+                            "states": set(),
+                            "paths": set(),
+                        },
+                    )
+                    site["states"].add(state_name)
+                    site["paths"].add(
+                        _runtime_call_path(state_roots, graph, blocks, name)
+                    )
+
+    for (_name, offset), site in sorted(truce_sites.items()):
+        block = site["block"]
+        states = ", ".join(sorted(site["states"]))
+        call_paths = "; ".join(sorted(site["paths"]))
+        issues.append(
+            RuntimeIssue(
+                "error",
+                "runtime-truce-state-reentry-cycle",
+                f"TState {states} достигает TruceBetweenShips ({call_paths}). "
+                "Эта функция синхронно запускает state-код обоих кораблей и "
+                "способна повторно войти в текущий граф, из-за чего NextDay "
+                "может зависнуть без исключения. SetData-флаг уменьшает прямую "
+                "рекурсию, но не доказывает завершение вложенного AI. Для фоновой "
+                "нормализации меняйте RelationToRanger и только действительно "
+                "изменившийся ShipBad напрямую; Truce оставляйте одноразовому "
+                "пользовательскому действию вне TState",
+                path,
+                f"{block.location} line {block.start_line + offset}",
+                site["line"],
+            )
+        )
+    return issues
+
+
 def lint_rson_runtime(
     project: RsonProject,
     *,
@@ -7367,6 +7490,7 @@ def lint_rson_runtime(
     issues.extend(_lint_warrior_home_release(project, functions))
     issues.extend(_lint_shared_state_mutates_player(project))
     issues.extend(_lint_state_unconditional_shipbad_write(project))
+    issues.extend(_lint_synchronous_runtime_reentry(project, functions))
     graph = _call_graph(functions)
     risky = _risky_functions(functions, graph)
 
