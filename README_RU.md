@@ -40,8 +40,8 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 - `runtime-saved-script-cache-update-shadow` выдаётся только добровольной командой `script compare-scr OLD NEW`, когда бинарники различаются, а `ScriptName` остался прежним. Обычные `lint-runtime`, `audit` и `release` этим предположением не засоряются; сравнение предупреждает, что активный код может храниться в SAV и одноимённая замена SCR не доказывает обновление уже запущенного экземпляра.
 - `runtime-shared-state-mutates-player` строит граф `TGroup → TState → runtime` и предупреждает, если одно состояние обслуживает `AddPlayer=true` и NPC, но изменяет неразделённый `CurShip` без доказанного отделения `Player()`.
 - `runtime-state-unconditional-shipbad-write` предупреждает о `ShipSetBad(CurShip, ...)` в повторно вызываемом TState без проверки, что значение `ShipGetBad` действительно меняется. Явная проверка текущей цели принимается.
-- `runtime-quest-item-image-missing` сопоставляет собственный литерал `CreateQuestItem` с `UselessItems` в Lang, `Bm/ItemsUseless` в CacheData и `DATA/ItemsUseless`. Отсутствие картинки выдаётся один раз на тип с пояснением о штатной подстановке `Usl_FishCont`.
-- Полный набор 0.9.5 состоит из 236 тестов и 24 подтестов.
+- Собственная статическая иконка `CreateQuestItem('Type')` считается зарегистрированной только точным непустым ключом `Bm/ItemsUseless/2Type_s`. `runtime-quest-item-image-registration-key-invalid` находит похожие, но нерабочие `2Type`, `_c` и неверный цифровой префикс; один GI в `DATA/ItemsUseless` больше не маскирует ошибку. Полное отсутствие ключа остаётся `runtime-quest-item-image-missing`, оба предупреждения сообщают о runtime-подстановке `Usl_FishCont`.
+- Полный набор 0.9.5 состоит из 238 тестов и 24 подтестов.
 
 ## Новое в 0.9.4
 

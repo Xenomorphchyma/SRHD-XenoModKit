@@ -237,8 +237,10 @@ if(current_cargo) ItemExist(current_cargo);
 
 Строковый первый аргумент `CreateQuestItem('CargoType', owner)` является типом
 `UselessItems`. Если мод объявляет этот тип в собственном `Lang`, он должен
-поставить изображение в `DATA/ItemsUseless` либо зарегистрировать непустой ключ
-`Bm/ItemsUseless/<race><CargoType>_s` в `CacheData`.
+поставить изображение в `DATA/ItemsUseless` и зарегистрировать его точным
+непустым ключом `Bm/ItemsUseless/2CargoType_s` в `CacheData`. Префикс здесь
+равен `2`, а суффикс `_s` обязателен для статической иконки; аргумент `owner`
+не подставляется вместо `2`. Сам файл `2CargoType.gi` себя не регистрирует.
 
 При отсутствии изображения игра не падает: для каждого созданного предмета она
 записывает `Can not find image for useless item` и подставляет
@@ -246,6 +248,11 @@ if(current_cargo) ItemExist(current_cargo);
 warning и агрегируется один раз на тип, независимо от числа вызовов
 `CreateQuestItem`. Базовые типы, не объявленные собственным Lang мода, это
 правило не присваивает моду автоматически.
+
+Если CacheData содержит похожий, но нерабочий ключ `2CargoType`,
+`2CargoType_c` или ключ с другим цифровым префиксом, ModKit выдаёт отдельное
+`runtime-quest-item-image-registration-key-invalid` с ожидаемым
+`2CargoType_s`. Наличие корректного GI не подавляет это предупреждение.
 
 ### ABI динамических массивов RScript
 

@@ -5280,16 +5280,43 @@ def _local_useless_item_names(
     return result
 
 
-def _useless_item_image_keys(
+def _useless_item_image_registrations(
     cache_documents: Sequence[tuple[str | Path, BlockParDocument]],
-) -> set[str]:
-    result: set[str] = set()
-    for _source, document in cache_documents:
+) -> dict[str, list[tuple[str, str, str]]]:
+    result: dict[str, list[tuple[str, str, str]]] = {}
+    for source, document in cache_documents:
         for node_path, key, value in _node_parameters(document.roots):
             parts = tuple(part.casefold() for part in node_path.split("/") if part)
-            if len(parts) >= 2 and parts[-2:] == ("bm", "itemsuseless") and value.strip():
-                result.add(key.casefold())
+            if len(parts) < 2 or parts[-2:] != ("bm", "itemsuseless"):
+                continue
+            result.setdefault(key.casefold(), []).append(
+                (key, value, str(source))
+            )
     return result
+
+
+def _effective_useless_item_cache_documents(
+    root: Path,
+    cache_documents: Sequence[tuple[str | Path, BlockParDocument]],
+) -> tuple[tuple[str | Path, BlockParDocument], ...]:
+    """Prefer the game-facing CFG CacheData over editable SOURCE copies."""
+
+    final_dat: list[tuple[str | Path, BlockParDocument]] = []
+    final_text: list[tuple[str | Path, BlockParDocument]] = []
+    for source, document in cache_documents:
+        try:
+            relative = Path(source).resolve().relative_to(root.resolve())
+        except ValueError:
+            continue
+        parts = tuple(part.casefold() for part in relative.parts)
+        if len(parts) != 2 or parts[0] != "cfg":
+            continue
+        if parts[1] == "cachedata.dat":
+            final_dat.append((source, document))
+        elif parts[1] == "cachedata.txt":
+            final_text.append((source, document))
+    selected = final_dat or final_text
+    return tuple(selected or cache_documents)
 
 
 def _local_useless_item_image_names(root: Path) -> set[str]:
@@ -5306,22 +5333,37 @@ def _local_useless_item_image_names(root: Path) -> set[str]:
     return result
 
 
-def _has_useless_item_image(
+def _has_local_useless_item_image(
     item_name: str,
-    registrations: set[str],
     image_names: set[str],
 ) -> bool:
-    """Accept the direct and race-prefixed names used by SRHD CacheData."""
+    """Recognize a likely local payload without treating it as registration."""
 
     folded = item_name.casefold()
-    patterns = (
-        re.compile(rf"^(?:[0-7])?{re.escape(folded)}(?:_s)?$", re.IGNORECASE),
-        re.compile(rf"^(?:[0-7])?{re.escape(folded)}$", re.IGNORECASE),
+    pattern = re.compile(
+        rf"^(?:2)?{re.escape(folded)}(?:_[sc])?$",
+        re.IGNORECASE,
     )
-    return any(
-        pattern.fullmatch(candidate)
-        for pattern in patterns
-        for candidate in (*registrations, *image_names)
+    return any(pattern.fullmatch(candidate) for candidate in image_names)
+
+
+def _nearby_useless_item_registration_keys(
+    item_name: str,
+    registrations: Mapping[str, Sequence[tuple[str, str, str]]],
+) -> list[str]:
+    folded = item_name.casefold()
+    pattern = re.compile(
+        rf"^(?:[0-9])?{re.escape(folded)}(?:_[sc])?$",
+        re.IGNORECASE,
+    )
+    return sorted(
+        {
+            original
+            for key, entries in registrations.items()
+            if pattern.fullmatch(key)
+            for original, _value, _source in entries
+        },
+        key=str.casefold,
     )
 
 
@@ -5336,9 +5378,12 @@ def lint_quest_item_images(
 ) -> list[RuntimeIssue]:
     """Warn once per mod-owned CreateQuestItem type without an image.
 
-    SRHD treats these values as ``UselessItems`` identifiers.  When neither a
-    direct ``DATA/ItemsUseless`` asset nor ``Bm/ItemsUseless`` CacheData entry
-    exists, the engine logs the failure for every created item and substitutes
+    SRHD treats these values as ``UselessItems`` identifiers and resolves the
+    static icon through the exact CacheData key
+    ``Bm/ItemsUseless/2<Type>_s``.  A GI/GAI payload in
+    ``DATA/ItemsUseless`` does not register itself.  When the key is absent,
+    empty or merely similar (for example ``2<Type>`` without ``_s``), the
+    engine logs the failure for every created item and substitutes
     ``Usl_FishCont``.  Local Lang ownership keeps base-game identifiers and
     dependency-provided items out of this single-mod advisory.
     """
@@ -5346,8 +5391,13 @@ def lint_quest_item_images(
     owned = _local_useless_item_names(language_documents)
     if not owned:
         return []
-    registrations = _useless_item_image_keys(cache_documents)
-    image_names = _local_useless_item_image_names(Path(root).resolve())
+    resolved_root = Path(root).resolve()
+    effective_cache = _effective_useless_item_cache_documents(
+        resolved_root,
+        cache_documents,
+    )
+    registrations = _useless_item_image_registrations(effective_cache)
+    image_names = _local_useless_item_image_names(resolved_root)
     uses: dict[str, list[tuple[str, str, str]]] = {}
     labels: dict[str, str] = {}
     for project in projects:
@@ -5372,18 +5422,59 @@ def lint_quest_item_images(
 
     issues: list[RuntimeIssue] = []
     for folded, occurrences in sorted(uses.items()):
-        if _has_useless_item_image(folded, registrations, image_names):
-            continue
         item_name = labels[folded]
+        expected_key = f"2{item_name}_s"
+        exact = registrations.get(expected_key.casefold(), ())
+        if any(value.strip() for _key, value, _source in exact):
+            continue
         source, location, evidence = occurrences[0]
+        nearby = [
+            key
+            for key in _nearby_useless_item_registration_keys(
+                item_name,
+                registrations,
+            )
+            if key.casefold() != expected_key.casefold()
+        ]
+        local_payload = _has_local_useless_item_image(item_name, image_names)
+        if nearby:
+            details = ", ".join(repr(key) for key in nearby)
+            issues.append(
+                RuntimeIssue(
+                    "warning",
+                    "runtime-quest-item-image-registration-key-invalid",
+                    f"Для собственного типа CreateQuestItem {item_name!r} "
+                    f"CacheData содержит похожий ключ {details}, но движок "
+                    f"запрашивает точный Bm/ItemsUseless/{expected_key}. "
+                    "Суффикс _s и префикс 2 обязательны для статической иконки"
+                    + (
+                        "; найденный файл в DATA/ItemsUseless сам себя не регистрирует"
+                        if local_payload
+                        else ""
+                    )
+                    + ". Игра продолжит работу, однако подставит Usl_FishCont",
+                    source,
+                    location,
+                    evidence,
+                )
+            )
+            continue
+        empty_registration = bool(exact)
         issues.append(
             RuntimeIssue(
                 "warning",
                 "runtime-quest-item-image-missing",
                 f"Собственный тип CreateQuestItem {item_name!r} используется в "
-                f"{len(occurrences)} вызовах, но для него не найдено изображения "
-                "в DATA/ItemsUseless или непустой регистрации Bm/ItemsUseless "
-                "в CacheData. Игра продолжит работу, однако запишет повторяющееся "
+                f"{len(occurrences)} вызовах, но для него отсутствует "
+                f"{'непустая ' if empty_registration else ''}регистрация "
+                f"Bm/ItemsUseless/{expected_key} в CacheData"
+                + (
+                    "; файл в DATA/ItemsUseless найден, но без точного ключа "
+                    "движок его не использует"
+                    if local_payload
+                    else ""
+                )
+                + ". Игра продолжит работу, однако запишет повторяющееся "
                 "«Can not find image for useless item» и подставит Usl_FishCont",
                 source,
                 location,

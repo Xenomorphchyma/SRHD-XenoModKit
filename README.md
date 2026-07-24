@@ -48,8 +48,8 @@ ModKit не устанавливает моды, не изменяет игру 
 - `runtime-saved-script-cache-update-shadow` выдаётся только добровольной командой `script compare-scr OLD NEW`, когда бинарники различаются, а `ScriptName` остался прежним. Обычные `lint-runtime`, `audit` и `release` этим предположением не засоряются; сравнение предупреждает, что активный код может быть сериализован в SAV и одноимённая замена SCR не доказывает обновление уже запущенного экземпляра.
 - `runtime-shared-state-mutates-player` проверяет граф `TGroup → TState → runtime` и предупреждает, когда общее состояние `AddPlayer=true`/NPC изменяет неразделённый `CurShip` без доказанного отделения `Player()`.
 - `runtime-state-unconditional-shipbad-write` находит `ShipSetBad(CurShip, ...)` в повторно вызываемом TState без проверки фактического изменения `ShipGetBad`; явный value guard не ограничивается.
-- `runtime-quest-item-image-missing` сопоставляет собственные типы `CreateQuestItem` с Lang `UselessItems`, CacheData `Bm/ItemsUseless` и `DATA/ItemsUseless`. Одно предупреждение на тип прямо сообщает о runtime-подстановке `Usl_FishCont`.
-- Полный набор 0.9.5 состоит из 236 тестов и 24 подтестов.
+- Собственная статическая иконка `CreateQuestItem('Type')` считается зарегистрированной только точным непустым ключом `Bm/ItemsUseless/2Type_s`. `runtime-quest-item-image-registration-key-invalid` находит похожие, но нерабочие `2Type`, `_c` и неверный цифровой префикс; один GI в `DATA/ItemsUseless` больше не маскирует ошибку. Полное отсутствие ключа остаётся `runtime-quest-item-image-missing`, оба предупреждения сообщают о runtime-подстановке `Usl_FishCont`.
+- Полный набор 0.9.5 состоит из 238 тестов и 24 подтестов.
 
 ### Что изменилось в 0.9.4
 

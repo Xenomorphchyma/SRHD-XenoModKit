@@ -679,6 +679,99 @@ class RuntimeLintTests(unittest.TestCase):
                 [],
             )
 
+    def test_quest_item_requires_exact_static_cache_key_even_with_gi(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "CreateQuestItem('CargoType', 2);",
+        ]
+        language = parse_blockpar(
+            "UselessItems ^{\n"
+            "  CargoType ^{\n"
+            "    Name=Cargo\n"
+            "  }\n"
+            "}\n"
+        )
+        project = RsonProject(data, Path("quest-item-key.rson"))
+        wrong_cache = parse_blockpar(
+            "Bm ^{\n"
+            "  ItemsUseless ^{\n"
+            "    2CargoType=DATA\\ItemsUseless\\2CargoType.gi\n"
+            "  }\n"
+            "}\n"
+        )
+        wrong_variant_cache = parse_blockpar(
+            "Bm ^{\n"
+            "  ItemsUseless ^{\n"
+            "    2CargoType_c=DATA\\ItemsUseless\\2CargoType.gai\n"
+            "    3CargoType_s=DATA\\ItemsUseless\\2CargoType.gi\n"
+            "  }\n"
+            "}\n"
+        )
+        correct_cache = parse_blockpar(
+            "Bm ^{\n"
+            "  ItemsUseless ^{\n"
+            "    2CargoType_s=DATA\\ItemsUseless\\2CargoType.gi\n"
+            "  }\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            image = root / "DATA" / "ItemsUseless" / "2CargoType.gi"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"validity is checked by the resource audit")
+
+            issues = lint_quest_item_images(
+                root,
+                (project,),
+                ((Path("CacheData.txt"), wrong_cache),),
+                {"rus": ((Path("Lang_Rus.txt"), language),)},
+            )
+            self.assertEqual(len(issues), 1)
+            self.assertEqual(
+                issues[0].code,
+                "runtime-quest-item-image-registration-key-invalid",
+            )
+            self.assertIn("2CargoType_s", issues[0].message)
+            self.assertIn("сам себя не регистрирует", issues[0].message)
+            self.assertIn("Usl_FishCont", issues[0].message)
+
+            variant_issues = lint_quest_item_images(
+                root,
+                (project,),
+                ((Path("CacheData.txt"), wrong_variant_cache),),
+                {"rus": ((Path("Lang_Rus.txt"), language),)},
+            )
+            self.assertEqual(len(variant_issues), 1)
+            self.assertIn("2CargoType_c", variant_issues[0].message)
+            self.assertIn("3CargoType_s", variant_issues[0].message)
+
+            source_cache_path = root / "SOURCE" / "CFG" / "CacheData.txt"
+            final_cache_path = root / "CFG" / "CacheData.dat"
+            self.assertEqual(
+                lint_quest_item_images(
+                    root,
+                    (project,),
+                    (
+                        (source_cache_path, correct_cache),
+                        (final_cache_path, wrong_cache),
+                    ),
+                    {"rus": ((Path("Lang_Rus.txt"), language),)},
+                )[0].code,
+                "runtime-quest-item-image-registration-key-invalid",
+            )
+            self.assertEqual(
+                lint_quest_item_images(
+                    root,
+                    (project,),
+                    (
+                        (source_cache_path, wrong_cache),
+                        (final_cache_path, correct_cache),
+                    ),
+                    {"rus": ((Path("Lang_Rus.txt"), language),)},
+                ),
+                [],
+            )
+
     def test_shared_player_and_npc_state_requires_curship_separation(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]

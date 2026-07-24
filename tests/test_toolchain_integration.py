@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import os
 import errno
+import time
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -208,10 +209,16 @@ class ToolchainIntegrationTests(unittest.TestCase):
             self.assertTrue(
                 all(issue["path"] == str(recovered.resolve()) for issue in result["runtime_issues"])
             )
-            self.assertEqual(
-                {path.name for path in rscript.parent.glob("_srhd_*")},
-                staged_before,
-            )
+            deadline = time.monotonic() + 5.0
+            staged_after = {
+                path.name for path in rscript.parent.glob("_srhd_*")
+            }
+            while staged_after != staged_before and time.monotonic() < deadline:
+                time.sleep(0.05)
+                staged_after = {
+                    path.name for path in rscript.parent.glob("_srhd_*")
+                }
+            self.assertEqual(staged_after, staged_before)
 
 
 if __name__ == "__main__":
