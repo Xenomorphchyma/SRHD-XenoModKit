@@ -206,6 +206,37 @@ class GiCodecTests(unittest.TestCase):
         self.assertEqual(len(encoded), 160)
         self.assertEqual(decode_gi(encoded).pixels, bytes(3 * 2 * 4))
 
+    def test_verify_reports_alpha_geometry_without_judging_artistic_alignment(self) -> None:
+        pixels = bytearray(6 * 4 * 4)
+        for y in range(1, 3):
+            for x in range(2, 5):
+                pixels[(y * 6 + x) * 4 : (y * 6 + x) * 4 + 4] = bytes(
+                    (10, 20, 30, 255)
+                )
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "geometry.gi"
+            path.write_bytes(encode_gi(RgbaImage(6, 4, bytes(pixels)), "2"))
+            result = verify_gi(path)
+        self.assertTrue(result["type2_three_layer_layout"])
+        geometry = result["alpha_geometry"]
+        self.assertEqual(
+            geometry["bounds"],
+            {
+                "start_x": 2,
+                "start_y": 1,
+                "finish_x": 5,
+                "finish_y": 3,
+                "width": 3,
+                "height": 2,
+            },
+        )
+        self.assertEqual(
+            geometry["transparent_margins"],
+            {"left": 2, "top": 1, "right": 1, "bottom": 1},
+        )
+        self.assertEqual(geometry["margin_asymmetry"], {"horizontal": 1, "vertical": 0})
+        self.assertEqual(geometry["alpha_center_offset"], {"x": 0.5, "y": 0.0})
+
     def test_legacy_frame_type_is_inspectable_but_not_decodable(self) -> None:
         header = struct.pack(
             "<4sIiiiiIIIIII4I",

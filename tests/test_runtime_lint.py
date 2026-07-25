@@ -845,7 +845,7 @@ class RuntimeLintTests(unittest.TestCase):
             image.write_bytes(
                 encode_gi(
                     RgbaImage(2, 2, bytes((20, 40, 60, 255)) * 4),
-                    "0_32",
+                    "2",
                 )
             )
             common = (
@@ -865,6 +865,26 @@ class RuntimeLintTests(unittest.TestCase):
                 ),
                 [],
             )
+
+            image.write_bytes(
+                encode_gi(
+                    RgbaImage(2, 2, bytes((20, 40, 60, 255)) * 4),
+                    "0_32",
+                )
+            )
+            layout_issues = lint_quest_item_images(
+                root,
+                common[0],
+                ((Path("CacheData.txt"), own),),
+                common[1],
+            )
+            self.assertEqual(len(layout_issues), 1)
+            self.assertEqual(
+                layout_issues[0].code,
+                "runtime-quest-item-image-layout-atypical",
+            )
+            self.assertEqual(layout_issues[0].severity, "warning")
+            self.assertIn("--mode 2", layout_issues[0].message)
 
             missing = cache(
                 r"Mods\OtherMods\QuestFixture\DATA\ItemsUseless\Missing.gi"

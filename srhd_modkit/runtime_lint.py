@@ -5483,13 +5483,36 @@ def _quest_item_image_target_issue(
                 evidence,
             )
         try:
-            verify_resource(local)
+            verified = verify_resource(local)
         except Exception as exc:
             return False, RuntimeIssue(
                 "warning",
                 "runtime-quest-item-image-target-invalid",
                 f"Собственный ресурс {target!r} найден, но не проходит проверку GI: "
                 f"{exc}. Игра может подставить Usl_FishCont",
+                str(local),
+                f"Bm/ItemsUseless/{expected_key}",
+                evidence,
+            )
+        if (
+            verified.get("format") == "GI image"
+            and (
+                verified.get("frame_type") != 2
+                or verified.get("layer_count") != 3
+            )
+        ):
+            return True, RuntimeIssue(
+                "warning",
+                "runtime-quest-item-image-layout-atypical",
+                f"Статическая иконка предмета {expected_key} структурно исправна, "
+                f"но использует GI type {verified.get('frame_type')} с "
+                f"числом слоёв {verified.get('layer_count')}. Для ресурсов "
+                "DATA\\ItemsUseless штатные и установленные образцы почти всегда "
+                "используют type 2 с тремя RLE-слоями. Однослойный GI может "
+                "выглядеть нормально в крупном слоте, но смещаться или иначе "
+                "масштабироваться во вторичных карточках интерфейса. Рекомендуется "
+                "пересобрать PNG командой convert png-gi --mode 2; редкие "
+                "подтверждённые форматы не запрещены",
                 str(local),
                 f"Bm/ItemsUseless/{expected_key}",
                 evidence,

@@ -108,6 +108,7 @@ class GiInfo:
             "height": self.height,
             "frame_type": self.frame_type,
             "layer_count": len(self.layers),
+            "type2_three_layer_layout": self.frame_type == 2 and len(self.layers) == 3,
             "supported": self.supported,
             "capabilities": ["inspect", "decode", "encode"] if self.supported else ["inspect"],
         }
@@ -699,6 +700,83 @@ def decode_gi(data: bytes | bytearray | memoryview) -> RgbaImage:
     )
 
 
+def analyze_alpha_geometry(image: RgbaImage) -> dict[str, Any]:
+    """Return factual alpha geometry without judging artistic centering.
+
+    Bounds use an exclusive right/bottom edge, matching GI layer descriptors.
+    The weighted center uses alpha as mass and pixel-center coordinates.  These
+    measurements are useful for diagnosing clipping and asymmetric transparent
+    padding, but are intentionally not treated as proof of a rendering defect.
+    """
+
+    bounds = _bbox(image, lambda alpha: alpha > 0)
+    nontransparent = 0
+    alpha_sum = 0
+    weighted_x = 0.0
+    weighted_y = 0.0
+    for y in range(image.height):
+        for x in range(image.width):
+            alpha = image.pixels[(y * image.width + x) * 4 + 3]
+            if not alpha:
+                continue
+            nontransparent += 1
+            alpha_sum += alpha
+            weighted_x += (x + 0.5) * alpha
+            weighted_y += (y + 0.5) * alpha
+    canvas_center = (image.width / 2.0, image.height / 2.0)
+    result: dict[str, Any] = {
+        "nontransparent_pixels": nontransparent,
+        "coverage": round(nontransparent / (image.width * image.height), 6),
+        "bounds": None,
+        "transparent_margins": None,
+        "margin_asymmetry": None,
+        "alpha_weighted_center": None,
+        "canvas_center": {
+            "x": round(canvas_center[0], 6),
+            "y": round(canvas_center[1], 6),
+        },
+        "alpha_center_offset": None,
+    }
+    if bounds is None:
+        return result
+    left, top, finish_x, finish_y = bounds
+    right = image.width - finish_x
+    bottom = image.height - finish_y
+    center_x = weighted_x / alpha_sum
+    center_y = weighted_y / alpha_sum
+    result.update(
+        {
+            "bounds": {
+                "start_x": left,
+                "start_y": top,
+                "finish_x": finish_x,
+                "finish_y": finish_y,
+                "width": finish_x - left,
+                "height": finish_y - top,
+            },
+            "transparent_margins": {
+                "left": left,
+                "top": top,
+                "right": right,
+                "bottom": bottom,
+            },
+            "margin_asymmetry": {
+                "horizontal": left - right,
+                "vertical": top - bottom,
+            },
+            "alpha_weighted_center": {
+                "x": round(center_x, 6),
+                "y": round(center_y, 6),
+            },
+            "alpha_center_offset": {
+                "x": round(center_x - canvas_center[0], 6),
+                "y": round(center_y - canvas_center[1], 6),
+            },
+        }
+    )
+    return result
+
+
 def read_gi(path: str | Path) -> RgbaImage:
     return decode_gi(Path(path).read_bytes())
 
@@ -915,5 +993,6 @@ def verify_gi(path: str | Path) -> dict[str, Any]:
             )
     value = info.summary()
     value["decoded_bytes"] = info.width * info.height * 4
+    value["alpha_geometry"] = analyze_alpha_geometry(decode_gi(data))
     value["verified"] = True
     return value

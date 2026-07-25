@@ -636,6 +636,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
         print(f"Преобразовано файлов: {len(items)}")
         for item in items:
             print(f"{item.source} -> {item.destination} ({human_size(item.destination_size)})")
+            for recommendation in item.recommendations:
+                print(f"  Рекомендация [{recommendation.code}]: {recommendation.message}")
     return 0
 
 
@@ -2112,7 +2114,12 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("direction", choices=("gi-png", "png-gi"))
     convert.add_argument("inputs", nargs="+")
     convert.add_argument("--output", "-o", required=True)
-    convert.add_argument("--mode", choices=("0_32", "0_16", "2"), default="0_32", help="Режим создаваемого GI")
+    convert.add_argument(
+        "--mode",
+        choices=("0_32", "0_16", "2"),
+        default="0_32",
+        help="Режим GI; для DATA/ItemsUseless рекомендуется 2",
+    )
     convert.add_argument("--overwrite", action="store_true")
     convert.add_argument("--tools-root")
     convert.add_argument("--json", action="store_true")

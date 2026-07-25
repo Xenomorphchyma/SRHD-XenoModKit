@@ -120,6 +120,32 @@ class ToolchainIntegrationTests(unittest.TestCase):
                     info = inspect_file(png_root / "modes.png")
                     self.assertEqual((info["width"], info["height"]), (7, 5))
 
+    def test_items_useless_destination_recommends_mode_2_without_forcing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "cargo.png"
+            write_png(RgbaImage(2, 2, bytes((20, 40, 60, 255)) * 4), source)
+            destination = root / "Mod" / "DATA" / "ItemsUseless"
+            atypical = self.chain.convert(
+                [source],
+                destination,
+                direction="png-gi",
+                gi_mode="0_32",
+            )
+            self.assertTrue((destination / "cargo.gi").is_file())
+            self.assertEqual(
+                atypical[0].recommendations[0].code,
+                "gi-items-useless-mode-2-recommended",
+            )
+
+            recommended = self.chain.convert(
+                [source],
+                root / "Other" / "DATA" / "ItemsUseless",
+                direction="png-gi",
+                gi_mode="2",
+            )
+            self.assertEqual(recommended[0].recommendations, ())
+
     def test_rscript_compiles_headless_state_event_signature(self) -> None:
         rscript = self.chain.tools["rscript"].path
         source_svr = rscript.parent / "LastOneHP.svr"

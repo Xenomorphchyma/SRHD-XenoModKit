@@ -16,6 +16,7 @@ from .module_info import parse_module_info
 from .validation import validate_collection, validate_mod
 from .toolchain import (
     ConversionItem,
+    ConversionRecommendation,
     RScriptLangFragment,
     ScriptBuildFailure,
     Toolchain,
@@ -80,6 +81,7 @@ from .release import (
 )
 from .compat import ModSetReport, OverlayCollision, OverlayOwner, analyze_modset
 from .image_codec import (
+    analyze_alpha_geometry,
     GiInfo,
     GiLayerInfo,
     ImageFormatError,
@@ -138,6 +140,7 @@ __all__ = [
     "stage_tree",
     "Toolchain",
     "ConversionItem",
+    "ConversionRecommendation",
     "RScriptLangFragment",
     "ScriptBuildFailure",
     "inspect_rscript_lang_fragment",
@@ -208,6 +211,7 @@ __all__ = [
     "GiLayerInfo",
     "ImageFormatError",
     "UnsupportedImageFormat",
+    "analyze_alpha_geometry",
     "decode_gi",
     "encode_gi",
     "read_gi",

@@ -139,6 +139,12 @@ python -B srhd.py convert gi-png "<WORK>/Images" -o "<TEMP>/PNG"
 python -B srhd.py convert png-gi "<TEMP>/PNG" -o "<OUT>/Images" --mode 0_32
 ```
 
+Для назначения `<MOD>/DATA/ItemsUseless` использовать `--mode 2`, если редкий
+формат не подтверждён игровым тестом. Другой режим не блокируется, но
+`ConversionItem.recommendations` и CLI сообщат
+`gi-items-useless-mode-2-recommended`. `resource info/verify --json` для
+декодируемого GI содержит объективную `alpha_geometry`.
+
 GI/PNG преобразуются собственным кодеком ModKit без RangerTools и Pillow.
 `0_32` точен по RGBA; `0_16` и `2` используют подтверждённое квантование.
 GI типов `1/3/4` и нулевой холст остаются read-only/passthrough с `unsupported`.

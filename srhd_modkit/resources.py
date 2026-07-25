@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .files import sha256_file
-from .image_codec import UnsupportedImageFormat, inspect_gi, verify_gi
+from .image_codec import (
+    ImageFormatError,
+    UnsupportedImageFormat,
+    analyze_alpha_geometry,
+    inspect_gi,
+    read_gi,
+    verify_gi,
+)
 
 
 GAI_MAGIC = b"gai\0"
@@ -843,7 +850,16 @@ def inspect_resource(path: str | Path, *, listing: bool = False) -> dict[str, An
         info = inspect_pkg(path)
     else:
         raise ValueError("Поддерживаются ресурсы GI, GAI, HAI и PKG")
-    return info.listing() if listing else info.summary()
+    value = info.listing() if listing else info.summary()
+    if extension == ".gi" and info.supported:
+        try:
+            value["alpha_geometry"] = analyze_alpha_geometry(read_gi(path))
+        except (ImageFormatError, UnsupportedImageFormat) as exc:
+            # ``resource info`` remains an inspector. Deep structural failure
+            # belongs to ``resource verify`` and must not hide header metadata.
+            value["alpha_geometry"] = None
+            value["alpha_geometry_error"] = str(exc)
+    return value
 
 
 def verify_resource(path: str | Path) -> dict[str, Any]:

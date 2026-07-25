@@ -451,18 +451,33 @@ class Tool:
 
 
 @dataclass(frozen=True)
+class ConversionRecommendation:
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
 class ConversionItem:
     source: Path
     destination: Path
     source_sha256: str
     destination_sha256: str
     destination_size: int
+    recommendations: tuple[ConversionRecommendation, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["source"] = str(self.source)
         value["destination"] = str(self.destination)
         return value
+
+
+def _items_useless_destination(path: Path) -> bool:
+    folded = tuple(part.casefold() for part in path.parts)
+    return any(
+        folded[index : index + 2] == ("data", "itemsuseless")
+        for index in range(len(folded) - 1)
+    )
 
 
 class Toolchain:
@@ -592,6 +607,21 @@ class Toolchain:
             for source, destination, stage_file in staged:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(stage_file, destination)
+                recommendations: tuple[ConversionRecommendation, ...] = ()
+                if (
+                    direction == "png-gi"
+                    and gi_mode != "2"
+                    and _items_useless_destination(destination)
+                ):
+                    recommendations = (
+                        ConversionRecommendation(
+                            "gi-items-useless-mode-2-recommended",
+                            "Для предметной иконки в DATA\\ItemsUseless рекомендуется "
+                            "--mode 2: штатная трёхслойная упаковка лучше совместима "
+                            "с уменьшенными карточками интерфейса. Выбранный режим "
+                            f"{gi_mode} сохранён; редкие форматы не запрещены.",
+                        ),
+                    )
                 converted.append(
                     ConversionItem(
                         source=source,
@@ -599,6 +629,7 @@ class Toolchain:
                         source_sha256=sha256_file(source),
                         destination_sha256=sha256_file(destination),
                         destination_size=destination.stat().st_size,
+                        recommendations=recommendations,
                     )
                 )
         return converted
