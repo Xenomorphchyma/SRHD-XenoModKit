@@ -1460,6 +1460,70 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-landed-shipout-after-mutation", codes)
 
+    def test_forced_pickup_transfer_requires_marker_cleanup(self) -> None:
+        def matching(body: list[str]):
+            data = deepcopy(SAFE_RSON)
+            data["Visual.Objects"][0]["Operations"][0]["Code"].extend(
+                ["function TakeMarkedLoot(dword ship, dword star, dword item)", "{", *body, "}"]
+            )
+            return [
+                issue
+                for issue in lint_rson_runtime(
+                    RsonProject(data, Path("pickup-marker.rson"))
+                )
+                if issue.code == "runtime-shippicksitem-stale-after-forced-transfer"
+            ]
+
+        unsafe = matching(
+            [
+                "    ShipPicksItem(ship, item, 1);",
+                "    dword taken = GetItemFromStar(star, item);",
+                "    if(taken) AddItemToShip(ship, taken);",
+                "    exit;",
+            ]
+        )
+        self.assertEqual(len(unsafe), 1)
+        self.assertEqual(unsafe[0].severity, "warning")
+        self.assertEqual(unsafe[0].evidence, "if(taken) AddItemToShip(ship, taken);")
+
+        safe_after = matching(
+            [
+                "    ShipPicksItem(ship, item, 1);",
+                "    dword taken = GetItemFromStar(star, item);",
+                "    if(taken) AddItemToShip(ship, taken);",
+                "    ShipPicksItem(ship, item, 0);",
+            ]
+        )
+        self.assertEqual(safe_after, [])
+
+        safe_before = matching(
+            [
+                "    ShipPicksItem(ship, item, 1);",
+                "    ShipPicksItem(ship, item, 0);",
+                "    dword taken = GetItemFromStar(star, item);",
+                "    if(taken) AddItemToShip(ship, taken);",
+            ]
+        )
+        self.assertEqual(safe_before, [])
+
+        vanilla_pickup = matching(
+            [
+                "    ShipPicksItem(ship, item, 1);",
+                "    ShipFreeFlight(ship);",
+            ]
+        )
+        self.assertEqual(vanilla_pickup, [])
+
+        wrong_item_cleanup = matching(
+            [
+                "    ShipPicksItem(ship, item, 1);",
+                "    dword taken = GetItemFromStar(star, item);",
+                "    if(taken) AddItemToShip(ship, taken);",
+                "    ShipPicksItem(ship, other_item, 0);",
+            ]
+        )
+        self.assertEqual(len(wrong_item_cleanup), 1)
+
     def test_forward_group_iteration_rejects_shipout(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][0]["Code"].extend(

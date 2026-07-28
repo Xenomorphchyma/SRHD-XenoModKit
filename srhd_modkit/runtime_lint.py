@@ -4525,6 +4525,116 @@ def _lint_repeated_detached_item_free(
     return issues
 
 
+_ITEM_ASSIGNMENT_RE = re.compile(
+    r"(?:\b(?:int|dword|unknown)\s+)?\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
+    re.IGNORECASE,
+)
+
+
+def _lint_shippicksitem_forced_transfer(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Warn when a manual pickup leaves ShipPicksItem's desired-loot marker set.
+
+    ``ShipPicksItem(ship, item, 1)`` does not move the item. If the same code
+    later detaches it with ``GetItemFromStar`` and puts the returned handle into
+    that ship manually, the engine does not clear the desired-loot entry for the
+    script. Require a matching flag-0 call in the same code block. Ordinary
+    vanilla pickup flows without a proven manual transfer remain untouched.
+    """
+
+    path = str(project.path) if project.path else None
+    issues: list[RuntimeIssue] = []
+    blocks: list[tuple[str, int, tuple[str, ...]]] = [
+        (block.location, block.start_line, block.lines)
+        for block in functions.values()
+    ]
+    function_containers = {
+        (block.object_id, block.field)
+        for block in functions.values()
+    }
+    blocks.extend(
+        (container.location, 1, container.lines)
+        for container in _iter_code_containers(project)
+        if (container.object_id, container.field) not in function_containers
+    )
+
+    for location, start_line, lines in blocks:
+        active: dict[tuple[str, str], tuple[int, str]] = {}
+        stale: dict[tuple[str, str], tuple[int, str]] = {}
+        detached_origins: dict[str, str] = {}
+
+        def origin(identifier: str | None) -> str | None:
+            if identifier is None:
+                return None
+            seen: set[str] = set()
+            current = identifier
+            while current in detached_origins and current not in seen:
+                seen.add(current)
+                current = detached_origins[current]
+            return current
+
+        for line_offset, line in enumerate(lines):
+            masked = _mask_non_code(line)
+            for assignment in _ITEM_ASSIGNMENT_RE.finditer(masked):
+                target = assignment.group(1).casefold()
+                expression = assignment.group(2).strip()
+                get_calls = _call_arguments(expression, "GetItemFromStar")
+                if get_calls and len(get_calls[0][1]) >= 2:
+                    source_item = origin(_simple_identifier(get_calls[0][1][1]))
+                    if source_item:
+                        detached_origins[target] = source_item
+                        continue
+                alias = origin(_simple_identifier(expression))
+                if alias and alias in detached_origins.values():
+                    detached_origins[target] = alias
+                else:
+                    detached_origins.pop(target, None)
+
+            for _position, call, arguments in _line_call_sites(masked):
+                if call == "shippicksitem" and len(arguments) >= 3:
+                    ship = _simple_identifier(arguments[0])
+                    item = origin(_simple_identifier(arguments[1]))
+                    enabled = _constant_int(arguments[2])
+                    if not ship or not item or enabled not in {0, 1}:
+                        continue
+                    pair = (ship, item)
+                    if enabled == 0:
+                        active.pop(pair, None)
+                        stale.pop(pair, None)
+                    else:
+                        active[pair] = (line_offset, line.strip())
+                    continue
+
+                if call != "additemtoship" or len(arguments) < 2:
+                    continue
+                ship = _simple_identifier(arguments[0])
+                item = origin(_simple_identifier(arguments[1]))
+                if not ship or not item:
+                    continue
+                pair = (ship, item)
+                if pair in active:
+                    stale[pair] = (line_offset, line.strip())
+
+        for (ship, item), (line_offset, evidence) in stale.items():
+            issues.append(
+                RuntimeIssue(
+                    "warning",
+                    "runtime-shippicksitem-stale-after-forced-transfer",
+                    f"{location} вручную переносит отмеченный для подбора предмет "
+                    f"{item} в корабль {ship}, но не снимает ShipPicksItem(..., 0). "
+                    "Маркер желаемой добычи переживает GetItemFromStar/AddItemToShip "
+                    "и может повторно направлять ИИ к уже исчезнувшему предмету, "
+                    "блокируя следующий приказ",
+                    path,
+                    f"{location} line {start_line + line_offset}",
+                    evidence,
+                )
+            )
+    return issues
+
+
 _ORDER_MUTATION_CALLS = {
     "ordernone": 0,
     "orderfollowship": 0,
@@ -7771,6 +7881,7 @@ def lint_rson_runtime(
     issues.extend(_lint_shipgetbad_opaque_dereferences(project, functions))
     ship_effects = _ship_effect_summaries(functions)
     issues.extend(_lint_repeated_detached_item_free(project, functions))
+    issues.extend(_lint_shippicksitem_forced_transfer(project, functions))
     issues.extend(_lint_order_rewrite_before_hyperspace_guard(project, functions))
     issues.extend(_lint_post_group_mutation_dereference(project, functions, ship_effects))
     issues.extend(_lint_cleanup_without_turn_gate(project, functions, ship_effects))
