@@ -1194,6 +1194,25 @@ class Toolchain:
         legacy_lang = fragment_output or requested_lang_dat
         assert legacy_lang is not None
         language_warnings: list[dict[str, Any]] = []
+        if (
+            requested_lang_dat is not None
+            and [part.casefold() for part in requested_lang_dat.parts[-3:]]
+            == ["data", "script", "lang.dat"]
+            and fragment.entries
+        ):
+            language_warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "rscript-lang-dat-nonruntime-path",
+                    "message": (
+                        "DATA/Script/Lang.dat пригоден как артефакт сборки или "
+                        "импорта RScript, но не доказывает загрузку текста игрой. "
+                        "Для статических TDialogAnswer опубликуйте проверенные "
+                        "ключи Script/<имя>/<номер> в CFG/<язык>/Lang.dat"
+                    ),
+                    "path": str(requested_lang_dat),
+                }
+            )
         if fragment.status == "incomplete":
             language_warnings.append(
                 {

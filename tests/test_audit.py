@@ -247,6 +247,18 @@ class AuditTests(unittest.TestCase):
                 encoding="cp1251",
             )
             Toolchain().convert_dat(lang_source, lang, overwrite=True)
+            runtime_missing = audit_mod(root, profile="release")
+            location_issue = next(
+                item
+                for item in runtime_missing.issues
+                if item.code == "script-dialog-lang-runtime-dat-missing"
+            )
+            self.assertIn("CFG/<язык>/Lang.dat", location_issue.message)
+            self.assertIn(location_issue, runtime_missing.blocking_issues())
+
+            runtime_lang = root / "CFG" / "Rus" / "Lang.dat"
+            runtime_lang.parent.mkdir(parents=True)
+            Toolchain().convert_dat(lang_source, runtime_lang)
             complete = audit_mod(root, profile="release")
             self.assertFalse(
                 any(

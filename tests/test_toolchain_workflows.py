@@ -518,7 +518,7 @@ class ToolchainWorkflowTests(unittest.TestCase):
             source.write_text(json.dumps(PROJECT), encoding="utf-8")
             scr = root / "workflow.scr"
             fragment = root / "workflow.lang.txt"
-            lang_dat = root / "Lang.dat"
+            lang_dat = root / "DATA" / "Script" / "Lang.dat"
             chain = Toolchain()
             captured: dict[str, str] = {}
 
@@ -561,6 +561,10 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertEqual(fragment.read_bytes()[:2], b"\xff\xfe")
             self.assertEqual(lang_dat.read_bytes(), b"verified-game-dat")
             self.assertEqual(result["language"]["game_dat"]["mode"], "generated")
+            self.assertEqual(
+                result["language"]["warnings"][0]["code"],
+                "rscript-lang-dat-nonruntime-path",
+            )
 
     def test_compile_builds_blockpar_container_for_empty_game_lang_dat(self) -> None:
         with tempfile.TemporaryDirectory() as name:

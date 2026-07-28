@@ -230,6 +230,14 @@ def _is_data_script_lang(path: Path) -> bool:
     ]
 
 
+def _is_cfg_language_lang(path: Path) -> bool:
+    return (
+        len(path.parts) >= 3
+        and path.parts[-3].casefold() == "cfg"
+        and path.parts[-1].casefold() == "lang.dat"
+    )
+
+
 def _expected_answer_keys(
     project: RsonProject,
     references: Sequence[_DialogAnswerLanguageRef],
@@ -273,11 +281,12 @@ def lint_script_dialog_language(
 ) -> list[ScriptArtifactIssue]:
     """Cross-check visible dialog answers against shipped script language data.
 
-    Both game layouts are supported: the compact DATA/Script/Lang.dat used by
-    current standalone script builds and the traditional CFG/<language>/Lang.dat
-    used by existing mods. Exact numeric keys are required only when a canonical
-    Script.<name>.<number> reference or RScript's adjacent language fragment
-    proves the mapping.
+    RScript may read or create DATA/Script/Lang.dat as a project/build artifact,
+    but SRHD loads active-language overrides from CFG/<language>/Lang.dat.  The
+    former is still inspected for malformed generated values, but it is never
+    accepted as proof that a static TDialogAnswer label reaches the game.
+    Exact numeric keys are required only when a canonical Script.<name>.<number>
+    reference or RScript's adjacent language fragment proves the mapping.
     """
     checked_projects = list(projects)
     project_names = {project.name.casefold() for project in checked_projects}
@@ -356,6 +365,17 @@ def lint_script_dialog_language(
         references_label = "; ".join(reference.label for reference in references)
         expected_path = f"Script/{project.name}"
 
+        runtime_documents = [
+            (path, document)
+            for path, document in documents
+            if _is_cfg_language_lang(path)
+        ]
+        build_documents = [
+            (path, document)
+            for path, document in documents
+            if _is_data_script_lang(path)
+        ]
+
         if not documents:
             key_text = (
                 f"/{','.join(expected_preview)}"
@@ -367,9 +387,8 @@ def lint_script_dialog_language(
                     "error",
                     "script-dialog-lang-dat-missing",
                     f"{references_label}: локализуемые варианты ответа не имеют "
-                    "поставляемого Lang.dat. Ожидались непустые записи "
-                    f"{expected_path}{key_text} в DATA/Script/Lang.dat либо "
-                    "CFG/<язык>/Lang.dat",
+                    "игрового Lang.dat. Ожидались непустые записи "
+                    f"{expected_path}{key_text} в CFG/<язык>/Lang.dat",
                     str(project.path) if project.path else None,
                     f"{expected_path}{key_text}",
                     f"проверен проект {project.name}; Lang.dat не найден",
@@ -377,20 +396,29 @@ def lint_script_dialog_language(
             )
             continue
 
-        global_with_node = [
-            (path, document)
-            for path, document in documents
-            if _is_data_script_lang(path)
-            and document is not None
-            and _script_node_parameters(document, project.name) is not None
-        ]
-        selected_documents = global_with_node or [
-            (path, document)
-            for path, document in documents
-            if not _is_data_script_lang(path)
-        ]
+        if not runtime_documents:
+            supplied = ", ".join(str(path) for path, _document in build_documents)
+            key_text = (
+                f"/{','.join(expected_preview)}"
+                if expected_preview
+                else "/<ключи RScript>"
+            )
+            issues.append(
+                ScriptArtifactIssue(
+                    "error",
+                    "script-dialog-lang-runtime-dat-missing",
+                    f"{references_label}: найден только DATA/Script/Lang.dat, "
+                    "который является артефактом сборки/импорта RScript и не "
+                    "доказывает загрузку подписи игрой. Опубликуйте "
+                    f"{expected_path}{key_text} в CFG/<язык>/Lang.dat",
+                    str(project.path) if project.path else None,
+                    f"{expected_path}{key_text}",
+                    f"проверены: {supplied or 'Lang.dat вне CFG/<язык>'}",
+                )
+            )
+        selected_documents = runtime_documents or build_documents
         if not selected_documents:
-            selected_documents = documents
+            continue
 
         nodes: list[tuple[Path, dict[str, str]]] = []
         for path, document in selected_documents:
@@ -509,14 +537,7 @@ def lint_script_dialog_language(
             if document is not None
             and (parameters := _script_node_parameters(document, script_name)) is not None
         ]
-        global_nodes = [
-            item
-            for item in nodes
-            if _is_data_script_lang(item[0])
-        ]
-        for path, parameters in global_nodes or [
-            item for item in nodes if not _is_data_script_lang(item[0])
-        ]:
+        for path, parameters in nodes:
             for key, value in parameters.items():
                 marker = (str(path).casefold(), script_name.casefold(), key)
                 if marker in reported_code_stubs or not _answer_value_is_code_stub(value):

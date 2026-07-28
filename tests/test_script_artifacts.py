@@ -251,7 +251,7 @@ class ScriptArtifactTests(unittest.TestCase):
         missing_node = parse_blockpar("Script ^{\n  Other ~{\n  }\n}\n")
         issues = lint_script_dialog_language(
             [_dialog_project()],
-            [(Path("DATA/Script/Lang.dat"), missing_node)],
+            [(Path("CFG/Rus/Lang.dat"), missing_node)],
             _GENERATED_DIALOG,
             checked_scripts=["Mod_Test"],
         )
@@ -269,7 +269,7 @@ class ScriptArtifactTests(unittest.TestCase):
         )
         issues = lint_script_dialog_language(
             [_dialog_project()],
-            [(Path("DATA/Script/Lang.dat"), incomplete)],
+            [(Path("CFG/Rus/Lang.dat"), incomplete)],
             _GENERATED_DIALOG,
             checked_scripts=["Mod_Test"],
         )
@@ -285,7 +285,7 @@ class ScriptArtifactTests(unittest.TestCase):
         self.assertIn("TestDialog", missing_key.message)
         self.assertEqual(missing_key.location, "Script/Mod_Test/2")
 
-    def test_complete_dialog_language_passes_both_game_layouts(self) -> None:
+    def test_data_script_lang_is_not_runtime_proof_for_static_answers(self) -> None:
         compact = parse_blockpar(
             "Script ^{\n"
             "  Mod_Test ~{\n"
@@ -294,16 +294,20 @@ class ScriptArtifactTests(unittest.TestCase):
             "  }\n"
             "}\n"
         )
-        self.assertEqual(
-            lint_script_dialog_language(
-                [_dialog_project()],
-                [(Path("DATA/Script/Lang.dat"), compact)],
-                _GENERATED_DIALOG,
-                checked_scripts=["Mod_Test"],
-            ),
-            [],
+        issues = lint_script_dialog_language(
+            [_dialog_project()],
+            [(Path("DATA/Script/Lang.dat"), compact)],
+            _GENERATED_DIALOG,
+            checked_scripts=["Mod_Test"],
         )
+        self.assertEqual(
+            [issue.code for issue in issues],
+            ["script-dialog-lang-runtime-dat-missing"],
+        )
+        self.assertIn("CFG/<язык>/Lang.dat", issues[0].message)
+        self.assertIn("DATA/Script/Lang.dat", issues[0].message)
 
+    def test_complete_dialog_language_passes_cfg_language_layout(self) -> None:
         translated = parse_blockpar(
             "Script ^{\n"
             "  Mod_Test ~{\n"
@@ -358,7 +362,7 @@ class ScriptArtifactTests(unittest.TestCase):
         )
         issues = lint_script_dialog_language(
             [_dialog_project()],
-            [(Path("DATA/Script/Lang.dat"), code_stubs)],
+            [(Path("CFG/Rus/Lang.dat"), code_stubs)],
             _GENERATED_DIALOG,
             checked_scripts=["Mod_Test"],
         )
@@ -394,6 +398,25 @@ class ScriptArtifactTests(unittest.TestCase):
         )
         self.assertIn("Script/Mod_Binary/12,13", issues[0].message)
         self.assertIn("номер объекта недоступен", issues[0].message)
+
+        data_only = parse_blockpar(
+            "Script ^{\n"
+            "  Mod_Binary ~{\n"
+            "    12=First binary answer\n"
+            "    13=Second binary answer\n"
+            "  }\n"
+            "}\n"
+        )
+        issues = lint_script_dialog_language(
+            [],
+            [(Path("DATA/Script/Lang.dat"), data_only)],
+            checked_scripts=["Mod_Binary"],
+            binary_scripts=[binary],
+        )
+        self.assertEqual(
+            [issue.code for issue in issues],
+            ["script-dialog-lang-runtime-dat-missing"],
+        )
 
     def test_script_audit_and_runtime_cli_report_missing_dialog_language(self) -> None:
         with tempfile.TemporaryDirectory() as name:

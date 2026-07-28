@@ -1242,6 +1242,7 @@ def cmd_script_lint_runtime(args: argparse.Namespace) -> int:
         language_codes = {
             "script-dialog-lang-dat-invalid",
             "script-dialog-lang-dat-missing",
+            "script-dialog-lang-runtime-dat-missing",
             "script-dialog-lang-node-missing",
             "script-dialog-lang-key-missing",
             "script-dialog-lang-value-empty",
