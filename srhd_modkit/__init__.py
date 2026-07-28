@@ -55,7 +55,11 @@ from .runtime_lint import (
     lint_quest_item_images,
     lint_rson_runtime,
 )
-from .script_artifacts import ScriptArtifactIssue, lint_script_cache
+from .script_artifacts import (
+    ScriptArtifactIssue,
+    lint_script_cache,
+    lint_script_dialog_language,
+)
 from .game_text import (
     GameTextIssue,
     lint_blockpar_display_text,
@@ -182,6 +186,7 @@ __all__ = [
     "lint_rson_runtime",
     "ScriptArtifactIssue",
     "lint_script_cache",
+    "lint_script_dialog_language",
     "GameTextIssue",
     "lint_blockpar_display_text",
     "lint_game_display_text",
@@ -247,4 +252,4 @@ __all__ = [
     "build_quest_from_json",
 ]
 
-__version__ = "0.9.5"
+__version__ = "0.9.6"

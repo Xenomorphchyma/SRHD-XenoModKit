@@ -12,7 +12,12 @@ from .files import build_manifest, compare_trees, find_collisions, find_duplicat
 from .formats import format_catalog, inspect_file, scan_formats
 from .modcfg import parse_modcfg, validate_modcfg
 from .module_info import find_module_info, parse_module_info
-from .toolchain import ScriptBuildFailure, Toolchain, is_empty_rscript_lang_dat
+from .toolchain import (
+    ScriptBuildFailure,
+    Toolchain,
+    inspect_rscript_lang_fragment,
+    is_empty_rscript_lang_dat,
+)
 from .blockpar import BlockParDocument, BlockParNode, load_blockpar
 from .scripts import inspect_scr, load_rson
 from .resources import build_gai, build_pkg, extract_resource, inspect_resource, verify_resource
@@ -29,7 +34,11 @@ from .game_text import (
     lint_key_value_display_text,
     lint_rson_display_text,
 )
-from .script_artifacts import ScriptArtifactIssue, lint_script_cache
+from .script_artifacts import (
+    ScriptArtifactIssue,
+    lint_script_cache,
+    lint_script_dialog_language,
+)
 from .textio import DecodedText, read_text
 from .runtime_lint import (
     RuntimeIssue,
@@ -1224,6 +1233,29 @@ def cmd_script_lint_runtime(args: argparse.Namespace) -> int:
         main_path=args.main,
         module_info_path=args.module_info,
     )
+    target = Path(args.target).resolve()
+    if target.is_dir():
+        artifact_result = _script_artifact_lint_target(
+            target,
+            tools_root=args.tools_root,
+        )
+        language_codes = {
+            "script-dialog-lang-dat-invalid",
+            "script-dialog-lang-dat-missing",
+            "script-dialog-lang-node-missing",
+            "script-dialog-lang-key-missing",
+            "script-dialog-lang-value-empty",
+            "script-dialog-lang-value-code-stub",
+            "script-generated-lang-fragment-invalid",
+            "script-generated-lang-unpublished",
+        }
+        language_issues = [
+            issue
+            for issue in artifact_result["issues"]
+            if issue["code"] in language_codes
+        ]
+        result["artifact_language"] = artifact_result["language"]
+        result["issues"].extend(language_issues)
     issues = result["issues"]
     if args.json:
         print_json(result)
@@ -1411,11 +1443,13 @@ def _script_artifact_lint_target(
     tools_root: str | Path | None = None,
     scripts: Sequence[str | Path] | None = None,
     registrations: dict[str, list[str]] | None = None,
+    check_dialog_language: bool = True,
 ) -> dict[str, Any]:
     root = Path(root).resolve()
     chain = Toolchain(tools_root)
     issues: list[ScriptArtifactIssue] = []
     checked_cache: list[str] = []
+    checked_language: list[str] = []
     script_root = root / "DATA" / "Script"
     actual_scripts = sorted(script_root.glob("*.scr")) if script_root.is_dir() else []
     combined_scripts = [*actual_scripts, *(scripts or ())]
@@ -1461,11 +1495,86 @@ def _script_artifact_lint_target(
                 )
         issues.extend(lint_script_cache(root, local_scripts, registrations, cache_documents))
 
+        if check_dialog_language:
+            rson_projects = []
+            for path in sorted(root.rglob("*.rson")):
+                try:
+                    project = load_rson(path)
+                    if not any(issue.severity == "error" for issue in project.validate()):
+                        rson_projects.append(project)
+                except Exception:
+                    # The structural/runtime pass owns RSON parse diagnostics.
+                    continue
+
+            packaged_languages: list[tuple[Path, BlockParDocument | None]] = []
+            language_candidates = [root / "DATA" / "Script" / "Lang.dat"]
+            cfg_root = root / "CFG"
+            if cfg_root.is_dir():
+                language_candidates.extend(sorted(cfg_root.glob("*/Lang.dat")))
+            for index, path in enumerate(language_candidates):
+                if not path.is_file():
+                    continue
+                try:
+                    document: BlockParDocument | None
+                    if is_empty_rscript_lang_dat(path):
+                        document = None
+                    else:
+                        workspace = temp / f"script-lang-{index}"
+                        workspace.mkdir()
+                        document, _ = _load_dat_source(path, chain, workspace)
+                    packaged_languages.append((path.resolve(), document))
+                    checked_language.append(str(path.resolve()))
+                except Exception as exc:
+                    packaged_languages.append((path.resolve(), None))
+                    issues.append(
+                        ScriptArtifactIssue(
+                            "error",
+                            "script-dialog-lang-dat-invalid",
+                            str(exc),
+                            str(path.resolve()),
+                        )
+                    )
+
+            fragments: dict[str, tuple[Path, tuple[tuple[str, str], ...]]] = {}
+            for project in rson_projects:
+                if project.path is None:
+                    continue
+                fragment_path = project.path.with_name(f"{project.name}.lang.txt")
+                if not fragment_path.is_file():
+                    continue
+                try:
+                    fragment = inspect_rscript_lang_fragment(fragment_path)
+                    fragments[project.name] = (fragment_path, fragment.entries)
+                    checked_language.append(str(fragment_path.resolve()))
+                except Exception as exc:
+                    issues.append(
+                        ScriptArtifactIssue(
+                            "error",
+                            "script-generated-lang-fragment-invalid",
+                            str(exc),
+                            str(fragment_path.resolve()),
+                        )
+                    )
+            issues.extend(
+                lint_script_dialog_language(
+                    rson_projects,
+                    packaged_languages,
+                    fragments,
+                    checked_scripts=[path.stem for path in local_scripts],
+                    binary_scripts=[
+                        inspect_scr(path)
+                        for path in local_scripts
+                        if path.is_file()
+                    ],
+                )
+            )
+
     return {
         "mod": str(root),
         "scripts": [str(Path(path).resolve()) for path in local_scripts],
         "registrations": registrations,
         "cachedata": checked_cache,
+        "language": checked_language,
         "issues": [issue.as_dict() for issue in issues],
     }
 
@@ -1623,6 +1732,7 @@ def cmd_script_build(args: argparse.Namespace) -> int:
             mod_root,
             tools_root=args.tools_root,
             scripts=[Path(args.scr).resolve()],
+            check_dialog_language=False,
         )
         artifact_errors = [issue for issue in artifact_preflight["issues"] if issue["severity"] == "error"]
         if artifact_errors:
@@ -1888,6 +1998,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
         },
         "artifact_lint": {
             "cachedata": artifact_lint["cachedata"],
+            "language": artifact_lint["language"],
         },
         "text_lint": {
             "checked": text_lint["checked"],
@@ -1914,7 +2025,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.5")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.6")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")

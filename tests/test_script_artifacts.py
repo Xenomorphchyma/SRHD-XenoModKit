@@ -3,14 +3,129 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from copy import deepcopy
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
 from srhd_modkit.blockpar import parse_blockpar
-from srhd_modkit.cli import cmd_script_build
-from srhd_modkit.script_artifacts import lint_script_cache
+from srhd_modkit.cli import (
+    cmd_script_audit_mod,
+    cmd_script_build,
+    cmd_script_lint_runtime,
+)
+from srhd_modkit.script_artifacts import (
+    lint_script_cache,
+    lint_script_dialog_language,
+)
+from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, RsonProject
+from srhd_modkit.toolchain import Toolchain
 from tests.test_runtime_lint import SAFE_RSON
+
+
+def _dialog_project() -> RsonProject:
+    return RsonProject(
+        {
+            "ScriptName": "Mod_Test",
+            "Visual.Objects": [
+                {
+                    "Dialogs": [
+                        {
+                            "Type": "TDialog",
+                            "Name": "TestDialog",
+                            "Parent": -1,
+                            "#": 1,
+                        },
+                        {
+                            "Type": "TDialogMsg",
+                            "Name": "",
+                            "Parent": -1,
+                            "#": 3,
+                            "DMsg.Num": 0,
+                            "Msg": "",
+                        },
+                        {
+                            "Type": "TDialogAnswer",
+                            "Name": "fastexit",
+                            "Parent": -1,
+                            "#": 5,
+                            "AMsg.Num": 0,
+                            "Msg": "DAnswer(CT('Script.Mod_Test.1'));",
+                        },
+                        {
+                            "Type": "TDialogAnswer",
+                            "Name": "fastexit",
+                            "Parent": -1,
+                            "#": 6,
+                            "AMsg.Num": 1,
+                            "Msg": "DAnswer(CT('Script.Mod_Test.2'));",
+                        },
+                    ],
+                    "Operations": [
+                        {
+                            "Type": "Top",
+                            "Name": "DialogRoot",
+                            "Parent": -1,
+                            "#": 2,
+                            "Code": ["DChange(0);"],
+                        },
+                        {
+                            "Type": "Top",
+                            "Name": "DialogMessage",
+                            "Parent": -1,
+                            "#": 4,
+                            "Code": ["DAdd(0);", "DAdd(1);"],
+                        },
+                    ],
+                }
+            ],
+            "Visual.Links": [
+                {"Begin": 1, "End": 2},
+                {"Begin": 3, "End": 4},
+            ],
+        },
+        Path("Mod_Test.rson"),
+    )
+
+
+_GENERATED_DIALOG = {
+    "Mod_Test": (
+        Path("Mod_Test.lang.txt"),
+        (
+            ("0", ""),
+            ("1", "DAnswer('fastexit~First answer')"),
+            ("2", "DAnswer('fastexit~Second answer')"),
+        ),
+    )
+}
+
+
+def _write_dialog_mod(root: Path) -> None:
+    root.mkdir(parents=True)
+    (root / "ModuleInfo.txt").write_text(
+        "Name=DialogFixture\nLanguages=Rus\n",
+        encoding="cp1251",
+    )
+    project = deepcopy(_dialog_project().data)
+    project["FileID"] = RSON_FILE_ID
+    project["FileVersion"] = RSON_FILE_VERSION
+    for link in project["Visual.Links"]:
+        link.update({"Type": "TGraphLink", "Nom": 0, "Arrow": True})
+    source = root / "SOURCE"
+    source.mkdir()
+    (source / "Mod_Test.rson").write_text(
+        json.dumps(project),
+        encoding="utf-8",
+    )
+    (source / "Mod_Test.lang.txt").write_bytes(
+        b"\xff\xfe"
+        + (
+            "0=\r\n"
+            "1=DAnswer('fastexit~First answer')\r\n"
+            "2=DAnswer('fastexit~Second answer')\r\n"
+        ).encode("utf-16-le")
+    )
 
 
 class ScriptArtifactTests(unittest.TestCase):
@@ -116,6 +231,240 @@ class ScriptArtifactTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "cache-script-key-path-mismatch"):
                 cmd_script_build(args)
+
+    def test_dialog_answers_require_a_packaged_lang_dat(self) -> None:
+        issues = lint_script_dialog_language(
+            [_dialog_project()],
+            [],
+            _GENERATED_DIALOG,
+            checked_scripts=["Mod_Test"],
+        )
+        self.assertEqual(
+            [issue.code for issue in issues],
+            ["script-dialog-lang-dat-missing"],
+        )
+        self.assertIn("TestDialog", issues[0].message)
+        self.assertIn("TDialogAnswer #5", issues[0].message)
+        self.assertIn("Script/Mod_Test/1,2", issues[0].message)
+
+    def test_dialog_language_reports_missing_node_key_and_empty_value(self) -> None:
+        missing_node = parse_blockpar("Script ^{\n  Other ~{\n  }\n}\n")
+        issues = lint_script_dialog_language(
+            [_dialog_project()],
+            [(Path("DATA/Script/Lang.dat"), missing_node)],
+            _GENERATED_DIALOG,
+            checked_scripts=["Mod_Test"],
+        )
+        self.assertEqual(
+            [issue.code for issue in issues],
+            ["script-dialog-lang-node-missing"],
+        )
+
+        incomplete = parse_blockpar(
+            "Script ^{\n"
+            "  Mod_Test ~{\n"
+            "    1=\n"
+            "  }\n"
+            "}\n"
+        )
+        issues = lint_script_dialog_language(
+            [_dialog_project()],
+            [(Path("DATA/Script/Lang.dat"), incomplete)],
+            _GENERATED_DIALOG,
+            checked_scripts=["Mod_Test"],
+        )
+        codes = [issue.code for issue in issues]
+        self.assertIn("script-dialog-lang-value-empty", codes)
+        self.assertIn("script-dialog-lang-key-missing", codes)
+        self.assertIn("script-generated-lang-unpublished", codes)
+        missing_key = next(
+            issue
+            for issue in issues
+            if issue.code == "script-dialog-lang-key-missing"
+        )
+        self.assertIn("TestDialog", missing_key.message)
+        self.assertEqual(missing_key.location, "Script/Mod_Test/2")
+
+    def test_complete_dialog_language_passes_both_game_layouts(self) -> None:
+        compact = parse_blockpar(
+            "Script ^{\n"
+            "  Mod_Test ~{\n"
+            "    1=First answer\n"
+            "    2=Second answer\n"
+            "  }\n"
+            "}\n"
+        )
+        self.assertEqual(
+            lint_script_dialog_language(
+                [_dialog_project()],
+                [(Path("DATA/Script/Lang.dat"), compact)],
+                _GENERATED_DIALOG,
+                checked_scripts=["Mod_Test"],
+            ),
+            [],
+        )
+
+        translated = parse_blockpar(
+            "Script ^{\n"
+            "  Mod_Test ~{\n"
+            "    1=Первый ответ\n"
+            "    2=Второй ответ\n"
+            "  }\n"
+            "}\n"
+        )
+        unrelated_compact = parse_blockpar("Script ^{\n  Other ~{\n  }\n}\n")
+        self.assertEqual(
+            lint_script_dialog_language(
+                [_dialog_project()],
+                [
+                    (Path("DATA/Script/Lang.dat"), unrelated_compact),
+                    (Path("CFG/Rus/Lang.dat"), translated),
+                ],
+                _GENERATED_DIALOG,
+                checked_scripts=["Mod_Test"],
+            ),
+            [],
+        )
+
+    def test_canonical_dialog_key_is_checked_without_generated_fragment(self) -> None:
+        project = _dialog_project()
+        answer = project.object_by_id(5)
+        answer["Msg"] = "DAnswer(CT('Script.Mod_Test.41'));"
+        project.object_by_id(6)["Msg"] = ""
+        language = parse_blockpar(
+            "Script ^{\n"
+            "  Mod_Test ~{\n"
+            "    41=Canonical answer\n"
+            "  }\n"
+            "}\n"
+        )
+        self.assertEqual(
+            lint_script_dialog_language(
+                [project],
+                [(Path("CFG/Rus/Lang.dat"), language)],
+                checked_scripts=["Mod_Test"],
+            ),
+            [],
+        )
+
+    def test_dialog_language_rejects_rscript_code_stub_values(self) -> None:
+        code_stubs = parse_blockpar(
+            "Script ^{\n"
+            "  Mod_Test ~{\n"
+            "    1=DAnswer('fastexit~First answer')\n"
+            "    2=DText('Second answer')\n"
+            "  }\n"
+            "}\n"
+        )
+        issues = lint_script_dialog_language(
+            [_dialog_project()],
+            [(Path("DATA/Script/Lang.dat"), code_stubs)],
+            _GENERATED_DIALOG,
+            checked_scripts=["Mod_Test"],
+        )
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "script-dialog-lang-value-code-stub"
+        ]
+        self.assertEqual(len(matching), 2)
+        self.assertTrue(all("TestDialog" in issue.message for issue in matching))
+        self.assertFalse(
+            any(issue.code == "script-generated-lang-unpublished" for issue in issues)
+        )
+
+    def test_scr_only_dialog_key_requires_packaged_language(self) -> None:
+        binary = {
+            "path": str(Path("DATA/Script/Mod_Binary.scr").resolve()),
+            "name": "Mod_Binary",
+            "dialog_language_keys": [
+                {"script_name": "Mod_Binary", "key": "12"},
+                {"script_name": "Mod_Binary", "key": "13"},
+            ],
+        }
+        issues = lint_script_dialog_language(
+            [],
+            [],
+            checked_scripts=["Mod_Binary"],
+            binary_scripts=[binary],
+        )
+        self.assertEqual(
+            [issue.code for issue in issues],
+            ["script-dialog-lang-dat-missing"],
+        )
+        self.assertIn("Script/Mod_Binary/12,13", issues[0].message)
+        self.assertIn("номер объекта недоступен", issues[0].message)
+
+    def test_script_audit_and_runtime_cli_report_missing_dialog_language(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "DialogFixture"
+            _write_dialog_mod(root)
+
+            output = StringIO()
+            with redirect_stdout(output):
+                code = cmd_script_audit_mod(
+                    SimpleNamespace(mod=str(root), tools_root=None, json=True)
+                )
+            self.assertEqual(code, 2)
+            report = json.loads(output.getvalue())
+            self.assertIn(
+                "script-dialog-lang-dat-missing",
+                {issue["code"] for issue in report["issues"]},
+            )
+            self.assertEqual(report["artifact_lint"]["language"], [
+                str((root / "SOURCE" / "Mod_Test.lang.txt").resolve())
+            ])
+
+            output = StringIO()
+            with redirect_stdout(output):
+                code = cmd_script_lint_runtime(
+                    SimpleNamespace(
+                        target=str(root),
+                        tools_root=None,
+                        main=None,
+                        module_info=None,
+                        strict=False,
+                        json=True,
+                    )
+                )
+            self.assertEqual(code, 2)
+            report = json.loads(output.getvalue())
+            self.assertIn(
+                "script-dialog-lang-dat-missing",
+                {issue["code"] for issue in report["issues"]},
+            )
+
+            lang_source = root / "SOURCE" / "Lang.txt"
+            lang_source.write_text(
+                "Script ^{\n"
+                "  Mod_Test ~{\n"
+                "    1=DAnswer('fastexit~First answer')\n"
+                "    2=DAnswer('fastexit~Second answer')\n"
+                "  }\n"
+                "}\n",
+                encoding="cp1251",
+            )
+            lang_dat = root / "DATA" / "Script" / "Lang.dat"
+            lang_dat.parent.mkdir(parents=True)
+            Toolchain().convert_dat(lang_source, lang_dat)
+            output = StringIO()
+            with redirect_stdout(output):
+                code = cmd_script_lint_runtime(
+                    SimpleNamespace(
+                        target=str(root),
+                        tools_root=None,
+                        main=None,
+                        module_info=None,
+                        strict=False,
+                        json=True,
+                    )
+                )
+            self.assertEqual(code, 2)
+            report = json.loads(output.getvalue())
+            self.assertIn(
+                "script-dialog-lang-value-code-stub",
+                {issue["code"] for issue in report["issues"]},
+            )
 
 
 if __name__ == "__main__":

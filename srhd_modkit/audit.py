@@ -31,10 +31,14 @@ from .runtime_lint import (
     lint_quest_item_images,
     lint_rson_runtime,
 )
-from .script_artifacts import lint_script_cache
+from .script_artifacts import lint_script_cache, lint_script_dialog_language
 from .scripts import inspect_scr, load_rson
 from .textio import DecodedText, read_text
-from .toolchain import Toolchain, is_empty_rscript_lang_dat
+from .toolchain import (
+    Toolchain,
+    inspect_rscript_lang_fragment,
+    is_empty_rscript_lang_dat,
+)
 from .validation import validate_collection, validate_mod
 
 
@@ -1313,9 +1317,11 @@ def _script_check(context: AuditContext) -> AuditCheck:
 
     issues: list[AuditIssue] = []
     checked: list[str] = []
+    scr_infos: list[dict[str, Any]] = []
     for path in scripts:
         try:
             info = inspect_scr(path)
+            scr_infos.append(info)
             checked.append(str(path))
             if not info["supported_version"]:
                 issues.append(
@@ -1498,6 +1504,80 @@ def _script_check(context: AuditContext) -> AuditCheck:
             rson_projects,
             cache_documents,
             language_documents,
+        )
+    )
+
+    packaged_script_languages: list[tuple[Path, BlockParDocument | None]] = []
+    script_language_paths = [
+        path
+        for relative, path in index.items()
+        if relative == "data/script/lang.dat"
+        or (
+            relative.startswith("cfg/")
+            and relative.endswith("/lang.dat")
+        )
+    ]
+    for path in dict.fromkeys(script_language_paths):
+        try:
+            packaged_script_languages.append((path, _load_dat(context, path)))
+            checked.append(str(path))
+        except Exception as exc:
+            packaged_script_languages.append((path, None))
+            issues.append(
+                _issue(
+                    context,
+                    name,
+                    "error",
+                    "script-dialog-lang-dat-invalid",
+                    f"Lang.dat нельзя проверить для скриптовых диалогов: {exc}",
+                    path,
+                )
+            )
+
+    fragments: dict[str, tuple[Path, tuple[tuple[str, str], ...]]] = {}
+    lang_fragment_paths: dict[str, list[Path]] = {}
+    for path in files:
+        if path.name.casefold().endswith(".lang.txt"):
+            lang_fragment_paths.setdefault(path.name.casefold(), []).append(path)
+    for project in rson_projects:
+        candidates = lang_fragment_paths.get(
+            f"{project.name}.lang.txt".casefold(),
+            [],
+        )
+        candidate = next(
+            (
+                path
+                for path in candidates
+                if project.path is not None
+                and path.parent == project.path.parent
+            ),
+            candidates[0] if len(candidates) == 1 else None,
+        )
+        if candidate is None:
+            continue
+        try:
+            fragment = inspect_rscript_lang_fragment(candidate)
+            fragments[project.name] = (candidate, fragment.entries)
+            checked.append(str(candidate))
+        except Exception as exc:
+            issues.append(
+                _issue(
+                    context,
+                    name,
+                    "error",
+                    "script-generated-lang-fragment-invalid",
+                    str(exc),
+                    candidate,
+                )
+            )
+    issues.extend(
+        AuditIssue.from_value(item, validator=name, mod=context.mod_name)
+        for item in lint_script_dialog_language(
+            rson_projects,
+            packaged_script_languages,
+            fragments,
+            checked_scripts=[path.stem for path in scripts],
+            binary_scripts=scr_infos,
         )
     )
 

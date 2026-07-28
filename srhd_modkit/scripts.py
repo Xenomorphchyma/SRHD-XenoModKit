@@ -499,6 +499,36 @@ class RsonProject:
 
             if item.get("Type") == "TDialogAnswer" and isinstance(item.get("Msg"), str):
                 message = item["Msg"].strip()
+                inline_answer = re.fullmatch(
+                    r"DAnswer\s*\(\s*(['\"])(.*?)\1\s*\)\s*;?",
+                    message,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                if (
+                    inline_answer is not None
+                    and "~" in inline_answer.group(2)
+                    and inline_answer.group(2).rsplit("~", 1)[1].strip()
+                ):
+                    issues.append(
+                        ScriptIssue(
+                            "error",
+                            "rscript-dialog-answer-msg-inline-text",
+                            "Видимый текст нельзя помещать внутрь DAnswer(...) поля TDialogAnswer.Msg: RScript экспортирует выражение как кодовую заглушку. Используйте DAnswer(CT('Script.<ScriptName>.<key>')); и обычную строку в Lang.dat",
+                            f"object #{item.get('#')} Msg",
+                        )
+                    )
+                if (
+                    re.match(r"^DAnswer\s*\(", message, re.IGNORECASE)
+                    and message.endswith(")")
+                ):
+                    issues.append(
+                        ScriptIssue(
+                            "error",
+                            "rscript-dialog-answer-msg-missing-semicolon",
+                            "Выражение DAnswer(...) в TDialogAnswer.Msg должно завершаться ';'; без него RScript может экспортировать неполный языковой фрагмент",
+                            f"object #{item.get('#')} Msg",
+                        )
+                    )
                 explicit_code = re.search(
                     r"\b(?:InjectAnswer|DChange|DAdd)\s*\(",
                     message,
@@ -750,6 +780,19 @@ def inspect_scr(path: str | Path) -> dict[str, Any]:
         for value in strings
         if re.fullmatch(r"\[t_[A-Za-z0-9_]+(?:,t_[A-Za-z0-9_]+)*\|(?:-?\d+)?\]", value)
     ]
+    dialog_language_keys = sorted(
+        {
+            (match.group(1), match.group(2))
+            for value in strings
+            for match in re.finditer(
+                r"\bDAnswer\s*\([^;\r\n]*?\bCT\s*\(\s*['\"]"
+                r"Script\.([A-Za-z0-9_.-]+)\.(\d+)['\"]",
+                value,
+                re.IGNORECASE,
+            )
+        },
+        key=lambda item: (item[0].casefold(), int(item[1])),
+    )
     return {
         "path": str(path),
         "name": path.stem,
@@ -758,6 +801,10 @@ def inspect_scr(path: str | Path) -> dict[str, Any]:
         "supported_version": version in {6, 7, 8},
         "utf16_strings": len(strings),
         "event_signatures": event_signatures,
+        "dialog_language_keys": [
+            {"script_name": script_name, "key": key}
+            for script_name, key in dialog_language_keys
+        ],
         "code_samples": [
             value for value in strings if any(token in value for token in (";", "if(", "while(", "for("))
         ][:20],

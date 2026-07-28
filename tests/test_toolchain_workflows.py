@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, load_rson
+from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, RsonProject, load_rson
 from srhd_modkit.scripts import inspect_scr
 from srhd_modkit.blockpar import parse_blockpar
 from srhd_modkit.toolchain import (
@@ -336,6 +336,7 @@ class ToolchainWorkflowTests(unittest.TestCase):
             root = Path(name)
             complete = root / "complete.txt"
             incomplete = root / "incomplete.txt"
+            code_stub = root / "code-stub.txt"
             empty = root / "empty.txt"
             invalid = root / "invalid.txt"
             duplicate = root / "duplicate.txt"
@@ -344,6 +345,9 @@ class ToolchainWorkflowTests(unittest.TestCase):
                 '0=Script.Workflow.4\r\n1=DAnswer(CT("Script.Workflow.5"));\r\n'.encode(
                     "utf-16"
                 )
+            )
+            code_stub.write_bytes(
+                "0=\r\n1=DAnswer('fastexit~Ой, извини')\r\n".encode("utf-16")
             )
             empty.write_bytes(b"\xff\xfe")
             invalid.write_bytes("0=Повреждён�\r\n".encode("utf-16"))
@@ -357,12 +361,42 @@ class ToolchainWorkflowTests(unittest.TestCase):
                 value.referenced_ct_keys,
                 ("Script.Workflow.4", "Script.Workflow.5"),
             )
+            stub_value = inspect_rscript_lang_fragment(code_stub)
+            self.assertEqual(stub_value.status, "incomplete")
+            self.assertEqual(stub_value.placeholder_keys, ("1",))
             self.assertEqual(inspect_rscript_lang_fragment(empty).status, "empty")
             invalid_value = inspect_rscript_lang_fragment(invalid)
             self.assertEqual(invalid_value.status, "invalid")
             self.assertEqual(invalid_value.invalid_text_keys, ("0",))
             with self.assertRaisesRegex(ValueError, "Дублирующийся ключ"):
                 inspect_rscript_lang_fragment(duplicate)
+
+    def test_script_lang_base_rejects_code_stub_values(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            fragment_path = root / "fragment.lang.txt"
+            fragment_path.write_bytes(
+                "0=\r\n1=DAnswer('fastexit~Ой, извини')\r\n".encode("utf-16")
+            )
+            fragment = inspect_rscript_lang_fragment(fragment_path)
+            base = root / "Lang.txt"
+            base.write_text(
+                "Script ^{\n"
+                "  Workflow ~{\n"
+                "    1=DAnswer('fastexit~Ой, извини')\n"
+                "  }\n"
+                "}\n",
+                encoding="cp1251",
+            )
+            project = RsonProject(deepcopy(PROJECT), root / "Workflow.rson")
+            with self.assertRaisesRegex(ValueError, "RScript-код вместо видимого текста"):
+                Toolchain()._prepare_script_lang_dat(
+                    project,
+                    fragment,
+                    root / "Lang.dat",
+                    root,
+                    base=base,
+                )
 
     def test_compile_does_not_publish_incomplete_fragment_as_lang_dat(self) -> None:
         with tempfile.TemporaryDirectory() as name:

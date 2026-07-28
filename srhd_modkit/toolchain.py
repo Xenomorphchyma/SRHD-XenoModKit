@@ -322,11 +322,15 @@ _RSCRIPT_LANG_PLACEHOLDER_RE = re.compile(
     r"(?:"
     r"Script\.[A-Za-z0-9_.-]+\.\d+"
     r"|CT\s*\(.*\)\s*;?"
-    r"|(?:DAnswer|DText)\s*\(\s*CT\s*\(.*\)\s*\)\s*;?"
+    r"|(?:DAnswer|DText|Format)\s*\(.*\)\s*;?"
     r")",
     re.IGNORECASE,
 )
 _SCRIPT_CT_KEY_RE = re.compile(r"Script\.([A-Za-z0-9_.-]+)\.(\d+)", re.IGNORECASE)
+_SCRIPT_LANG_CODE_STUB_RE = re.compile(
+    r"^\s*(?:DAnswer|DText|CT|Format)\s*\(",
+    re.IGNORECASE,
+)
 
 
 def inspect_rscript_lang_fragment(path: str | Path) -> RScriptLangFragment:
@@ -959,6 +963,12 @@ class Toolchain:
             node = self._script_lang_node(base_document, script_name)
             available = {parameter.key for parameter in node.parameters}
             required = _project_script_language_keys(project, script_name)
+            required.update(
+                key
+                for key, value in fragment.entries
+                if _SCRIPT_LANG_CODE_STUB_RE.match(value)
+                and not _SCRIPT_CT_KEY_RE.search(value)
+            )
             missing = sorted(required - available, key=lambda value: int(value))
             if missing:
                 preview = ", ".join(missing[:12])
@@ -966,6 +976,22 @@ class Toolchain:
                 raise ValueError(
                     f"Базовый Lang.dat не покрывает Script/{script_name}: "
                     f"отсутствуют ключи {preview}{suffix}"
+                )
+            code_stubs = sorted(
+                (
+                    parameter.key
+                    for parameter in node.parameters
+                    if parameter.key.isdecimal()
+                    and _SCRIPT_LANG_CODE_STUB_RE.match(parameter.value)
+                ),
+                key=int,
+            )
+            if code_stubs:
+                preview = ", ".join(code_stubs[:12])
+                suffix = "…" if len(code_stubs) > 12 else ""
+                raise ValueError(
+                    f"Базовый Lang.dat содержит RScript-код вместо видимого текста "
+                    f"в Script/{script_name}: ключи {preview}{suffix}"
                 )
             if base.suffix.casefold() == ".dat":
                 shutil.copy2(base, destination)

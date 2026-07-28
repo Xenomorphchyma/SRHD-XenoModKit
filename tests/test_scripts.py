@@ -175,13 +175,73 @@ class RsonTests(unittest.TestCase):
         self.assertIn("dialog-answer-msg-contains-rscript-expression", codes)
 
         data["Visual.Objects"][0]["Dialogs"][0]["Msg"] = (
-            'DAnswer(CT("Script.TestMod.41"))'
+            'DAnswer(CT("Script.TestMod.41"));'
         )
         canonical_codes = {
             issue.code
             for issue in RsonProject(data, Path("dialog-msg-canonical.rson")).validate()
         }
         self.assertNotIn("dialog-answer-msg-contains-rscript-expression", canonical_codes)
+        self.assertNotIn("rscript-dialog-answer-msg-missing-semicolon", canonical_codes)
+
+    def test_dialog_answer_expression_requires_semicolon(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0]["Dialogs"] = [
+            {
+                "Type": "TDialogAnswer",
+                "Name": "MissingSemicolon",
+                "Parent": -1,
+                "#": 3,
+                "AMsg.Num": 0,
+                "Msg": "DAnswer('fastexit~Visible text')",
+            }
+        ]
+        issues = RsonProject(data, Path("dialog-msg-semicolon.rson")).validate()
+        issue = next(
+            issue
+            for issue in issues
+            if issue.code == "rscript-dialog-answer-msg-missing-semicolon"
+        )
+        self.assertEqual(issue.severity, "error")
+        self.assertTrue(
+            any(
+                issue.code == "rscript-dialog-answer-msg-inline-text"
+                for issue in issues
+            )
+        )
+
+        data["Visual.Objects"][0]["Dialogs"][0]["Msg"] += ";"
+        codes = {
+            issue.code
+            for issue in RsonProject(data, Path("dialog-msg-semicolon.rson")).validate()
+        }
+        self.assertNotIn("rscript-dialog-answer-msg-missing-semicolon", codes)
+
+    def test_dialog_answer_inline_visible_text_is_rejected_but_exit_is_allowed(self) -> None:
+        data = deepcopy(SAMPLE)
+        answer = {
+            "Type": "TDialogAnswer",
+            "Name": "Inline",
+            "Parent": -1,
+            "#": 3,
+            "AMsg.Num": 0,
+            "Msg": "DAnswer('fastexit~Visible text');",
+        }
+        data["Visual.Objects"][0]["Dialogs"] = [answer]
+        issues = RsonProject(data, Path("dialog-inline-text.rson")).validate()
+        self.assertTrue(
+            any(
+                issue.code == "rscript-dialog-answer-msg-inline-text"
+                for issue in issues
+            )
+        )
+
+        answer["Msg"] = "DAnswer('exit');"
+        codes = {
+            issue.code
+            for issue in RsonProject(data, Path("dialog-exit.rson")).validate()
+        }
+        self.assertNotIn("rscript-dialog-answer-msg-inline-text", codes)
 
     def test_set_code_updates_line_count_and_survives_json(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -393,6 +453,24 @@ class RsonTests(unittest.TestCase):
             )
             result = inspect_scr(path)
             self.assertEqual(result["event_signatures"], ["[t_OnEnteringForm,t_OnPlayerBuyEq|]"])
+
+    def test_inspect_scr_reports_proven_dialog_language_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "Mod_Binary.scr"
+            code = (
+                "DAnswer('fastexit~'+CT(\"Script.Mod_Binary.12\"));"
+                "DText(CT(\"Script.Mod_Binary.13\"));"
+            )
+            path.write_bytes(
+                (8).to_bytes(4, "little")
+                + code.encode("utf-16-le")
+                + b"\x00\x00"
+            )
+            result = inspect_scr(path)
+            self.assertEqual(
+                result["dialog_language_keys"],
+                [{"script_name": "Mod_Binary", "key": "12"}],
+            )
 
 
 if __name__ == "__main__":

@@ -79,6 +79,183 @@ def _quest() -> QuestDocument:
 
 
 class AuditTests(unittest.TestCase):
+    def test_release_rejects_code_stub_lang_for_scr_without_rson_key(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            source_cfg = root / "SOURCE" / "CFG"
+            source_cfg.mkdir(parents=True)
+            (source_cfg / "Main.txt").write_text(
+                "Data ^{\n"
+                "  Script ^{\n"
+                "    Mod_Binary=1,Script.Mod_Binary\n"
+                "  }\n"
+                "}\n",
+                encoding="cp1251",
+            )
+            script = root / "DATA" / "Script" / "Mod_Binary.scr"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(
+                (8).to_bytes(4, "little")
+                + "DAnswer('fastexit~Inline answer');".encode("utf-16-le")
+                + b"\x00\x00"
+            )
+            lang_source = root / "SOURCE" / "Lang.txt"
+            lang_source.write_text(
+                "Script ^{\n"
+                "  Mod_Binary ~{\n"
+                "    1=DAnswer('fastexit~Inline answer')\n"
+                "  }\n"
+                "}\n",
+                encoding="cp1251",
+            )
+            lang = root / "DATA" / "Script" / "Lang.dat"
+            Toolchain().convert_dat(lang_source, lang)
+
+            report = audit_mod(root, profile="release")
+            issue = next(
+                item
+                for item in report.issues
+                if item.code == "script-dialog-lang-value-code-stub"
+            )
+            self.assertEqual(issue.location, "Script/Mod_Binary/1")
+            self.assertIn("недоступны без точной RSON/SCR-ссылки", issue.message)
+
+    def test_release_checks_dialog_language_in_scr_without_rson(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            source_cfg = root / "SOURCE" / "CFG"
+            source_cfg.mkdir(parents=True)
+            (source_cfg / "Main.txt").write_text(
+                "Data ^{\n"
+                "  Script ^{\n"
+                "    Mod_Binary=1,Script.Mod_Binary\n"
+                "  }\n"
+                "}\n",
+                encoding="cp1251",
+            )
+            script = root / "DATA" / "Script" / "Mod_Binary.scr"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(
+                (8).to_bytes(4, "little")
+                + (
+                    "DAnswer('fastexit~'+"
+                    "CT(\"Script.Mod_Binary.12\"));"
+                ).encode("utf-16-le")
+                + b"\x00\x00"
+            )
+
+            report = audit_mod(root, profile="release")
+            issue = next(
+                item
+                for item in report.issues
+                if item.code == "script-dialog-lang-dat-missing"
+            )
+            self.assertIn("Script/Mod_Binary/12", issue.message)
+            self.assertIn("номер объекта недоступен", issue.message)
+
+    def test_release_connects_dialog_answers_to_packaged_script_language(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            source = root / "SOURCE"
+            source.mkdir()
+            project = {
+                "FileID": RSON_FILE_ID,
+                "FileVersion": RSON_FILE_VERSION,
+                "ScriptName": "Mod_Test",
+                "Visual.Objects": [
+                    {
+                        "Dialogs": [
+                            {
+                                "Type": "TDialog",
+                                "Name": "VisibleDialog",
+                                "Parent": -1,
+                                "#": 1,
+                            },
+                            {
+                                "Type": "TDialogAnswer",
+                                "Name": "fastexit",
+                                "Parent": -1,
+                                "#": 2,
+                                "AMsg.Num": 0,
+                                "Msg": "DAnswer(CT('Script.Mod_Test.1'));",
+                            },
+                        ]
+                    }
+                ],
+                "Visual.Links": [
+                    {
+                        "Type": "TGraphLink",
+                        "Begin": 1,
+                        "End": 2,
+                        "Nom": 0,
+                        "Arrow": True,
+                    }
+                ],
+            }
+            (source / "Mod_Test.rson").write_text(
+                json.dumps(project),
+                encoding="utf-8",
+            )
+            (source / "Mod_Test.lang.txt").write_bytes(
+                b"\xff\xfe"
+                + (
+                    "0=\r\n"
+                    "1=DAnswer('fastexit~Visible answer')\r\n"
+                ).encode("utf-16-le")
+            )
+
+            missing = audit_mod(root, profile="release")
+            issue = next(
+                item
+                for item in missing.issues
+                if item.code == "script-dialog-lang-dat-missing"
+            )
+            self.assertEqual(issue.severity, "error")
+            self.assertIn("VisibleDialog", issue.message)
+            self.assertIn(issue, missing.blocking_issues())
+
+            lang_source = source / "Lang.txt"
+            lang_source.write_text(
+                "Script ^{\n"
+                "  Mod_Test ~{\n"
+                "    1=DAnswer('fastexit~Visible answer')\n"
+                "  }\n"
+                "}\n",
+                encoding="cp1251",
+            )
+            lang = root / "DATA" / "Script" / "Lang.dat"
+            lang.parent.mkdir(parents=True)
+            Toolchain().convert_dat(lang_source, lang)
+            code_stub = audit_mod(root, profile="release")
+            stub_issue = next(
+                item
+                for item in code_stub.issues
+                if item.code == "script-dialog-lang-value-code-stub"
+            )
+            self.assertIn("VisibleDialog", stub_issue.message)
+            self.assertEqual(stub_issue.location, "Script/Mod_Test/1")
+
+            lang_source.write_text(
+                "Script ^{\n"
+                "  Mod_Test ~{\n"
+                "    1=Visible answer\n"
+                "  }\n"
+                "}\n",
+                encoding="cp1251",
+            )
+            Toolchain().convert_dat(lang_source, lang, overwrite=True)
+            complete = audit_mod(root, profile="release")
+            self.assertFalse(
+                any(
+                    item.code.startswith("script-dialog-lang-")
+                    or item.code == "script-generated-lang-unpublished"
+                    for item in complete.issues
+                )
+            )
+
     def test_release_warns_about_limited_game_text_notation(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"
