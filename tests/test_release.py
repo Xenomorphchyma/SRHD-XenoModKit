@@ -4,7 +4,9 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
+from srhd_modkit.audit import AuditProfile, AuditReport
 from srhd_modkit.release import (
     ReleaseBlockedError,
     build_release,
@@ -25,6 +27,28 @@ def _mod(root: Path) -> bytes:
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_release_prefix_is_used_as_exact_install_subpath(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "ReleaseFixture"
+            _mod(root)
+            report = AuditReport(str(root), AuditProfile.RELEASE, ())
+            with patch("srhd_modkit.release.audit_mod", return_value=report) as audit:
+                result = build_release(
+                    root,
+                    base / "nested.zip",
+                    prefix="OtherMods/ReleaseFixture",
+                )
+            self.assertEqual(
+                audit.call_args.kwargs["install_subpath"],
+                "OtherMods/ReleaseFixture",
+            )
+            with zipfile.ZipFile(result.output) as archive:
+                self.assertIn(
+                    "OtherMods/ReleaseFixture/ModuleInfo.txt",
+                    archive.namelist(),
+                )
+
     def test_release_is_deterministic_verified_and_keeps_metadata_outside(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             base = Path(name)

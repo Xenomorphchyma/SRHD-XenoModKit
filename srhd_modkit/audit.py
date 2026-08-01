@@ -188,6 +188,7 @@ class AuditContext:
     profile: AuditProfile
     tools: Toolchain
     temp: Path
+    install_subpath: str | None = None
     mod_name: str = ""
     dat_documents: dict[Path, BlockParDocument | None] = field(default_factory=dict)
     dat_failures: dict[Path, Exception] = field(default_factory=dict)
@@ -1338,7 +1339,11 @@ def _script_check(context: AuditContext) -> AuditCheck:
             issues.append(_issue(context, name, "error", "scr-invalid", str(exc), path))
 
     index = _relative_index(context.root)
-    main_path = index.get("cfg/main.dat") or index.get("source/cfg/main.txt")
+    main_path = (
+        index.get("cfg/main.dat")
+        or index.get("source/cfg/main.txt")
+        or index.get("source/config/main.txt")
+    )
     main_document: BlockParDocument | None = None
     registrations: dict[str, list[str]] = {}
     onstart = False
@@ -1434,6 +1439,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
         for language in module_info.languages:
             candidates = (
                 index.get(f"source/cfg/lang_{language}.txt".casefold()),
+                index.get(f"source/config/lang_{language}.txt".casefold()),
                 index.get(f"cfg/{language}/lang.dat".casefold()),
             )
             for language_path in dict.fromkeys(path for path in candidates if path is not None):
@@ -1482,7 +1488,12 @@ def _script_check(context: AuditContext) -> AuditCheck:
         )
 
     cache_documents: list[tuple[Path, BlockParDocument]] = []
-    for relative in ("source/cfg/cachedata.txt", "cfg/cachedata.txt", "cfg/cachedata.dat"):
+    for relative in (
+        "source/cfg/cachedata.txt",
+        "source/config/cachedata.txt",
+        "cfg/cachedata.txt",
+        "cfg/cachedata.dat",
+    ):
         path = index.get(relative)
         if path is None:
             continue
@@ -1495,7 +1506,13 @@ def _script_check(context: AuditContext) -> AuditCheck:
             issues.append(_issue(context, name, "error", "cachedata-load", str(exc), path))
     issues.extend(
         AuditIssue.from_value(item, validator=name, mod=context.mod_name)
-        for item in lint_script_cache(context.root, scripts, registrations, cache_documents)
+        for item in lint_script_cache(
+            context.root,
+            scripts,
+            registrations,
+            cache_documents,
+            install_subpath=context.install_subpath,
+        )
     )
     issues.extend(
         AuditIssue.from_value(item, validator=name, mod=context.mod_name)
@@ -1664,6 +1681,7 @@ def audit_mod(
     *,
     profile: str | AuditProfile = AuditProfile.DEV,
     tools_root: str | Path | None = None,
+    install_subpath: str | Path | None = None,
     allow: Sequence[str] = (),
     registry: AuditRegistry | None = None,
 ) -> AuditReport:
@@ -1672,7 +1690,13 @@ def audit_mod(
         raise NotADirectoryError(root)
     parsed_profile = AuditProfile.parse(profile)
     with tempfile.TemporaryDirectory(prefix="srhd-audit-") as temp_name:
-        context = AuditContext(root, parsed_profile, Toolchain(tools_root), Path(temp_name))
+        context = AuditContext(
+            root,
+            parsed_profile,
+            Toolchain(tools_root),
+            Path(temp_name),
+            str(install_subpath) if install_subpath is not None else None,
+        )
         checks = (registry or default_registry()).run(context)
     return _apply_allowances(
         AuditReport(str(root), parsed_profile, checks),

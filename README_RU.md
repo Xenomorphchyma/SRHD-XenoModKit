@@ -1,4 +1,4 @@
-# SRHD ModKit 0.9.6
+# SRHD ModKit 0.9.7
 
 Публичная GitHub-версия называется **SRHD XenoModKit**. Внутренние имена
 каталога, Python-пакета и CLI не переименованы. Автор и сопровождающий:
@@ -16,21 +16,15 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 описания внешних зависимостей начните с [основного README](README.md) и
 [THIRD_PARTY_TOOLS_RU.md](THIRD_PARTY_TOOLS_RU.md).
 
-## Новое в 0.9.6
+## Новое в 0.9.7
 
-- `script lint-runtime`, `script audit-mod` и release-аудит замыкают цепочку `TDialogAnswer → ключ RScript → Script/<ScriptName>/<key> → Lang.dat`.
-- Отдельно диагностируются отсутствующий `Lang.dat`, узел скрипта, числовой ключ и пустая подпись. Отчёт указывает диалог, `#` ответа, `AMsg.Num`, ожидаемый путь и проверенный файл.
-- `script-dialog-lang-value-code-stub` блокирует непустой `DAnswer(...)`, `DText(...)`, `CT(...)` или `Format(...)` в языковом значении: под `Script/<ScriptName>/<key>` должна находиться обычная видимая строка.
-- Игровым доказательством считается только `CFG/<язык>/Lang.dat`. `DATA/Script/Lang.dat` остаётся допустимым артефактом сборки/импорта RScript, но сам по себе не доказывает, что SRHD загрузит подпись; это блокируется как `script-dialog-lang-runtime-dat-missing`.
-- Статические `DAdd/TDialogAnswer` остаются поддерживаемым механизмом: ModKit не навязывает `InjectAnswer`, если ключи опубликованы в языковых CFG. Для `InjectAnswer` уже проверяются существование целевого `TDialog` и достижимого обработчика.
-- `runtime-shippicksitem-stale-after-forced-transfer` предупреждает о ручном `GetItemFromStar → AddItemToShip` после `ShipPicksItem(..., 1)` без парного снятия маркера: ИИ способен продолжать преследовать уже перенесённый предмет и не выполнить следующий приказ.
-- `script validate`, `script build` и release-аудит блокируют каждый `TGroup` без исходящих связей к `TPlanet` и `TState`. Такие неполные группы заставляют RScript 4.10f молча вернуться в окно Build без SCR.
-- Если RSON не поставляется, бинарный аудит SCR проверяет только доказанные ссылки `DAnswer(...CT("Script.<name>.<key>"))` и не угадывает недоступные номера объектов.
-- Непустой `*.lang.txt` RScript не считается опубликованным языком: `script-generated-lang-unpublished` перечисляет записи, не попавшие в игровой DAT.
-- Незавершённый `DAnswer(...)` в `TDialogAnswer.Msg` останавливается до запуска RScript как `rscript-dialog-answer-msg-missing-semicolon`; обычный текст остаётся допустимым.
-- Видимый литерал `DAnswer('...~текст')` блокируется как `rscript-dialog-answer-msg-inline-text`: нужно использовать `DAnswer(CT('Script.<имя>.<ключ>'));`, а подпись хранить в Lang.dat. Управляющий `DAnswer('exit');` разрешён.
-- Отсутствие уже упакованного DAT не блокирует preflight: результат RScript проверяется во staging. Обычные строки можно собрать сразу, а CT/code-заглушки требуют проверенный `--lang-base`.
-- Полный набор 0.9.6 состоит из 261 теста и 24 подтестов.
+- CacheData теперь сверяется с точным местом установки локального SCR, а не только с окончанием `папка мода\\DATA\\Script\\файл.scr`.
+- `cache-script-install-path-mismatch` блокирует релиз или установленный мод, если лишний либо пропущенный раздел (`OtherMods`, `Tweaks` и другие) заставит игру открыть несуществующий SCR.
+- `release check/build --prefix OtherMods/MyMod` одновременно задаёт проверяемый путь внутри `Mods` и корень ZIP. Без `--prefix` ожидается прямая установка `Mods\\MyMod`.
+- Для отдельной рабочей папки, где будущее расположение неизвестно, вложенный путь выдаёт неблокирующее `cache-script-install-path-unverified`; вложенные моды не запрещаются.
+- Наряду с `SOURCE/CFG` поддерживается схема исходников `Source/Config` для `Main.txt`, `CacheData.txt` и языковых файлов.
+- Исходный и собранный CacheData по-прежнему сравниваются семантически, поэтому исправленный TXT нельзя выпустить со старым DAT.
+- Полный набор 0.9.7 состоит из 266 тестов и 24 подтестов.
 
 ## Поддержка форматов
 
@@ -542,7 +536,7 @@ ModKit через GitHub.
 python -B -m unittest discover -s tests -v
 ```
 
-В наборе из 261 теста используются нативные PNG/GI/QM/QMM-кодеки и локальные BlockParEditor/RScript:
+В наборе из 266 тестов используются нативные PNG/GI/QM/QMM-кодеки и локальные BlockParEditor/RScript:
 проверяют пиксель-в-пиксель круговой проход RGBA8, все три режима GI, CRC,
 палитры и Adam7, ASCII/Unicode DAT,
 события TState в собранном SCR, runtime-блокировки, граф RSON, аудит/релиз,

@@ -163,6 +163,76 @@ class ScriptArtifactTests(unittest.TestCase):
                 [script],
                 {"mod_test": ["1,Script.Mod_Test"]},
                 [(root / "CFG" / "CacheData.txt", cache)],
+                install_subpath="OtherMods/TestMod",
+            )
+            self.assertEqual(issues, [])
+
+    def test_installed_mod_cache_path_must_match_actual_mods_location(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "Mods" / "LifeBeforeRanger"
+            script = root / "DATA" / "Script" / "Mod_LifeBeforeRanger.scr"
+            cache = parse_blockpar(
+                "Script ^{\n"
+                "  Mod_LifeBeforeRanger=Mods\\OtherMods\\LifeBeforeRanger\\DATA\\Script\\Mod_LifeBeforeRanger.scr\n"
+                "}\n"
+            )
+            issues = lint_script_cache(
+                root,
+                [script],
+                {"mod_lifebeforeranger": ["1,Script.Mod_LifeBeforeRanger"]},
+                [(root / "SOURCE" / "CFG" / "CacheData.txt", cache)],
+            )
+            matching = [
+                issue
+                for issue in issues
+                if issue.code == "cache-script-install-path-mismatch"
+            ]
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0].severity, "error")
+            self.assertIn(
+                r"ожидается: Mods\LifeBeforeRanger\DATA\Script\Mod_LifeBeforeRanger.scr",
+                matching[0].evidence or "",
+            )
+
+    def test_workspace_nested_cache_path_is_reported_as_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "TestMod"
+            script = root / "DATA" / "Script" / "Mod_Test.scr"
+            cache = parse_blockpar(
+                "Script ^{\n"
+                "  Mod_Test=Mods\\OtherMods\\TestMod\\DATA\\Script\\Mod_Test.scr\n"
+                "}\n"
+            )
+            issues = lint_script_cache(
+                root,
+                [script],
+                {"mod_test": ["1,Script.Mod_Test"]},
+                [(root / "SOURCE" / "CFG" / "CacheData.txt", cache)],
+            )
+            matching = [
+                issue
+                for issue in issues
+                if issue.code == "cache-script-install-path-unverified"
+            ]
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0].severity, "warning")
+            self.assertIn(r"Mods\OtherMods\TestMod", matching[0].message)
+
+    def test_declared_release_prefix_accepts_nested_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "TestMod"
+            script = root / "DATA" / "Script" / "Mod_Test.scr"
+            cache = parse_blockpar(
+                "Script ^{\n"
+                "  Mod_Test=Mods\\OtherMods\\TestMod\\DATA\\Script\\Mod_Test.scr\n"
+                "}\n"
+            )
+            issues = lint_script_cache(
+                root,
+                [script],
+                {"mod_test": ["1,Script.Mod_Test"]},
+                [(root / "SOURCE" / "CFG" / "CacheData.txt", cache)],
+                install_subpath="OtherMods/TestMod",
             )
             self.assertEqual(issues, [])
 

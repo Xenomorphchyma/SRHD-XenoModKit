@@ -1054,16 +1054,33 @@ JSON сборки имеет схему `srhd-modkit-script-build-v1` и пуб�
 ```text
 DATA/Script/Mod_Name.scr
 Data/Script: Mod_Name=1,Script.Mod_Name
-CacheData Script: Mod_Name=Mods\<раздел>\<папка мода>\DATA\Script\Mod_Name.scr
+CacheData Script: Mod_Name=Mods\<точный путь установки>\DATA\Script\Mod_Name.scr
 ```
 
-Проверяются и `SOURCE/CFG/CacheData.txt`, и `CFG/CacheData.dat`. Их семантическое
+Проверяются `SOURCE/CFG/CacheData.txt`, альтернативная схема
+`Source/Config/CacheData.txt` и итоговый `CFG/CacheData.dat`. Их семантическое
 расхождение блокируется кодом `cachedata-source-binary-mismatch`; неверное имя
 или путь — `cache-script-key-path-mismatch` и
 `cache-script-local-path-mismatch`; отсутствующая локальная запись —
 `cache-script-missing`. Дополнительная ссылка на SCR другого мода допустима,
 если она не подменяет локальный зарегистрированный SCR: так работают некоторые
 патчи зависимостей с узлом `Script ~{`.
+
+Когда корень проверяемого мода уже находится внутри `Mods`, ModKit выводит его
+фактический относительный путь и требует точного совпадения. Для релиза этот же
+путь задаётся ZIP-префиксом:
+
+```powershell
+python srhd.py release check D:\work\MyMod --prefix OtherMods/MyMod
+python srhd.py release build D:\work\MyMod D:\Releases\MyMod.zip --prefix OtherMods/MyMod
+```
+
+Без `--prefix` релиз означает прямую установку `Mods\MyMod`. Несовпадение
+блокируется как `cache-script-install-path-mismatch`. Обычный `script build` в
+рабочей папке не знает будущего места установки: вложенная ссылка получает
+`cache-script-install-path-unverified`, но не блокируется. Это предупреждение
+нужно закрыть точным `--prefix` на релизной проверке. Значение `Section` из
+ModuleInfo определяет раздел интерфейса и не доказывает каталог установки.
 
 Русская полезная нагрузка `CFG/Rus/*.dat` должна расшифровываться как
 Windows-1251. UTF-8 здесь опасен: редактор способен без потерь выполнить

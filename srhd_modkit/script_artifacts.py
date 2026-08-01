@@ -35,6 +35,26 @@ def _path_parts(value: str) -> list[str]:
     return [part for part in value.replace("/", "\\").split("\\") if part]
 
 
+def _installed_mod_subpath(root: Path) -> tuple[str, ...] | None:
+    """Return the real path below the nearest ``Mods`` directory, if known."""
+    for parent in root.parents:
+        if parent.name.casefold() != "mods":
+            continue
+        relative = root.relative_to(parent)
+        if relative.parts:
+            return tuple(relative.parts)
+    return None
+
+
+def _install_subpath_parts(value: str | Path) -> tuple[str, ...]:
+    parts = tuple(_path_parts(str(value)))
+    if parts and parts[0].casefold() == "mods":
+        parts = parts[1:]
+    if not parts or any(part in {".", ".."} or ":" in part for part in parts):
+        raise ValueError(f"Небезопасный установочный путь мода: {value!s}")
+    return parts
+
+
 @dataclass(frozen=True)
 class _DialogAnswerLanguageRef:
     script_name: str
@@ -562,6 +582,8 @@ def lint_script_cache(
     scripts: Sequence[str | Path],
     registrations: Mapping[str, Sequence[str]],
     cache_documents: Sequence[tuple[str | Path, BlockParDocument]],
+    *,
+    install_subpath: str | Path | None = None,
 ) -> list[ScriptArtifactIssue]:
     """Cross-check local SCR files, Main registrations and CacheData mappings.
 
@@ -573,6 +595,11 @@ def lint_script_cache(
     issues: list[ScriptArtifactIssue] = []
     normalized_registrations = {key.casefold(): values for key, values in registrations.items()}
     local_scripts = {Path(path).stem.casefold(): Path(path).name for path in scripts}
+    known_install_parts = (
+        _install_subpath_parts(install_subpath)
+        if install_subpath is not None
+        else _installed_mod_subpath(root)
+    )
 
     if len(cache_documents) > 1:
         baseline_path, baseline = cache_documents[0]
@@ -630,9 +657,33 @@ def lint_script_cache(
                             value,
                         )
                     )
-                folded_tail = [part.casefold() for part in parts[-4:]]
-                if folded_tail != expected_tail:
-                    expected = f"Mods\\<раздел>\\{root.name}\\DATA\\Script\\{filename}"
+                folded_parts = [part.casefold() for part in parts]
+                folded_tail = folded_parts[-4:]
+                if known_install_parts is not None:
+                    expected_parts = [
+                        "mods",
+                        *(part.casefold() for part in known_install_parts),
+                        "data",
+                        "script",
+                        filename.casefold(),
+                    ]
+                    if folded_parts != expected_parts:
+                        expected = "\\".join(
+                            ["Mods", *known_install_parts, "DATA", "Script", filename]
+                        )
+                        issues.append(
+                            ScriptArtifactIssue(
+                                "error",
+                                "cache-script-install-path-mismatch",
+                                f"CacheData для {filename} не совпадает с точным "
+                                "установочным путём этого мода",
+                                resolved_cache,
+                                f"Script/{key}",
+                                f"получено: {value}; ожидается: {expected}",
+                            )
+                        )
+                elif not folded_parts or folded_parts[0] != "mods" or folded_tail != expected_tail:
+                    expected = f"Mods\\<путь установки>\\{root.name}\\DATA\\Script\\{filename}"
                     issues.append(
                         ScriptArtifactIssue(
                             "error",
@@ -641,6 +692,21 @@ def lint_script_cache(
                             resolved_cache,
                             f"Script/{key}",
                             f"получено: {value}; ожидается: {expected}",
+                        )
+                    )
+                elif len(parts) > 5:
+                    install_hint = "\\".join(parts[1:-3])
+                    issues.append(
+                        ScriptArtifactIssue(
+                            "warning",
+                            "cache-script-install-path-unverified",
+                            f"CacheData для {filename} предполагает установку в "
+                            f"Mods\\{install_hint}, но отдельная рабочая папка не "
+                            "доказывает это размещение",
+                            resolved_cache,
+                            f"Script/{key}",
+                            "Проверьте установленную копию либо задайте тот же путь "
+                            "через --prefix при release check/build",
                         )
                     )
     return issues

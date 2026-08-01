@@ -156,18 +156,19 @@ def build_release(
         if existing:
             raise FileExistsError(f"Результат уже существует: {existing}")
 
+    archive_prefix = prefix if prefix is not None else mod_dir.name
+    _safe_archive_name(archive_prefix)
     report = audit_mod(
         mod_dir,
         profile=AuditProfile.RELEASE,
         tools_root=tools_root,
+        install_subpath=archive_prefix,
         allow=allow,
     )
     if report.blocking_issues(warnings_as_errors=warnings_as_errors):
         raise ReleaseBlockedError(report, warnings_as_errors=warnings_as_errors)
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    archive_prefix = prefix if prefix is not None else mod_dir.name
-    _safe_archive_name(archive_prefix)
     with tempfile.TemporaryDirectory(prefix=".srhd-release-", dir=output.parent) as temp_name:
         temp = Path(temp_name)
         staged = temp / "staged" / mod_dir.name
@@ -219,4 +220,3 @@ def build_release(
         report,
         tuple(exclude),
     )
-

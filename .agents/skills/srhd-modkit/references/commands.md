@@ -7,11 +7,14 @@
 ```powershell
 python -B srhd.py audit "<MOD>" --profile dev --json
 python -B srhd.py audit "<MOD>" --profile release --json
-python -B srhd.py release check "<MOD>" --json
-python -B srhd.py release build "<MOD>" "<RELEASES>/MyMod.zip" --json
+python -B srhd.py release check "<MOD>" --prefix OtherMods/MyMod --json
+python -B srhd.py release build "<MOD>" "<RELEASES>/MyMod.zip" --prefix OtherMods/MyMod --json
 ```
 
-Дополнения: `--warnings-as-errors`, `--allow CODE`, `--allow CODE:GLOB`, `--exclude GLOB`, `--overwrite`. Служебные JSON создаются рядом с ZIP.
+`--prefix` задаёт точный путь относительно `Mods` и корень ZIP; без него
+используется имя папки мода. Дополнения: `--warnings-as-errors`, `--allow CODE`,
+`--allow CODE:GLOB`, `--exclude GLOB`, `--overwrite`. Служебные JSON создаются
+рядом с ZIP.
 
 ## DAT / BlockPar
 

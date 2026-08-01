@@ -187,10 +187,12 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
 
 def cmd_release_check(args: argparse.Namespace) -> int:
+    install_subpath = args.prefix if args.prefix is not None else Path(args.mod).resolve().name
     report = audit_mod(
         args.mod,
         profile=AuditProfile.RELEASE,
         tools_root=args.tools_root,
+        install_subpath=install_subpath,
         allow=args.allow,
     )
     if args.json:
@@ -1086,7 +1088,11 @@ def _runtime_lint_target(
     if main_path:
         main_candidates.append(Path(main_path).resolve())
     elif target.is_dir():
-        for candidate in (root / "CFG" / "Main.dat", root / "SOURCE" / "CFG" / "Main.txt"):
+        for candidate in (
+            root / "CFG" / "Main.dat",
+            root / "SOURCE" / "CFG" / "Main.txt",
+            root / "Source" / "Config" / "Main.txt",
+        ):
             if candidate.is_file():
                 main_candidates.append(candidate.resolve())
 
@@ -1140,6 +1146,7 @@ def _runtime_lint_target(
             for language in module_info.languages:
                 candidates = (
                     root / "SOURCE" / "CFG" / f"Lang_{language}.txt",
+                    root / "Source" / "Config" / f"Lang_{language}.txt",
                     root / "CFG" / language / "Lang.dat",
                 )
                 for index, language_path in enumerate(candidates):
@@ -1170,6 +1177,7 @@ def _runtime_lint_target(
             temp = Path(name)
             candidates = (
                 root / "SOURCE" / "CFG" / "CacheData.txt",
+                root / "Source" / "Config" / "CacheData.txt",
                 root / "CFG" / "CacheData.txt",
                 root / "CFG" / "CacheData.dat",
             )
@@ -1460,7 +1468,11 @@ def _script_artifact_lint_target(
         temp = Path(name)
         if registrations is None:
             registrations = {}
-            main_candidates = (root / "CFG" / "Main.dat", root / "SOURCE" / "CFG" / "Main.txt")
+            main_candidates = (
+                root / "CFG" / "Main.dat",
+                root / "SOURCE" / "CFG" / "Main.txt",
+                root / "Source" / "Config" / "Main.txt",
+            )
             for index, path in enumerate(main_candidates):
                 if not path.is_file():
                     continue
@@ -1478,6 +1490,7 @@ def _script_artifact_lint_target(
         cache_documents: list[tuple[Path, BlockParDocument]] = []
         cache_candidates = (
             root / "SOURCE" / "CFG" / "CacheData.txt",
+            root / "Source" / "Config" / "CacheData.txt",
             root / "CFG" / "CacheData.txt",
             root / "CFG" / "CacheData.dat",
         )
@@ -2026,7 +2039,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.6")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.7")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -2059,6 +2072,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     release_check = release_sub.add_parser("check", help="Запустить полный релизный аудит")
     release_check.add_argument("mod")
+    release_check.add_argument(
+        "--prefix",
+        help="Точный путь мода внутри Mods и ZIP, например OtherMods/MyMod",
+    )
     release_check.add_argument("--allow", action="append", default=[])
     release_check.add_argument("--warnings-as-errors", action="store_true")
     release_check.add_argument("--tools-root")
@@ -2068,7 +2085,10 @@ def build_parser() -> argparse.ArgumentParser:
     release_build = release_sub.add_parser("build", help="Собрать и повторно проверить ZIP-релиз")
     release_build.add_argument("mod")
     release_build.add_argument("output")
-    release_build.add_argument("--prefix")
+    release_build.add_argument(
+        "--prefix",
+        help="Точный путь мода внутри Mods и ZIP, например OtherMods/MyMod",
+    )
     release_build.add_argument("--exclude", action="append", default=[])
     release_build.add_argument("--allow", action="append", default=[])
     release_build.add_argument("--warnings-as-errors", action="store_true")

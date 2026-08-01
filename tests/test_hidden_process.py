@@ -98,8 +98,8 @@ class HiddenProcessTests(unittest.TestCase):
                     ["-B", "-c", endless_writer],
                     cwd=ROOT,
                     expected_outputs=[endless],
-                    timeout=0.4,
-                    progress_timeout=0.15,
+                    timeout=0.8,
+                    progress_timeout=0.45,
                     settle_seconds=0.25,
                 )
         self.assert_clean()

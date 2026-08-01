@@ -11,7 +11,7 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 
 1. Найти корень репозитория, содержащий `srhd.py`, `pyproject.toml` и каталог `srhd_modkit`. Обозначать его как `<MODKIT_ROOT>`.
 2. Если этот скилл загружен прямо из репозитория, `<MODKIT_ROOT>` находится на три уровня выше `SKILL.md`: `.agents/skills/srhd-modkit/../../..`.
-3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.9.6` или новее.
+3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.9.7` или новее.
 4. При другой версии сначала прочитать локальные `README_RU.md`, `AUDIT_RU.md` и вывод `python -B srhd.py --help`; не предполагать наличие `script decompile`.
 5. Если корень найти нельзя, запросить путь к клону ModKit. Не использовать каталог установленной игры вместо инструментария.
 6. Для точного синтаксиса читать [references/commands.md](references/commands.md).
@@ -36,7 +36,7 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 - Для GI/PNG использовать нативные `convert gi-png` и `convert png-gi`; RangerTools и GUI не нужны. Для `DATA/ItemsUseless` явно выбирать `--mode 2`, если совместимость с предметными карточками не доказана иначе. Для остальных ресурсов использовать `resource info/list/verify/extract/build-gai/build-pkg`. Не пытаться записывать HAI.
 - Для текстового квеста сначала выполнять `quest info` и `quest validate`: изучать `location_images`, локации без кадров и `image_usage`. Для всего мода запускать release-аудит и проверять отдельные `quest-cards`, `quest-media`, регистрацию `Bm.PQI.*`, неиспользуемые ассеты и параметры `343x394 RGB`. Редактировать через `quest export-json`, собирать новым путём через `quest build`, затем выполнять `quest roundtrip`. TGE и GUI не нужны. Не объявлять визуальное постоянство персонажа или предмета доказанным статическим анализом.
 - Для активного набора модов использовать `compat` с существующим ModCFG только для чтения.
-- Для публикации использовать `release check`, затем `release build`. Не считать низкоуровневый `pack` полноценной релизной проверкой.
+- Для публикации использовать `release check`, затем `release build`. Если мод должен лежать не прямо в `Mods`, обеим командам передавать точный одинаковый `--prefix`, например `OtherMods/MyMod`; он проверяет CacheData и задаёт корень ZIP. Без `--prefix` ожидается `Mods/MyMod`. `Section` в ModuleInfo не заменяет путь установки. Не считать низкоуровневый `pack` полноценной релизной проверкой.
 - При подозрении на оставшиеся RScript/BlockParEditor сначала выполнять `doctor processes`; `--terminate` использовать только после просмотра отчёта.
 - Если CLI недоступен, пользователь может завершить редактор по исходному имени EXE во вкладке «Подробности» Диспетчера задач; процесс не является защищённым или скрытым от системного списка.
 
