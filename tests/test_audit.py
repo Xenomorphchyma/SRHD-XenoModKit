@@ -79,6 +79,40 @@ def _quest() -> QuestDocument:
 
 
 class AuditTests(unittest.TestCase):
+    def test_release_blocks_tgroup_without_planet_or_initial_state(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            source = root / "SOURCE"
+            source.mkdir()
+            project = {
+                "FileID": RSON_FILE_ID,
+                "FileVersion": RSON_FILE_VERSION,
+                "ScriptName": "Mod_IncompleteGroup",
+                "Visual.Objects": [
+                    {
+                        "Groups": [
+                            {
+                                "Type": "TGroup",
+                                "Name": "Unplaced",
+                                "Parent": -1,
+                                "#": 0,
+                            }
+                        ]
+                    }
+                ],
+                "Visual.Links": [],
+            }
+            (source / "Mod_IncompleteGroup.rson").write_text(
+                json.dumps(project),
+                encoding="utf-8",
+            )
+
+            report = audit_mod(root, profile="release")
+            codes = {item.code for item in report.blocking_issues()}
+            self.assertIn("rscript-tgroup-planet-link-missing", codes)
+            self.assertIn("rscript-tgroup-state-link-missing", codes)
+
     def test_release_rejects_code_stub_lang_for_scr_without_rson_key(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"

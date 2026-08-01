@@ -388,6 +388,54 @@ class RsonProject:
                 )
             )
 
+        links = self.data.get("Visual.Links")
+        object_by_id = {
+            item.get("#"): item
+            for item in objects
+            if isinstance(item.get("#"), int) and not isinstance(item.get("#"), bool)
+        }
+        if isinstance(links, list):
+            valid_outgoing: dict[int, set[str]] = {}
+            for link in links:
+                if not isinstance(link, dict) or link.get("Type") != "TGraphLink":
+                    continue
+                begin = link.get("Begin")
+                target = object_by_id.get(link.get("End"))
+                if not isinstance(begin, int) or isinstance(begin, bool) or target is None:
+                    continue
+                valid_outgoing.setdefault(begin, set()).add(
+                    str(target.get("Type", "")).casefold()
+                )
+            for item in tgroups:
+                object_id = item.get("#")
+                if not isinstance(object_id, int) or isinstance(object_id, bool):
+                    continue
+                target_types = valid_outgoing.get(object_id, set())
+                label = str(item.get("Name", "")).strip() or "<без имени>"
+                location = f"object #{object_id} Visual.Links"
+                if "tplanet" not in target_types:
+                    issues.append(
+                        ScriptIssue(
+                            "error",
+                            "rscript-tgroup-planet-link-missing",
+                            f"TGroup #{object_id} {label} не имеет исходящей связи к TPlanet. "
+                            "RScript 4.10f возвращается в главное окно Build без SCR; "
+                            "задайте стартовое размещение группы на планете",
+                            location,
+                        )
+                    )
+                if "tstate" not in target_types:
+                    issues.append(
+                        ScriptIssue(
+                            "error",
+                            "rscript-tgroup-state-link-missing",
+                            f"TGroup #{object_id} {label} не имеет исходящей связи к TState. "
+                            "RScript 4.10f возвращается в главное окно Build без SCR; "
+                            "задайте начальное состояние группы",
+                            location,
+                        )
+                    )
+
         dialog_number_fields = {
             "TDialogMsg": "DMsg.Num",
             "TDialogAnswer": "AMsg.Num",

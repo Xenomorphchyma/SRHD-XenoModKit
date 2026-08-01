@@ -64,7 +64,8 @@ SCR и язык даже при exit code RScript 0.
 `--fallback-without-lang` использовать только осознанно после диагностики ошибки
 импорта: RSON будет проверен round-trip, но текст диалогов из Lang.dat потерян,
 а fallback останется в JSON. `script validate` блокирует неправильную форму
-`TItem`, пятый `TGroup` и противоречия структуры диалогов до запуска RScript.
+`TItem`, пятый `TGroup`, а также `TGroup` без исходящих связей к `TPlanet` и
+`TState`, и противоречия структуры диалогов до запуска RScript.
 `script lint-runtime` дополнительно блокирует сырые `Item` в общих
 TVar/массивах, сырые `Planet`/`Star`/`Ship` в долгоживущих TVar, разгрузку с
 `ShipOut` в одном прямом пути и удаление текущего `GroupShip` при прямом обходе.

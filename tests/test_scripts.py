@@ -120,6 +120,71 @@ class RsonTests(unittest.TestCase):
         self.assertEqual(issue.severity, "error")
         self.assertIn("#7 Fifth", issue.message)
 
+    def test_tgroup_requires_outgoing_planet_and_initial_state_links(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0].update(
+            {
+                "Groups": [
+                    {"Type": "TGroup", "Name": "RuntimePlayer", "Parent": -1, "#": 3}
+                ],
+                "Planets": [
+                    {"Type": "TPlanet", "Name": "PlanetAnchor", "Parent": -1, "#": 4}
+                ],
+                "States": [
+                    {"Type": "TState", "Name": "InitialState", "Parent": -1, "#": 5}
+                ],
+            }
+        )
+
+        missing = RsonProject(deepcopy(data), Path("missing-links.rson")).validate()
+        self.assertEqual(
+            {
+                issue.code
+                for issue in missing
+                if issue.code.startswith("rscript-tgroup-")
+            },
+            {
+                "rscript-tgroup-planet-link-missing",
+                "rscript-tgroup-state-link-missing",
+            },
+        )
+
+        only_planet = deepcopy(data)
+        only_planet["Visual.Links"].append(
+            {"Type": "TGraphLink", "Begin": 3, "End": 4, "Nom": 0, "Arrow": True}
+        )
+        codes = {
+            issue.code
+            for issue in RsonProject(only_planet, Path("only-planet.rson")).validate()
+        }
+        self.assertNotIn("rscript-tgroup-planet-link-missing", codes)
+        self.assertIn("rscript-tgroup-state-link-missing", codes)
+
+        complete = deepcopy(only_planet)
+        complete["Visual.Links"].append(
+            {"Type": "TGraphLink", "Begin": 3, "End": 5, "Nom": 0, "Arrow": True}
+        )
+        codes = {
+            issue.code
+            for issue in RsonProject(complete, Path("complete-group.rson")).validate()
+        }
+        self.assertNotIn("rscript-tgroup-planet-link-missing", codes)
+        self.assertNotIn("rscript-tgroup-state-link-missing", codes)
+
+        wrong_direction = deepcopy(data)
+        wrong_direction["Visual.Links"].extend(
+            [
+                {"Type": "TGraphLink", "Begin": 4, "End": 3, "Nom": 0, "Arrow": True},
+                {"Type": "TGraphLink", "Begin": 5, "End": 3, "Nom": 0, "Arrow": True},
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in RsonProject(wrong_direction, Path("reverse-links.rson")).validate()
+        }
+        self.assertIn("rscript-tgroup-planet-link-missing", codes)
+        self.assertIn("rscript-tgroup-state-link-missing", codes)
+
     def test_dialog_numbers_are_global_dense_and_unique(self) -> None:
         data = deepcopy(SAMPLE)
         data["Visual.Objects"][0]["Dialogs"] = [

@@ -47,6 +47,26 @@ PROJECT = {
 
 
 class ToolchainWorkflowTests(unittest.TestCase):
+    def test_compile_blocks_incomplete_tgroup_before_rscript(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            data = deepcopy(PROJECT)
+            data["Visual.Objects"][0]["Groups"] = [
+                {"Type": "TGroup", "Name": "Unplaced", "Parent": -1, "#": 2}
+            ]
+            source = root / "incomplete-group.rson"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            chain = Toolchain(root / "tools")
+
+            with patch.object(chain, "_compile_rson_with_rscript") as compiler:
+                with self.assertRaisesRegex(ValueError, "не имеет исходящей связи к TPlanet"):
+                    chain.compile_rson(
+                        source,
+                        root / "out.scr",
+                        root / "out.lang.txt",
+                    )
+                compiler.assert_not_called()
+
     def test_decompiled_runtime_issues_keep_analysis_provenance(self) -> None:
         sensitive = _decompiled_runtime_issue(
             RuntimeIssue(

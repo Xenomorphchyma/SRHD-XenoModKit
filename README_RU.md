@@ -24,12 +24,13 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 - Игровым доказательством считается только `CFG/<язык>/Lang.dat`. `DATA/Script/Lang.dat` остаётся допустимым артефактом сборки/импорта RScript, но сам по себе не доказывает, что SRHD загрузит подпись; это блокируется как `script-dialog-lang-runtime-dat-missing`.
 - Статические `DAdd/TDialogAnswer` остаются поддерживаемым механизмом: ModKit не навязывает `InjectAnswer`, если ключи опубликованы в языковых CFG. Для `InjectAnswer` уже проверяются существование целевого `TDialog` и достижимого обработчика.
 - `runtime-shippicksitem-stale-after-forced-transfer` предупреждает о ручном `GetItemFromStar → AddItemToShip` после `ShipPicksItem(..., 1)` без парного снятия маркера: ИИ способен продолжать преследовать уже перенесённый предмет и не выполнить следующий приказ.
+- `script validate`, `script build` и release-аудит блокируют каждый `TGroup` без исходящих связей к `TPlanet` и `TState`. Такие неполные группы заставляют RScript 4.10f молча вернуться в окно Build без SCR.
 - Если RSON не поставляется, бинарный аудит SCR проверяет только доказанные ссылки `DAnswer(...CT("Script.<name>.<key>"))` и не угадывает недоступные номера объектов.
 - Непустой `*.lang.txt` RScript не считается опубликованным языком: `script-generated-lang-unpublished` перечисляет записи, не попавшие в игровой DAT.
 - Незавершённый `DAnswer(...)` в `TDialogAnswer.Msg` останавливается до запуска RScript как `rscript-dialog-answer-msg-missing-semicolon`; обычный текст остаётся допустимым.
 - Видимый литерал `DAnswer('...~текст')` блокируется как `rscript-dialog-answer-msg-inline-text`: нужно использовать `DAnswer(CT('Script.<имя>.<ключ>'));`, а подпись хранить в Lang.dat. Управляющий `DAnswer('exit');` разрешён.
 - Отсутствие уже упакованного DAT не блокирует preflight: результат RScript проверяется во staging. Обычные строки можно собрать сразу, а CT/code-заглушки требуют проверенный `--lang-base`.
-- Полный набор 0.9.6 состоит из 258 тестов и 24 подтестов.
+- Полный набор 0.9.6 состоит из 261 теста и 24 подтестов.
 
 ## Поддержка форматов
 
@@ -541,7 +542,7 @@ ModKit через GitHub.
 python -B -m unittest discover -s tests -v
 ```
 
-В наборе из 256 тестов используются нативные PNG/GI/QM/QMM-кодеки и локальные BlockParEditor/RScript:
+В наборе из 261 теста используются нативные PNG/GI/QM/QMM-кодеки и локальные BlockParEditor/RScript:
 проверяют пиксель-в-пиксель круговой проход RGBA8, все три режима GI, CRC,
 палитры и Adam7, ASCII/Unicode DAT,
 события TState в собранном SCR, runtime-блокировки, граф RSON, аудит/релиз,
