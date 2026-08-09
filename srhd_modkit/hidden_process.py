@@ -17,6 +17,7 @@ _LEGACY_TOOL_MUTEX = r"Local\SRHD_XenoModKit_LegacyGUI_v1"
 
 _CREATE_SUSPENDED = 0x00000004
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
+_CREATE_NO_WINDOW = 0x08000000
 _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 _WAIT_OBJECT_0 = 0x00000000
 _WAIT_ABANDONED = 0x00000080
@@ -213,6 +214,7 @@ def run_on_hidden_desktop(
     settle_seconds: float = 1.5,
     abort_window_patterns: Sequence[str] = (),
     control_actions: Sequence[HiddenControlAction] = (),
+    no_console: bool = False,
 ) -> HiddenProcessResult:
     """Run a legacy GUI-subsystem CLI on an invisible Windows desktop.
 
@@ -379,6 +381,12 @@ def run_on_hidden_desktop(
         startup.wShowWindow = 0  # SW_HIDE
         startup_pointer = ctypes.byref(startup)
         create_flags = _CREATE_UNICODE_ENVIRONMENT | _CREATE_SUSPENDED
+        if no_console:
+            # Console-native helpers such as rsmc otherwise inherit Codex's
+            # console and corrupt an outer ``--json`` stream with vendor text.
+            # CREATE_NO_WINDOW suppresses only the console window/output; the
+            # process remains visible in Task Manager and owned by our Job.
+            create_flags |= _CREATE_NO_WINDOW
 
         # On current Windows, attach the process to the job atomically at
         # CreateProcess time. The suspended AssignProcess fallback supports
@@ -774,6 +782,7 @@ def terminate_hidden_processes() -> dict[str, object]:
         "rscript.exe",
         "blockpareditor.exe",
         "blockpareditor.legacy.exe",
+        "rsmc.exe",
         "reseditor_hai128.exe",
     }
     targets: set[int] = set()

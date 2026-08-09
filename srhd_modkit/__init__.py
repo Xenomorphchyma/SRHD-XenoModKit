@@ -18,11 +18,14 @@ from .toolchain import (
     ConversionItem,
     ConversionRecommendation,
     RScriptLangFragment,
+    RsmBuildFailure,
     ScriptBuildFailure,
     Toolchain,
     inspect_rscript_lang_fragment,
     is_empty_rscript_lang_dat,
 )
+from .executable_version import ExecutableVersion, detect_executable_version
+from .rsm import RsmIssue, RsmModule, RsmProject, inspect_rsm_project
 from .blockpar import BlockParDocument, BlockParNode, BlockParParameter, load_blockpar, parse_blockpar
 from .scripts import RsonProject, ScriptIssue, inspect_scr, load_rson
 from .resources import (
@@ -147,8 +150,15 @@ __all__ = [
     "ConversionRecommendation",
     "RScriptLangFragment",
     "ScriptBuildFailure",
+    "RsmBuildFailure",
     "inspect_rscript_lang_fragment",
     "is_empty_rscript_lang_dat",
+    "ExecutableVersion",
+    "detect_executable_version",
+    "RsmIssue",
+    "RsmModule",
+    "RsmProject",
+    "inspect_rsm_project",
     "BlockParDocument",
     "BlockParNode",
     "BlockParParameter",

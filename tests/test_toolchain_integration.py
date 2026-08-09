@@ -148,9 +148,9 @@ class ToolchainIntegrationTests(unittest.TestCase):
 
     def test_rscript_compiles_headless_state_event_signature(self) -> None:
         rscript = self.chain.tools["rscript"].path
-        source_svr = rscript.parent / "LastOneHP.svr"
+        source_svr = self.chain.tools["rscript410"].path.parent / "LastOneHP.svr"
         if not rscript.is_file() or not source_svr.is_file():
-            self.skipTest("RScript 4.10f или проверочный SVR не найден")
+            self.skipTest("RScript 4.15f или legacy-проверочный SVR не найден")
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             rson = root / "events.rson"
@@ -178,9 +178,9 @@ class ToolchainIntegrationTests(unittest.TestCase):
 
     def test_rscript_decompiles_scr_headlessly_and_roundtrips(self) -> None:
         rscript = self.chain.tools["rscript"].path
-        source_svr = rscript.parent / "LastOneHP.svr"
+        source_svr = self.chain.tools["rscript410"].path.parent / "LastOneHP.svr"
         if not rscript.is_file() or not source_svr.is_file():
-            self.skipTest("RScript 4.10f или проверочный SVR не найден")
+            self.skipTest("RScript 4.15f или legacy-проверочный SVR не найден")
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             source_rson = root / "source.rson"
@@ -250,6 +250,48 @@ class ToolchainIntegrationTests(unittest.TestCase):
                     path.name for path in rscript.parent.glob("_srhd_*")
                 }
             self.assertEqual(staged_after, staged_before)
+
+    def test_rsm_export_and_build_publish_only_audited_scr_with_clean_json(self) -> None:
+        rscript = self.chain.tools["rscript"].path
+        rsmc = self.chain.tools["rsmc"].path
+        source_svr = self.chain.tools["rscript410"].path.parent / "LastOneHP.svr"
+        if not rscript.is_file() or not rsmc.is_file() or not source_svr.is_file():
+            self.skipTest("RScript 4.15f, rsmc или legacy-проверочный SVR не найден")
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source_rson = root / "source.rson"
+            rsm = root / "source.rsm"
+            output_scr = root / "source.scr"
+            self.chain.convert_script_project(source_svr, source_rson)
+            project = load_rson(source_rson)
+            state = next(item for item in project.iter_objects() if item.get("Type") == "TState")
+            state["OnActCode"] = "CurTurn();"
+            project.save(source_rson)
+
+            exported = self.chain.export_rsm(source_rson, rsm)
+            self.assertEqual(exported["status"], "passed")
+            self.assertEqual(exported["compiler"]["version"], "4.15f")
+
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "script",
+                        "build-rsm",
+                        str(rsm),
+                        "--scr",
+                        str(output_scr),
+                        "--json",
+                    ]
+                )
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0, result)
+            self.assertTrue(result["verified"])
+            self.assertTrue(result["published_outputs"])
+            self.assertEqual(result["scr"], str(output_scr.resolve()))
+            self.assertEqual(result["scr_info"]["path"], str(output_scr.resolve()))
+            self.assertEqual(result["compiler"]["name"], "rsmc")
+            self.assertEqual(inspect_scr(output_scr)["version"], 8)
 
 
 if __name__ == "__main__":

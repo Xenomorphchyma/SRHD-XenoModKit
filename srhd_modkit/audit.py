@@ -607,7 +607,11 @@ def _text_check(context: AuditContext) -> AuditCheck:
             for item in lint_game_text(
                 decoded,
                 path,
-                require_cp1251=True,
+                # BlockPar 2.1 exports every DAT to UTF-16 text regardless of
+                # the binary container's original transport. Validate the
+                # logical values for game CP1251 instead of misclassifying the
+                # codec's temporary TXT encoding as the DAT encoding.
+                require_cp1251_representable=True,
                 check_display_compatibility=False,
             )
         )

@@ -10,7 +10,7 @@ Headless modding toolkit for **Space Rangers HD: A War Apart** / **Космич�
 
 - проверять мод целиком и выпускать воспроизводимый ZIP с SHA-256-манифестом;
 - читать и изменять BlockPar `DAT` без ручного открытия редактора;
-- анализировать, декомпилировать, сравнивать, изменять и собирать `RSON`, `SVR` и `SCR`;
+- анализировать, декомпилировать, сравнивать, изменять и собирать `RSON`, модульные `RSM`, legacy-`SVR` и `SCR`;
 - обнаруживать опасные runtime-шаблоны, связанные с зависанием на «Проходит время»;
 - проверять регистрацию скриптов в `Main.dat` и согласованность `CacheData`;
 - находить ошибки CP1251, UTF-8 и повреждённый русский текст до запуска игры;
@@ -25,13 +25,13 @@ ModKit не устанавливает моды, не изменяет игру 
 
 ### Что изменилось в 0.9.7
 
-- CacheData теперь сверяется с точным местом установки локального SCR, включая все каталоги между `Mods` и папкой мода.
-- `cache-script-install-path-mismatch` блокирует релиз или установленный мод, если лишний либо пропущенный раздел (`OtherMods`, `Tweaks` и другие) направляет игру к несуществующему SCR.
-- `release check/build --prefix OtherMods/MyMod` одновременно задаёт проверяемый путь внутри `Mods` и корень ZIP. Без `--prefix` ожидается прямая установка `Mods\\MyMod`.
-- В самостоятельной рабочей папке неизвестный вложенный путь выдаёт предупреждение `cache-script-install-path-unverified`, не запрещая корректные вложенные моды.
-- Исходники конфигурации обнаруживаются как в `SOURCE/CFG`, так и в `Source/Config`; это относится к `Main.txt`, `CacheData.txt` и языковым файлам.
-- Исходный TXT и собранный CacheData.dat продолжают сравниваться семантически, чтобы старый бинарник не прошёл после исправления исходника.
-- Полный набор 0.9.7 состоит из 266 тестов и 24 подтестов.
+- CacheData теперь сверяется с точным путём установки локального SCR, включая вложенные разделы внутри `Mods`; ошибочный лишний или пропущенный каталог блокирует сборку. Для ещё не установленного мода точный путь задаётся через `release check/build --prefix`.
+- Исходники `Main.txt`, `CacheData.txt` и языковых DAT распознаются в схемах `SOURCE/CFG` и `Source/Config`; исходный TXT и собранный DAT сравниваются семантически, поэтому исправление исходника не выпускается со старым бинарником.
+- Штатный RScript обновлён до 4.15f. ModKit читает версию EXE и выбирает правильный CLI: 4.15f декомпилирует SCR напрямую без GUI-автоматизации, а обнаруженная 4.10f остаётся поддержанным legacy-бэкендом.
+- Добавлены `script export-rsm`, `script validate-rsm` и `script build-rsm`. Импорты RSM фиксируются хешами, rsmc собирает staging-SCR, после чего выполняются SCR round-trip, runtime-lint и проверка языковых DAT/TXT.
+- Перед `rsmc --lang-txt/--lang-dat` ModKit создаёт существующий BlockPar-файл с узлом `Script/<ScriptName>`, а при сбое возвращает полный JSON и не публикует промежуточный SCR.
+- BlockParEditor 2.1 стал штатным и запускается напрямую без DLL и legacy-manifest. Обнаруженная 1.9 остаётся поддержанной через локальный CP1251-совместимый EXE; обе версии проверяют DAT обратным чтением и сравнением дерева, а не бинарного SHA-256.
+- Добавлены регрессии входных TXT в UTF-8, CP1251 и UTF-16. Значения с `//`, включая `https://`, блокируются до конвертации, потому что обе проверенные версии BlockPar трактуют остаток строки как комментарий.
 
 ## Быстрый старт
 
@@ -54,20 +54,27 @@ python -B srhd.py tools
 
 ### Установить DAT- и script-кодеки
 
-Для полной работы с `DAT` и сборки `RSON/SVR → SCR` запустите:
+Для полной работы с `DAT`, `RSON/RSM/SCR` и legacy-`SVR` запустите:
 
 ```powershell
 .\scripts\setup-tools.ps1
 ```
 
-Скрипт скачивает BlockParEditor 1.9 и RScript 4.10f из зафиксированных архивов, проверяет SHA-256 и кладёт их рядом с клоном:
+Скрипт скачивает BlockParEditor 2.1, RScript 4.15f и rsmc из официальных зафиксированных релизов, проверяет SHA-256 архивов и EXE и кладёт их рядом с клоном:
 
 ```text
 Рабочая папка/
 ├── SRHD-XenoModKit/
 ├── BlockParEditor/
-└── RScript/
+├── RScript/
+├── RScript410/
+└── RSMCompiler/
 ```
+
+При обновлении уже проверенные 1.9/4.10f не удаляются: установщик переносит их
+в `BlockParEditor19/` и `RScript410/`. На чистой установке 4.10f также
+добавляется в `RScript410/`, потому что она нужна для legacy `RSON ↔ SVR`,
+которой больше нет в CLI 4.15f.
 
 Другой каталог можно задать явно:
 
@@ -90,8 +97,10 @@ python -B srhd.py tools --tools-root C:\SRHD-Tools
 | GAI/PKG сборка с обратной проверкой | да | — |
 | QM/QMM чтение, JSON-редактирование, сборка и аудит | да | — |
 | неизвестные форматы и SHA-256-манифест | да | — |
-| DAT ↔ TXT и полный DAT-аудит | после setup | BlockParEditor 1.9 |
-| RSON/SVR ↔ SCR | после setup | RScript 4.10f |
+| DAT ↔ TXT и полный DAT-аудит | после setup | BlockParEditor 2.1 |
+| RSON ↔ SCR, настоящий CLI SCR → RSON | после setup | RScript 4.15f |
+| RSM export/build/validate | после setup | RScript 4.15f + rsmc |
+| RSON ↔ SVR (legacy) | после setup | совместимый RScript 4.10f |
 
 ## Первые команды
 
@@ -134,6 +143,10 @@ python -B srhd.py script compare-storage C:\Work\Old.rson C:\Work\New.rson --jso
 python -B srhd.py script set-code C:\Work\Script.rson C:\Work\Script.edited.rson `
   --id 17 --field OnActCode --code-file C:\Work\player-buy-handler.txt
 python -B srhd.py script build C:\Work\Script.rson --scr C:\Work\Script.scr --lang C:\Work\Lang.txt
+python -B srhd.py script export-rsm C:\Work\Script.rson C:\Work\ScriptRsm --split
+python -B srhd.py script validate-rsm C:\Work\ScriptRsm\main.rsm --lang-base C:\Work\Lang.dat --json
+python -B srhd.py script build-rsm C:\Work\ScriptRsm\main.rsm --scr C:\Work\Script.scr `
+  --lang-dat C:\Work\Lang.dat --lang-base C:\Work\Lang.base.dat --json
 ```
 
 Текстовые квесты без TGE:
@@ -190,7 +203,7 @@ python -B srhd.py compat "C:\Games\Space Rangers HD\Mods\ModCFG.txt" `
 - `unsupported` означает неполное покрытие, а не повреждение файла.
 - GUI заблокирован по умолчанию и не нужен для штатных сценариев.
 - `script validate` до запуска RScript ловит незакрытые строки/комментарии/скобки и случайный русский текст вне строки или комментария — известную причину зависания старого компилятора.
-- `script decompile` управляет декомпилятором RScript только на изолированном невидимом desktop, не изменяет исходный SCR, выдаёт поэтапный JSON и публикует RSON лишь после цикла `SCR → RSON → SCR`.
+- `script decompile` в RScript 4.15f использует настоящий CLI; 4.10f запускается только как legacy-бэкенд на изолированном невидимом desktop. Исходный SCR не изменяется, а RSON публикуется лишь после цикла `SCR → RSON → SCR`.
 - Сбой импорта непустого Lang.dat не скрывается: JSON содержит структурированную диагностику, а восстановление без диалогов выполняется только по явному `--fallback-without-lang`.
 - Машинные отчёты декомпиляции, сравнения и совместимости persistent-хранилища имеют схемы `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1` и `srhd-modkit-storage-compat-v1`.
 - Непроверенное восстановление удаляется; сохранить его можно только по отдельному явному пути `--keep-unverified`. `--deep-roundtrip` дополнительно проверяет стабильность числа объектов, связей, строк кода и типов после второго восстановления.
@@ -224,13 +237,14 @@ $srhd-modkit
 python -B -m unittest discover -s tests -v
 ```
 
-Текущий набор из 266 тестов проверяет нативные PNG/GI, лексический preflight,
+Текущий набор из 281 теста проверяет нативные PNG/GI, лексический preflight,
 прогресс-зависимые таймауты, fail-closed декомпиляцию, глубокий round-trip,
-сравнение SCR и завершение скрытого дерева процессов при обрыве агента, а также
+RScript 4.10f/4.15f, RSM/rsmc, BlockPar 2.1 и завершение скрытого дерева
+процессов при обрыве агента, а также
 QM/QMM reader/writer, формулы квестов и JSON-цикл. На локальном корпусе глубоко проверено 3098 из 3131
 GI; оставшиеся 33 корректно классифицированы как `unsupported`. Дополнительно
-dev-аудит был выполнен на 421 установленном моде без падений валидаторов.
-Он выполнил 3790 проверок и распознал 48 QM/QMM.
+dev-аудит был выполнен на 425 установленных модах без падений валидаторов.
+В корпусе распознано 48 QM/QMM.
 
 ## Авторство
 

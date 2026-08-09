@@ -13,6 +13,7 @@ from .formats import format_catalog, inspect_file, scan_formats
 from .modcfg import parse_modcfg, validate_modcfg
 from .module_info import find_module_info, parse_module_info
 from .toolchain import (
+    RsmBuildFailure,
     ScriptBuildFailure,
     Toolchain,
     inspect_rscript_lang_fragment,
@@ -1681,7 +1682,8 @@ def _game_text_lint_target(
                         lint_game_text(
                             decoded,
                             path,
-                            require_cp1251=True,
+                            require_cp1251=path.suffix.casefold() != ".dat",
+                            require_cp1251_representable=path.suffix.casefold() == ".dat",
                             check_display_compatibility=False,
                         )
                     )
@@ -1837,6 +1839,129 @@ def cmd_script_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_script_export_rsm(args: argparse.Namespace) -> int:
+    result = Toolchain(args.tools_root).export_rsm(
+        args.source,
+        args.output,
+        split=args.split,
+        overwrite=args.overwrite,
+        timeout=args.timeout,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"RSM экспортирован: {result['destination']}")
+        print(f"ScriptName: {result['script_name']}")
+        print(f"Модулей: {len(result['modules'])}")
+        print(f"RScript: {result['compiler']['version']}")
+    return 0
+
+
+def cmd_script_validate_rsm(args: argparse.Namespace) -> int:
+    result = Toolchain(args.tools_root).validate_rsm(
+        args.source,
+        lang_base=args.lang_base,
+        timeout=args.timeout,
+        deep_roundtrip=args.deep_roundtrip,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"RSM: {result.get('status')}; ScriptName={result.get('script_name')}")
+        print(f"Модулей: {len(result.get('modules', []))}")
+        print(f"Замечаний: {len(result.get('issues', []))}")
+        for issue in result.get("issues", []):
+            print(f"  {issue['severity'].upper()} {issue['code']}: {issue['message']}")
+    return 0 if result.get("verified") else 2
+
+
+def cmd_script_build_rsm(args: argparse.Namespace) -> int:
+    source = Path(args.source).resolve()
+    mod_root = _find_mod_root(source)
+    artifact_preflight: dict[str, Any] | None = None
+    text_preflight: dict[str, Any] | None = None
+    if mod_root is not None:
+        artifact_preflight = _script_artifact_lint_target(
+            mod_root,
+            tools_root=args.tools_root,
+            scripts=[Path(args.scr).resolve()],
+            check_dialog_language=False,
+        )
+        artifact_errors = [
+            issue for issue in artifact_preflight["issues"] if issue["severity"] == "error"
+        ]
+        if artifact_errors:
+            first = artifact_errors[0]
+            raise RsmBuildFailure(
+                first["message"],
+                {
+                    "schema": "srhd-modkit-rsm-build-v1",
+                    "status": "failed",
+                    "verified": False,
+                    "source": str(source),
+                    "compiler_output_created": False,
+                    "published_outputs": False,
+                    "failure": {
+                        "code": "rsm-build-artifact-preflight-failed",
+                        "message": first["message"],
+                    },
+                    "artifact_preflight": artifact_preflight,
+                },
+            )
+        text_preflight = _game_text_lint_target(mod_root, tools_root=args.tools_root)
+        text_errors = [issue for issue in text_preflight["issues"] if issue["severity"] == "error"]
+        if text_errors:
+            first = text_errors[0]
+            raise RsmBuildFailure(
+                first["message"],
+                {
+                    "schema": "srhd-modkit-rsm-build-v1",
+                    "status": "failed",
+                    "verified": False,
+                    "source": str(source),
+                    "compiler_output_created": False,
+                    "published_outputs": False,
+                    "failure": {
+                        "code": "rsm-build-text-preflight-failed",
+                        "message": first["message"],
+                    },
+                    "text_preflight": text_preflight,
+                },
+            )
+    try:
+        result = Toolchain(args.tools_root).build_rsm(
+            source,
+            args.scr,
+            lang_txt_output=args.lang_txt,
+            lang_dat_output=args.lang_dat,
+            lang_base=args.lang_base,
+            overwrite=args.overwrite,
+            timeout=args.timeout,
+            deep_roundtrip=args.deep_roundtrip,
+        )
+    except RsmBuildFailure as exc:
+        report = dict(exc.as_dict())
+        if artifact_preflight is not None:
+            report["artifact_preflight"] = artifact_preflight
+        if text_preflight is not None:
+            report["text_preflight"] = text_preflight
+        raise RsmBuildFailure(str(exc), report) from exc
+    if artifact_preflight is not None:
+        result["artifact_preflight"] = artifact_preflight
+        result["text_preflight"] = text_preflight
+    if args.json:
+        print_json(result)
+    else:
+        print(f"SCR: {result['scr']} ({human_size(result['scr_size'])})")
+        print(f"SHA-256: {result['scr_sha256']}")
+        print(f"Runtime-замечаний: {len(result['runtime_issues'])}")
+        if result["language"].get("txt"):
+            print(f"Lang.txt: {result['language']['txt']}")
+        if result["language"].get("dat"):
+            print(f"Lang.dat: {result['language']['dat']}")
+    return 0
+
+
 def cmd_script_convert(args: argparse.Namespace) -> int:
     result = Toolchain(args.tools_root).convert_script_project(
         args.source,
@@ -1920,7 +2045,7 @@ def cmd_script_inspect_scr(args: argparse.Namespace) -> int:
         print_json(result)
     else:
         print(f"SCR: {result['name']}; версия {result['version']}; размер {human_size(result['size'])}")
-        print(f"Версия поддерживается RScript 4.10f: {'да' if result['supported_version'] else 'НЕТ'}")
+        print(f"Версия SCR поддерживается ModKit/RScript: {'да' if result['supported_version'] else 'НЕТ'}")
         print(f"Найдено UTF-16 строк: {result['utf16_strings']}")
         for signature in result["event_signatures"]:
             print(f"События: {signature}")
@@ -2237,7 +2362,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_processes.add_argument(
         "--terminate",
         action="store_true",
-        help="Завершить только известные RScript/BlockParEditor/ResEditor на служебных desktop",
+        help="Завершить только известные RScript/rsmc/BlockParEditor/ResEditor на служебных desktop",
     )
     doctor_processes.add_argument("--json", action="store_true")
     doctor_processes.set_defaults(func=cmd_doctor_processes)
@@ -2499,6 +2624,57 @@ def build_parser() -> argparse.ArgumentParser:
     script_build.add_argument("--tools-root")
     script_build.add_argument("--json", action="store_true")
     script_build.set_defaults(func=cmd_script_build)
+
+    script_export_rsm = script_sub.add_parser(
+        "export-rsm",
+        help="Экспортировать RSON в модульный текстовый RSM через RScript 4.15f",
+    )
+    script_export_rsm.add_argument("source")
+    script_export_rsm.add_argument("output")
+    script_export_rsm.add_argument(
+        "--split",
+        action="store_true",
+        help="Опубликовать каталог main/vars/world/places/states/dialogs/code",
+    )
+    script_export_rsm.add_argument("--overwrite", action="store_true")
+    script_export_rsm.add_argument("--timeout", type=float)
+    script_export_rsm.add_argument("--tools-root")
+    script_export_rsm.add_argument("--json", action="store_true")
+    script_export_rsm.set_defaults(func=cmd_script_export_rsm)
+
+    script_validate_rsm = script_sub.add_parser(
+        "validate-rsm",
+        help="Проверить импорты RSM, собрать временный SCR и выполнить runtime/language-аудит",
+    )
+    script_validate_rsm.add_argument("source")
+    script_validate_rsm.add_argument(
+        "--lang-base",
+        help="Существующий Lang.txt/Lang.dat с узлом Script/<ScriptName> для проверки диалогов",
+    )
+    script_validate_rsm.add_argument("--timeout", type=float)
+    script_validate_rsm.add_argument("--deep-roundtrip", action="store_true")
+    script_validate_rsm.add_argument("--tools-root")
+    script_validate_rsm.add_argument("--json", action="store_true")
+    script_validate_rsm.set_defaults(func=cmd_script_validate_rsm)
+
+    script_build_rsm = script_sub.add_parser(
+        "build-rsm",
+        help="Собрать RSM в SCR через rsmc и опубликовать только после полного аудита",
+    )
+    script_build_rsm.add_argument("source")
+    script_build_rsm.add_argument("--scr", required=True)
+    script_build_rsm.add_argument("--lang-txt", help="Опциональный полный Lang.txt для слияния")
+    script_build_rsm.add_argument("--lang-dat", help="Опциональный игровой Lang.dat для слияния")
+    script_build_rsm.add_argument(
+        "--lang-base",
+        help="База Lang.txt/Lang.dat; без неё ModKit заранее создаёт минимальный Script/<ScriptName>",
+    )
+    script_build_rsm.add_argument("--overwrite", action="store_true")
+    script_build_rsm.add_argument("--timeout", type=float)
+    script_build_rsm.add_argument("--deep-roundtrip", action="store_true")
+    script_build_rsm.add_argument("--tools-root")
+    script_build_rsm.add_argument("--json", action="store_true")
+    script_build_rsm.set_defaults(func=cmd_script_build_rsm)
 
     script_convert = script_sub.add_parser("convert", help="Преобразовать проект RSON <-> SVR без GUI")
     script_convert.add_argument("source")

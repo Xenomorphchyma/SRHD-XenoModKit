@@ -22,6 +22,7 @@ from srhd_modkit.toolchain import (
 )
 from srhd_modkit.runtime_lint import RuntimeIssue
 from srhd_modkit.hidden_process import HiddenProcessTimeout
+from srhd_modkit.executable_version import ExecutableVersion
 
 
 PROJECT = {
@@ -47,6 +48,129 @@ PROJECT = {
 
 
 class ToolchainWorkflowTests(unittest.TestCase):
+    def test_rscript_cli_arguments_follow_detected_version(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            rscript = root / "RScript" / "RScript.exe"
+            rscript.parent.mkdir()
+            rscript.write_bytes(b"fixture")
+            source = root / "source.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+
+            def compile_for(version: ExecutableVersion) -> list[str]:
+                chain = Toolchain(root)
+                chain.rscript_version = version
+                captured: list[str] = []
+
+                def fake_run(_application, arguments, **kwargs):
+                    captured.extend(arguments)
+                    outputs = [Path(value) for value in kwargs["expected_outputs"]]
+                    outputs[0].write_bytes((8).to_bytes(4, "little") + b"compiled")
+                    outputs[1].write_bytes(b"\xff\xfe")
+                    return SimpleNamespace(
+                        exit_code=0,
+                        forced_after_outputs=False,
+                        elapsed_seconds=0.01,
+                        queue_seconds=0.0,
+                        progress_updates=1,
+                        last_progress_seconds=0.01,
+                    )
+
+                with patch("srhd_modkit.toolchain.run_on_hidden_desktop", side_effect=fake_run):
+                    chain._compile_rson_with_rscript(
+                        source,
+                        root / f"{version.minor}.scr",
+                        root / f"{version.minor}.txt",
+                    )
+                return captured
+
+            legacy = compile_for(ExecutableVersion(4, 10))
+            modern = compile_for(ExecutableVersion(4, 15))
+
+            self.assertEqual(legacy[0:3], ["--cli", "--build", "--full"])
+            self.assertEqual(modern[0:2], ["--cli", "-b"])
+            self.assertEqual(modern[-1], "--full")
+
+    def test_rscript_415_decompile_uses_true_cli_without_gui_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            rscript = root / "RScript" / "RScript.exe"
+            rscript.parent.mkdir()
+            rscript.write_bytes(b"fixture")
+            source = root / "source.scr"
+            source.write_bytes((8).to_bytes(4, "little") + b"source")
+            recovered = root / "recovered.rson"
+            chain = Toolchain(root)
+            chain.rscript_version = ExecutableVersion(4, 15)
+            captured: dict[str, object] = {}
+
+            def fake_run(_application, arguments, **kwargs):
+                captured["arguments"] = list(arguments)
+                captured["control_actions"] = kwargs.get("control_actions")
+                recovered.write_text(json.dumps(PROJECT), encoding="utf-8")
+                return SimpleNamespace(exit_code=0, forced_after_outputs=False, elapsed_seconds=0.01)
+
+            with patch("srhd_modkit.toolchain.run_on_hidden_desktop", side_effect=fake_run):
+                _process, policy = chain._recover_scr_with_rscript(
+                    source,
+                    recovered,
+                    lang_dat=None,
+                    timeout=30,
+                )
+
+            self.assertEqual(captured["arguments"][0:2], ["--cli", "-d"])
+            self.assertIsNone(captured["control_actions"])
+            self.assertEqual(policy["backend"], "modern-cli")
+
+    def test_blockpar_21_uses_vendor_executable_without_legacy_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            executable = root / "BlockParEditor" / "BlockParEditor.exe"
+            executable.parent.mkdir()
+            executable.write_bytes(b"fixture")
+
+            def version_for(path):
+                return ExecutableVersion(2, 1) if Path(path).name == "BlockParEditor.exe" else None
+
+            with patch(
+                "srhd_modkit.toolchain.detect_executable_version",
+                side_effect=version_for,
+            ), patch("srhd_modkit.toolchain.ensure_legacy_codepage_executable") as legacy:
+                chain = Toolchain(root)
+
+            self.assertEqual(chain.tools["blockpar"].path, executable.resolve())
+            self.assertEqual(chain.tools["blockpar"].version, "2.1")
+            legacy.assert_not_called()
+
+    def test_blockpar_19_uses_cp1251_compatibility_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            executable = root / "BlockParEditor" / "BlockParEditor.exe"
+            executable.parent.mkdir()
+            executable.write_bytes(b"fixture")
+            compatibility = executable.with_name("BlockParEditor.Legacy.exe")
+
+            def fake_legacy(_source, destination):
+                Path(destination).write_bytes(b"legacy-fixture")
+
+            with patch(
+                "srhd_modkit.toolchain.detect_executable_version",
+                side_effect=lambda path: (
+                    ExecutableVersion(1, 9)
+                    if Path(path).name == "BlockParEditor.exe"
+                    else None
+                ),
+            ), patch(
+                "srhd_modkit.toolchain.ensure_legacy_codepage_executable",
+                side_effect=fake_legacy,
+            ) as legacy:
+                chain = Toolchain(root)
+
+            legacy.assert_called_once_with(executable.resolve(), compatibility.resolve())
+            self.assertEqual(chain.tools["blockpar"].path, compatibility.resolve())
+            self.assertEqual(chain.tools["blockpar"].version, "1.9")
+            self.assertEqual(chain.tools["blockpar"].compatibility, "legacy-cp1251")
+
     def test_compile_blocks_incomplete_tgroup_before_rscript(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -306,6 +430,7 @@ class ToolchainWorkflowTests(unittest.TestCase):
             rscript.parent.mkdir()
             rscript.write_bytes(b"fixture")
             chain = Toolchain(root)
+            chain.rscript_version = ExecutableVersion(4, 10)
             timeout = HiddenProcessTimeout(
                 "Процесс не показал подтверждённого прогресса; "
                 "скрытое окно: RScript 4.10f; RScript; OK; Build; "

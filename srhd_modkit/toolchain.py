@@ -31,8 +31,13 @@ from .runtime_lint import (
     dialog_semantic_map,
     lint_rson_runtime,
 )
-from .hidden_process import HiddenControlAction, run_on_hidden_desktop
+from .script_artifacts import lint_script_dialog_language
+from .game_text import lint_blockpar_display_text, lint_game_text
+from .textio import read_text
+from .rsm import RsmProject, inspect_rsm_project
+from .hidden_process import HiddenControlAction, HiddenProcessTimeout, run_on_hidden_desktop
 from .legacy_manifest import ensure_legacy_codepage_executable
+from .executable_version import ExecutableVersion, detect_executable_version
 
 
 EMPTY_RSCRIPT_LANG_DAT = b"\xff\xfe"
@@ -207,6 +212,17 @@ def _rscript_failure_diagnostic(
 
 class ScriptBuildFailure(ValueError):
     """Machine-readable failure from the headless RScript build workflow."""
+
+    def __init__(self, message: str, report: dict[str, Any]):
+        super().__init__(message)
+        self.report = report
+
+    def as_dict(self) -> dict[str, Any]:
+        return self.report
+
+
+class RsmBuildFailure(ValueError):
+    """Machine-readable failure from the standalone rsmc workflow."""
 
     def __init__(self, message: str, report: dict[str, Any]):
         super().__init__(message)
@@ -439,12 +455,35 @@ def _project_script_language_keys(project: Any, script_name: str) -> set[str]:
     return result
 
 
+def _blockpar_inline_comment_risk(document: BlockParDocument) -> tuple[str, str] | None:
+    """Return the first value that BlockParEditor would truncate at ``//``."""
+
+    def walk(node: BlockParNode, prefix: str) -> tuple[str, str] | None:
+        location = f"{prefix}/{node.name}" if prefix else node.name
+        for parameter in node.parameters:
+            if "//" in parameter.value:
+                return f"{location}/{parameter.key}", parameter.value
+        for child in node.children:
+            found = walk(child, location)
+            if found is not None:
+                return found
+        return None
+
+    for root in document.roots:
+        found = walk(root, "")
+        if found is not None:
+            return found
+    return None
+
+
 @dataclass(frozen=True)
 class Tool:
     name: str
     path: Path
     purpose: str
     automatic: bool
+    version: str | None = None
+    compatibility: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -492,14 +531,45 @@ class Toolchain:
         blockpar_root = self.tools_root / "BlockParEditor"
         blockpar_original = blockpar_root / "BlockParEditor.exe"
         blockpar_codec = blockpar_root / "BlockParEditor.Legacy.exe"
-        if blockpar_original.is_file():
+        self.blockpar_version = detect_executable_version(blockpar_original)
+        if blockpar_original.is_file() and not (
+            self.blockpar_version is not None
+            and self.blockpar_version.at_least(2, 0)
+        ):
             ensure_legacy_codepage_executable(blockpar_original, blockpar_codec)
+        blockpar_path = (
+            blockpar_original
+            if self.blockpar_version is not None
+            and self.blockpar_version.at_least(2, 0)
+            else blockpar_codec
+        )
+        rscript_path = self.tools_root / "RScript" / "RScript.exe"
+        self.rscript_version = detect_executable_version(rscript_path)
+        rscript410_path = self.tools_root / "RScript410" / "RScript.exe"
+        self.rscript410_version = detect_executable_version(rscript410_path)
+        rscript_label = self._rscript_version_label()
+        blockpar_label = self._blockpar_version_label()
         self.tools = {
             "blockpar": Tool(
                 "blockpar",
-                blockpar_codec,
-                "DAT/BlockPar 1.9 без GUI с локальной CP1251-совместимостью",
+                blockpar_path,
+                (
+                    f"DAT/BlockPar {blockpar_label} без GUI"
+                    + (
+                        " с нативной Unicode-поддержкой"
+                        if self.blockpar_version is not None
+                        and self.blockpar_version.at_least(2, 0)
+                        else " с локальной CP1251-совместимостью"
+                    )
+                ),
                 True,
+                blockpar_label,
+                (
+                    "native-unicode"
+                    if self.blockpar_version is not None
+                    and self.blockpar_version.at_least(2, 0)
+                    else "legacy-cp1251"
+                ),
             ),
             "reseditor": Tool(
                 "reseditor",
@@ -509,9 +579,34 @@ class Toolchain:
             ),
             "rscript": Tool(
                 "rscript",
-                self.tools_root / "RScript" / "RScript.exe",
-                "Headless-проверка, декомпиляция, конвертация и компиляция RSON/SVR/SCR 4.10f",
+                rscript_path,
+                (
+                    "Headless-проверка, декомпиляция и компиляция "
+                    f"RSON/SCR через RScript {rscript_label}"
+                ),
                 True,
+                rscript_label,
+                self._rscript_cli_profile(),
+            ),
+            "rsmc": Tool(
+                "rsmc",
+                self.tools_root / "RSMCompiler" / "rsmc.exe",
+                "Консольная сборка модульных RSM-проектов в SCR",
+                True,
+                None,
+                "rsm-build",
+            ),
+            "rscript410": Tool(
+                "rscript410",
+                rscript410_path,
+                "Необязательный legacy-конвертер RSON/SVR через RScript 4.10f",
+                True,
+                (
+                    f"{self.rscript410_version.major}.{self.rscript410_version.minor}f"
+                    if self.rscript410_version is not None
+                    else None
+                ),
+                "legacy-svr-convert",
             ),
             "shipviewer": Tool(
                 "shipviewer",
@@ -699,25 +794,49 @@ class Toolchain:
         tool = self.require("blockpar")
 
         source_document = load_blockpar(source) if source.suffix.casefold() == ".txt" else None
+        if source_document is not None:
+            inline_comment = _blockpar_inline_comment_risk(source_document)
+            if inline_comment is not None:
+                location, value = inline_comment
+                raise ValueError(
+                    "blockpar-inline-comment-truncation-risk: BlockParEditor 1.9/2.1 "
+                    "считает // началом комментария и обрежет значение при TXT -> DAT; "
+                    f"{location}={value!r}"
+                )
         with tempfile.TemporaryDirectory(prefix=".srhd-dat-", dir=destination.parent) as temp_name:
             temp = Path(temp_name)
             staged_source = temp / source.name
             staged_destination = temp / destination.name
             if source_document is not None:
-                # The VB6 frontend corrupts Unicode on systems whose global ACP
-                # is UTF-8. The private codec process is explicitly CP1251, which
-                # also matches the byte payload consumed by the game. Feeding it
-                # UTF-8 can round-trip through the editor while producing mojibake
-                # in SRHD, so unrepresentable Unicode must fail before conversion.
+                # BlockPar 2.1 is Unicode-native and must receive Unicode text;
+                # feeding it the legacy CP1251 transport changes Russian values.
+                # BlockPar 1.9 remains on the isolated CP1251 compatibility EXE.
+                # In both cases the game-facing payload is still limited to
+                # Windows-1251, so reject unrepresentable glyphs first.
+                transport_encoding = (
+                    "utf-8"
+                    if self.blockpar_version is not None
+                    and self.blockpar_version.at_least(2, 0)
+                    else "cp1251"
+                )
+                game_text = source_document.to_text(include_raw=False)
+                try:
+                    game_text.encode("cp1251")
+                except UnicodeEncodeError as exc:
+                    bad = game_text[exc.start : max(exc.end, exc.start + 1)]
+                    raise ValueError(
+                        "BlockPar-текст нельзя передать игре как Windows-1251: "
+                        f"{bad!r} (U+{ord(bad[0]):04X})"
+                    ) from exc
                 try:
                     source_document.save(
                         staged_source,
-                        encoding="cp1251",
+                        encoding=transport_encoding,
                         include_raw=False,
                         bom=False,
                     )
                 except UnicodeEncodeError as exc:
-                    bad = source_document.to_text(include_raw=False)[exc.start : max(exc.end, exc.start + 1)]
+                    bad = game_text[exc.start : max(exc.end, exc.start + 1)]
                     raise ValueError(
                         "BlockPar-текст нельзя передать игре как Windows-1251: "
                         f"{bad!r} (U+{ord(bad[0]):04X})"
@@ -777,7 +896,7 @@ class Toolchain:
     ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
         """Run the RScript compiler after callers perform their own policy checks."""
 
-        tool = self.require("rscript")
+        tool, cli_profile = self._require_supported_rscript("compile")
         timeout_seconds, timeout_policy = _rscript_timeout_policy(source, "compile", timeout)
         scr_output.parent.mkdir(parents=True, exist_ok=True)
         lang_output.parent.mkdir(parents=True, exist_ok=True)
@@ -791,16 +910,28 @@ class Toolchain:
             process_result = None
             compiler_started = time.monotonic()
             try:
-                process_result = run_on_hidden_desktop(
-                    tool.path,
+                arguments = (
                     [
+                        "--cli",
+                        "-b",
+                        str(staged_source),
+                        str(staged_scr),
+                        str(staged_lang),
+                        "--full",
+                    ]
+                    if cli_profile == "modern-cli"
+                    else [
                         "--cli",
                         "--build",
                         "--full",
                         str(staged_source),
                         str(staged_scr),
                         str(staged_lang),
-                    ],
+                    ]
+                )
+                process_result = run_on_hidden_desktop(
+                    tool.path,
+                    arguments,
                     cwd=tool.path.parent,
                     timeout=timeout_seconds,
                     expected_outputs=[staged_scr, staged_lang],
@@ -864,7 +995,8 @@ class Toolchain:
                     "published_outputs": False,
                     "compiler": {
                         "name": "RScript",
-                        "version": "4.10f",
+                        "version": self._rscript_version_label(),
+                        "cli_profile": cli_profile,
                         "executable": str(tool.path),
                         "exit_code": (
                             getattr(process_result, "exit_code", None)
@@ -1089,6 +1221,45 @@ class Toolchain:
             ),
         }
 
+    def _rscript_version_label(self) -> str:
+        if self.rscript_version is None:
+            return "неизвестной версии"
+        return f"{self.rscript_version.major}.{self.rscript_version.minor}f"
+
+    def _blockpar_version_label(self) -> str:
+        if self.blockpar_version is None:
+            return "неизвестной версии"
+        return self.blockpar_version.dotted(components=2)
+
+    def _rscript_cli_profile(self) -> str:
+        version = self.rscript_version
+        if version is None:
+            return "undetected-cli"
+        if version.parts[:2] == (4, 15):
+            return "modern-cli"
+        if version.parts[:2] == (4, 10):
+            return "legacy-cli"
+        return "unsupported-cli"
+
+    def _require_supported_rscript(self, operation: str) -> tuple[Tool, str]:
+        tool = self.require("rscript")
+        profile = self._rscript_cli_profile()
+        if profile in {"unsupported-cli", "undetected-cli"}:
+            raise RuntimeError(
+                f"RScript {self._rscript_version_label()} не входит в проверенную "
+                "матрицу CLI. Поддерживаются точно 4.10f и 4.15f. "
+                "Установите штатную 4.15f либо сохраните 4.10f."
+            )
+        if operation in {"export-rsm", "cli-decompile"} and profile not in {
+            "modern-cli",
+        }:
+            raise RuntimeError(
+                f"Операция {operation} требует RScript 4.15f; обнаружен "
+                f"{self._rscript_version_label()}. RScript 4.10f остаётся "
+                "поддержан для RSON/SCR-сборки и legacy-декомпиляции."
+            )
+        return tool, profile
+
     def compile_rson(
         self,
         source: str | Path,
@@ -1241,6 +1412,12 @@ class Toolchain:
                 "game_dat": game_lang,
                 "warnings": language_warnings,
             },
+            "compiler": {
+                "name": "RScript",
+                "version": self._rscript_version_label(),
+                "cli_profile": self._rscript_cli_profile(),
+                "executable": str(self.tools["rscript"].path),
+            },
             "compiler_exit_code": process_result.exit_code,
             "preflight_passed": True,
             "compiler_started": True,
@@ -1268,13 +1445,41 @@ class Toolchain:
         lang_dat: Path | None,
         timeout: float | None,
     ) -> tuple[Any, dict[str, Any]]:
-        """Automate RScript's hidden decompiler and always remove its staged SCR."""
+        """Recover RSON through the version-appropriate headless backend."""
 
-        tool = self.require("rscript")
+        tool, cli_profile = self._require_supported_rscript("decompile")
         timeout_seconds, timeout_policy = _rscript_timeout_policy(source, "decompile", timeout)
+        timeout_policy = {**timeout_policy, "backend": cli_profile}
+        recovered.parent.mkdir(parents=True, exist_ok=True)
+        if cli_profile == "modern-cli":
+            arguments = ["--cli", "-d", str(source), str(recovered)]
+            if lang_dat is not None:
+                arguments.extend(["--langdat", str(lang_dat)])
+            process_result = run_on_hidden_desktop(
+                tool.path,
+                arguments,
+                cwd=tool.path.parent,
+                expected_outputs=[recovered],
+                timeout=timeout_seconds,
+                progress_timeout=timeout_policy["progress_seconds"],
+                abort_window_patterns=(
+                    "Run-time error",
+                    "Runtime error",
+                    "Application Error",
+                    "Access violation",
+                    "Error",
+                    "Ошибка",
+                ),
+            )
+            if not recovered.is_file():
+                raise RuntimeError(
+                    "RScript modern CLI не создал восстановленный RSON "
+                    f"(код {process_result.exit_code})"
+                )
+            return process_result, timeout_policy
+
         stem = f"_srhd_{uuid.uuid4().hex}"
         staged_scr = tool.path.parent / f"{stem}.scr"
-        recovered.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(source, staged_scr)
             control_actions: list[HiddenControlAction] = []
@@ -1394,7 +1599,10 @@ class Toolchain:
                 lang_dat_skip_reason = "empty-rscript-lang-dat"
         source_info = inspect_scr(source)
         if not source_info["supported_version"]:
-            raise ValueError(f"RScript 4.10f не поддерживает SCR версии {source_info['version']}")
+            raise ValueError(
+                f"RScript {self._rscript_version_label()} не поддерживает "
+                f"SCR версии {source_info['version']}"
+            )
 
         destination.parent.mkdir(parents=True, exist_ok=True)
         stale_transactions_removed = _cleanup_stale_decompile_transactions(destination.parent)
@@ -1456,6 +1664,12 @@ class Toolchain:
                 "unverified_path": kept,
                 "source_sha256": sha256_file(source),
                 "source_version": source_info["version"],
+                "decompiler": {
+                    "name": "RScript",
+                    "version": self._rscript_version_label(),
+                    "cli_profile": self._rscript_cli_profile(),
+                    "executable": str(self.tools["rscript"].path),
+                },
                 "lang_dat": str(requested_lang) if requested_lang is not None else None,
                 "dialogs_imported": dialogs_imported,
                 "lang_dat_skip_reason": lang_dat_skip_reason,
@@ -1748,6 +1962,12 @@ class Toolchain:
             "source_sha256": sha256_file(source),
             "destination_sha256": sha256_file(destination),
             "source_version": source_info["version"],
+            "decompiler": {
+                "name": "RScript",
+                "version": self._rscript_version_label(),
+                "cli_profile": self._rscript_cli_profile(),
+                "executable": str(self.tools["rscript"].path),
+            },
             "lang_dat": str(requested_lang) if requested_lang is not None else None,
             "dialogs_imported": dialogs_imported,
             "lang_dat_skip_reason": lang_dat_skip_reason,
@@ -2010,6 +2230,529 @@ class Toolchain:
                 },
             }
 
+    def export_rsm(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        split: bool = False,
+        overwrite: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Export a validated RSON project through RScript 4.15f's CLI."""
+
+        source = Path(source).resolve()
+        destination = Path(destination).resolve()
+        if source.suffix.casefold() != ".rson" or not source.is_file():
+            raise ValueError("Экспорт в RSM принимает существующий файл .rson")
+        errors = [issue for issue in load_rson(source).validate() if issue.severity == "error"]
+        if errors:
+            raise ValueError(f"RSON не прошёл проверку: {errors[0].message}")
+        if not split and destination.suffix.casefold() != ".rsm":
+            raise ValueError("Одиночный RSM должен иметь расширение .rsm")
+        if destination.exists() and not overwrite:
+            raise FileExistsError(f"Результат уже существует: {destination}")
+        tool, _profile = self._require_supported_rscript("export-rsm")
+        timeout_seconds, timeout_policy = _rscript_timeout_policy(source, "export-rsm", timeout)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".srhd-rsm-export-", dir=destination.parent
+        ) as temp_name:
+            temp = Path(temp_name)
+            staged_argument = temp / "project.rsm"
+            arguments = ["--cli", "-x", str(source), str(staged_argument)]
+            if split:
+                arguments.append("--split")
+            expected = [] if split else [staged_argument]
+            process = run_on_hidden_desktop(
+                tool.path,
+                arguments,
+                cwd=tool.path.parent,
+                expected_outputs=expected,
+                timeout=timeout_seconds,
+                progress_timeout=timeout_policy["progress_seconds"],
+                abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
+            )
+            generated = staged_argument.with_suffix("") if split else staged_argument
+            entry = generated / "main.rsm" if split else generated
+            if process.exit_code != 0 or not entry.is_file():
+                raise RuntimeError(
+                    "RScript 4.15f не создал RSM "
+                    f"(код {process.exit_code}; ожидался {entry})"
+                )
+            project = inspect_rsm_project(entry)
+            if not project.valid:
+                first = next(issue for issue in project.issues if issue.severity == "error")
+                raise RuntimeError(f"Экспортированный RSM не прошёл проверку: {first.message}")
+            if split:
+                backup = destination.parent / f".srhd-rsm-backup-{uuid.uuid4().hex}"
+                had_destination = destination.exists()
+                if had_destination:
+                    os.replace(destination, backup)
+                try:
+                    os.replace(generated, destination)
+                except Exception:
+                    if had_destination and backup.exists() and not destination.exists():
+                        os.replace(backup, destination)
+                    raise
+                finally:
+                    if backup.exists():
+                        shutil.rmtree(backup, ignore_errors=True)
+                published_entry = destination / "main.rsm"
+            else:
+                _replace_cross_device_safe(generated, destination)
+                published_entry = destination
+        published = inspect_rsm_project(published_entry)
+        return {
+            "schema": "srhd-modkit-rsm-export-v1",
+            "status": "passed",
+            "source": str(source),
+            "destination": str(destination),
+            "split": split,
+            "script_name": published.script_name,
+            "modules": [module.as_dict() for module in published.modules],
+            "source_sha256": sha256_file(source),
+            "compiler": {
+                "name": "RScript",
+                "version": self._rscript_version_label(),
+                "cli_profile": self._rscript_cli_profile(),
+                "executable": str(tool.path),
+                "exit_code": process.exit_code,
+            },
+            "timeout": timeout_policy,
+        }
+
+    def _rsm_language_document(
+        self,
+        script_name: str,
+        base: Path | None,
+        workspace: Path,
+        label: str,
+    ) -> BlockParDocument:
+        if base is None:
+            document = parse_blockpar("Script ^{\n}\n", encoding="utf-8")
+        elif base.suffix.casefold() == ".txt":
+            document = load_blockpar(base)
+        elif base.suffix.casefold() == ".dat":
+            decoded = workspace / f"{label}.base.txt"
+            self.convert_dat(base, decoded)
+            document = load_blockpar(decoded)
+        else:
+            raise ValueError("Языковая база RSM должна быть Lang.txt или Lang.dat")
+        document.ensure_node(f"Script/{script_name}")
+        return document
+
+    def _prepare_rsm_language_target(
+        self,
+        script_name: str,
+        target: Path,
+        *,
+        base: Path | None,
+        workspace: Path,
+        binary: bool,
+        label: str,
+    ) -> None:
+        document = self._rsm_language_document(script_name, base, workspace, label)
+        seed = workspace / f"{label}.seed.txt"
+        document.save(seed, encoding="utf-8", include_raw=False, bom=False)
+        if binary:
+            self.convert_dat(seed, target, verify=True)
+        else:
+            shutil.copy2(seed, target)
+
+    def _audit_rsm_language(
+        self,
+        project: Any,
+        script_name: str,
+        *,
+        lang_txt: Path | None,
+        lang_dat: Path | None,
+        workspace: Path,
+    ) -> tuple[list[dict[str, Any]], Path | None, dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        documents: list[tuple[str, BlockParDocument]] = []
+        audit_lang_dat: Path | None = None
+        txt_document: BlockParDocument | None = None
+        dat_document: BlockParDocument | None = None
+
+        if lang_txt is not None:
+            txt_document = load_blockpar(lang_txt)
+            documents.append((str(workspace / "CFG" / "Rus" / "Lang.dat"), txt_document))
+            for issue in lint_game_text(
+                read_text(lang_txt),
+                lang_txt,
+                require_cp1251_representable=True,
+            ):
+                issues.append(issue.as_dict())
+            issues.extend(issue.as_dict() for issue in lint_blockpar_display_text(txt_document, lang_txt))
+            audit_lang_dat = workspace / "lang-audit" / "Lang.dat"
+            audit_lang_dat.parent.mkdir(parents=True, exist_ok=True)
+            self.convert_dat(lang_txt, audit_lang_dat, verify=True)
+
+        if lang_dat is not None:
+            decoded = workspace / "lang-dat.decoded.txt"
+            self.convert_dat(lang_dat, decoded)
+            dat_document = load_blockpar(decoded)
+            documents.append((str(workspace / "CFG" / "Rus" / "Lang.dat"), dat_document))
+            for issue in lint_game_text(
+                read_text(decoded),
+                lang_dat,
+                require_cp1251_representable=True,
+            ):
+                issues.append(issue.as_dict())
+            issues.extend(issue.as_dict() for issue in lint_blockpar_display_text(dat_document, lang_dat))
+            semantic_probe = workspace / "lang-dat-roundtrip" / "Lang.dat"
+            semantic_probe.parent.mkdir(parents=True, exist_ok=True)
+            self.convert_dat(decoded, semantic_probe, verify=True)
+            audit_lang_dat = lang_dat
+
+        if txt_document is not None and dat_document is not None:
+            if txt_document.canonical_semantic() != dat_document.canonical_semantic():
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "rsm-language-outputs-mismatch",
+                        "message": "Lang.txt и Lang.dat после rsmc содержат разные деревья BlockPar",
+                        "path": str(lang_dat),
+                        "location": f"Script/{script_name}",
+                        "evidence": str(lang_txt),
+                    }
+                )
+
+        selected = documents[:1]
+        issues.extend(
+            issue.as_dict()
+            for issue in lint_script_dialog_language(
+                [project],
+                selected,
+                checked_scripts=[script_name],
+            )
+        )
+        return issues, audit_lang_dat, {
+            "txt": str(lang_txt) if lang_txt is not None else None,
+            "dat": str(lang_dat) if lang_dat is not None else None,
+            "documents": len(documents),
+        }
+
+    def _compile_and_audit_rsm(
+        self,
+        project: RsmProject,
+        workspace: Path,
+        *,
+        lang_txt: Path | None,
+        lang_dat: Path | None,
+        timeout: float | None,
+        deep_roundtrip: bool,
+    ) -> dict[str, Any]:
+        rsmc = self.require("rsmc")
+        staged_scr = workspace / "compiled.scr"
+        arguments = ["build", str(project.entry), "-o", str(staged_scr)]
+        if lang_txt is not None:
+            arguments.extend(["--lang-txt", str(lang_txt)])
+        if lang_dat is not None:
+            arguments.extend(["--lang-dat", str(lang_dat)])
+        timeout_seconds, timeout_policy = _rscript_timeout_policy(
+            project.entry, "rsm-build", timeout
+        )
+        try:
+            process = run_on_hidden_desktop(
+                rsmc.path,
+                arguments,
+                cwd=project.entry.parent,
+                expected_outputs=[staged_scr],
+                timeout=timeout_seconds,
+                progress_timeout=timeout_policy["progress_seconds"],
+                abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
+                no_console=True,
+            )
+        except HiddenProcessTimeout as exc:
+            report = {
+                "schema": "srhd-modkit-rsm-build-v1",
+                "status": "failed",
+                "verified": False,
+                "source": str(project.entry),
+                "script_name": project.script_name,
+                "compiler_output_created": staged_scr.is_file(),
+                "published_outputs": False,
+                "failure": {
+                    "code": "rsmc-build-timeout",
+                    "message": str(exc),
+                    "diagnostic": exc.as_dict(),
+                },
+                "compiler": {
+                    "name": "rsmc",
+                    "executable": str(rsmc.path),
+                    "executable_sha256": sha256_file(rsmc.path),
+                    "exit_code": exc.exit_code,
+                },
+                "timeout": timeout_policy,
+            }
+            raise RsmBuildFailure(str(exc), report) from exc
+        if process.exit_code != 0 or not staged_scr.is_file():
+            code = (
+                "rsmc-language-merge-failed"
+                if staged_scr.is_file() and (lang_txt is not None or lang_dat is not None)
+                else "rsmc-build-failed"
+            )
+            report = {
+                "schema": "srhd-modkit-rsm-build-v1",
+                "status": "failed",
+                "verified": False,
+                "source": str(project.entry),
+                "script_name": project.script_name,
+                "compiler_output_created": staged_scr.is_file(),
+                "published_outputs": False,
+                "failure": {
+                    "code": code,
+                    "message": (
+                        "rsmc завершился с ошибкой после создания SCR; обычно это "
+                        "означает, что языковой файл не существовал заранее или "
+                        "не содержал Script/<ScriptName>"
+                        if code == "rsmc-language-merge-failed"
+                        else "rsmc не создал SCR"
+                    ),
+                },
+                "compiler": {
+                    "name": "rsmc",
+                    "executable": str(rsmc.path),
+                    "executable_sha256": sha256_file(rsmc.path),
+                    "exit_code": process.exit_code,
+                },
+                "timeout": timeout_policy,
+            }
+            raise RsmBuildFailure(report["failure"]["message"], report)
+
+        scr_info = inspect_scr(staged_scr)
+        if not scr_info["supported_version"]:
+            raise RsmBuildFailure(
+                "rsmc создал неподдерживаемую версию SCR",
+                {
+                    "schema": "srhd-modkit-rsm-build-v1",
+                    "status": "failed",
+                    "verified": False,
+                    "source": str(project.entry),
+                    "compiler_output_created": True,
+                    "published_outputs": False,
+                    "failure": {
+                        "code": "rsmc-scr-version",
+                        "message": f"Неподдерживаемая версия SCR {scr_info['version']}",
+                    },
+                },
+            )
+
+        language_issues: list[dict[str, Any]] = []
+        audit_lang_dat: Path | None = None
+        language_report: dict[str, Any] = {"txt": None, "dat": None, "documents": 0}
+        recovered = workspace / "recovered.rson"
+        # Recover code without importing language. RScript 4.15f can raise
+        # EInOutError 105 while importing an otherwise valid merged Lang.dat.
+        # The exact packaged BlockPar is audited immediately afterwards against
+        # the recovered graph, so no dialogue key is trusted or skipped.
+        decompile = self.decompile_scr(
+            staged_scr,
+            recovered,
+            deep_roundtrip=deep_roundtrip,
+        )
+        if decompile.get("verified"):
+            recovered_project = load_rson(recovered)
+            language_issues, audit_lang_dat, language_report = self._audit_rsm_language(
+                recovered_project,
+                project.script_name or recovered_project.name,
+                lang_txt=lang_txt,
+                lang_dat=lang_dat,
+                workspace=workspace,
+            )
+        runtime_issues = list(decompile.get("runtime_issues", ()))
+        validation_issues = list(decompile.get("validation_issues", ()))
+        issues = [*project.as_dict()["issues"], *validation_issues, *runtime_issues, *language_issues]
+        errors = [issue for issue in issues if issue.get("severity") == "error"]
+        verified = bool(decompile.get("verified") and not errors)
+        failure: dict[str, Any] | None = None
+        if not decompile.get("verified"):
+            failure = {
+                "code": "rsm-postbuild-scr-audit-failed",
+                "message": "rsmc создал SCR, но обязательный SCR round-trip не прошёл",
+                "diagnostic": decompile.get("error"),
+            }
+        elif errors:
+            failure = {
+                "code": "rsm-postbuild-audit-issues",
+                "message": "SCR собран, но runtime/language-аудит обнаружил ошибки",
+                "issue_codes": sorted({issue.get("code") for issue in errors if issue.get("code")}),
+            }
+        return {
+            "schema": "srhd-modkit-rsm-build-v1",
+            "status": "passed" if verified else "issues" if decompile.get("verified") else "failed",
+            "verified": verified,
+            "source": str(project.entry),
+            "script_name": project.script_name,
+            "modules": [module.as_dict() for module in project.modules],
+            "scr": str(staged_scr),
+            "scr_size": staged_scr.stat().st_size,
+            "scr_sha256": sha256_file(staged_scr),
+            "scr_info": scr_info,
+            "language": language_report,
+            "issues": issues,
+            "runtime_issues": runtime_issues,
+            "language_issues": language_issues,
+            "failure": failure,
+            "decompile_audit": decompile,
+            "compiler_output_created": True,
+            "published_outputs": False,
+            "compiler": {
+                "name": "rsmc",
+                "executable": str(rsmc.path),
+                "executable_sha256": sha256_file(rsmc.path),
+                "exit_code": process.exit_code,
+                "seconds": round(process.elapsed_seconds, 3),
+            },
+            "timeout": timeout_policy,
+        }
+
+    def validate_rsm(
+        self,
+        entry: str | Path,
+        *,
+        lang_base: str | Path | None = None,
+        timeout: float | None = None,
+        deep_roundtrip: bool = False,
+    ) -> dict[str, Any]:
+        project = inspect_rsm_project(entry)
+        if not project.valid:
+            return {**project.as_dict(), "status": "issues", "verified": False}
+        base = Path(lang_base).resolve() if lang_base is not None else None
+        if base is not None and not base.is_file():
+            raise FileNotFoundError(base)
+        with tempfile.TemporaryDirectory(prefix="srhd-rsm-validate-") as temp_name:
+            workspace = Path(temp_name)
+            lang_txt: Path | None = None
+            lang_dat: Path | None = None
+            if base is not None:
+                if base.suffix.casefold() == ".dat":
+                    lang_dat = workspace / "CFG" / "Rus" / "Lang.dat"
+                    lang_dat.parent.mkdir(parents=True, exist_ok=True)
+                    self._prepare_rsm_language_target(
+                        project.script_name or "",
+                        lang_dat,
+                        base=base,
+                        workspace=workspace,
+                        binary=True,
+                        label="validate-lang-dat",
+                    )
+                else:
+                    lang_txt = workspace / "CFG" / "Rus" / "Lang.txt"
+                    lang_txt.parent.mkdir(parents=True, exist_ok=True)
+                    self._prepare_rsm_language_target(
+                        project.script_name or "",
+                        lang_txt,
+                        base=base,
+                        workspace=workspace,
+                        binary=False,
+                        label="validate-lang-txt",
+                    )
+            result = self._compile_and_audit_rsm(
+                project,
+                workspace,
+                lang_txt=lang_txt,
+                lang_dat=lang_dat,
+                timeout=timeout,
+                deep_roundtrip=deep_roundtrip,
+            )
+            result["temporary_outputs_persisted"] = False
+            result["scr"] = None
+            result["scr_sha256"] = result.get("scr_sha256")
+            return result
+
+    def build_rsm(
+        self,
+        entry: str | Path,
+        scr_output: str | Path,
+        *,
+        lang_txt_output: str | Path | None = None,
+        lang_dat_output: str | Path | None = None,
+        lang_base: str | Path | None = None,
+        overwrite: bool = False,
+        timeout: float | None = None,
+        deep_roundtrip: bool = False,
+    ) -> dict[str, Any]:
+        project = inspect_rsm_project(entry)
+        if not project.valid:
+            report = {**project.as_dict(), "status": "issues", "verified": False, "published_outputs": False}
+            raise RsmBuildFailure("RSM не прошёл статическую проверку", report)
+        scr_output = Path(scr_output).resolve()
+        if scr_output.suffix.casefold() != ".scr":
+            raise ValueError("Результат build-rsm должен иметь расширение .scr")
+        lang_txt_target = Path(lang_txt_output).resolve() if lang_txt_output is not None else None
+        lang_dat_target = Path(lang_dat_output).resolve() if lang_dat_output is not None else None
+        if lang_txt_target is not None and lang_txt_target.suffix.casefold() != ".txt":
+            raise ValueError("--lang-txt должен указывать на .txt")
+        if lang_dat_target is not None and lang_dat_target.suffix.casefold() != ".dat":
+            raise ValueError("--lang-dat должен указывать на .dat")
+        targets = [path for path in (scr_output, lang_txt_target, lang_dat_target) if path is not None]
+        existing = [path for path in targets if path.exists()]
+        if existing and not overwrite:
+            raise FileExistsError(f"Результат уже существует: {existing[0]}")
+        explicit_base = Path(lang_base).resolve() if lang_base is not None else None
+        if explicit_base is not None and not explicit_base.is_file():
+            raise FileNotFoundError(explicit_base)
+        scr_output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".srhd-rsm-build-", dir=scr_output.parent) as temp_name:
+            workspace = Path(temp_name)
+            staged_txt: Path | None = None
+            staged_dat: Path | None = None
+            if lang_txt_target is not None:
+                staged_txt = workspace / "CFG" / "Rus" / "Lang.txt"
+                staged_txt.parent.mkdir(parents=True, exist_ok=True)
+                txt_base = explicit_base or (lang_txt_target if lang_txt_target.is_file() else None)
+                self._prepare_rsm_language_target(
+                    project.script_name or "",
+                    staged_txt,
+                    base=txt_base,
+                    workspace=workspace,
+                    binary=False,
+                    label="build-lang-txt",
+                )
+            if lang_dat_target is not None:
+                staged_dat = workspace / "CFG" / "Rus" / "Lang.dat"
+                staged_dat.parent.mkdir(parents=True, exist_ok=True)
+                dat_base = explicit_base or (lang_dat_target if lang_dat_target.is_file() else None)
+                self._prepare_rsm_language_target(
+                    project.script_name or "",
+                    staged_dat,
+                    base=dat_base,
+                    workspace=workspace,
+                    binary=True,
+                    label="build-lang-dat",
+                )
+            result = self._compile_and_audit_rsm(
+                project,
+                workspace,
+                lang_txt=staged_txt,
+                lang_dat=staged_dat,
+                timeout=timeout,
+                deep_roundtrip=deep_roundtrip,
+            )
+            if not result["verified"]:
+                raise RsmBuildFailure("RSM-сборка не прошла обязательный аудит", result)
+            staged_scr = Path(result["scr"])
+            _replace_cross_device_safe(staged_scr, scr_output)
+            if staged_txt is not None and lang_txt_target is not None:
+                lang_txt_target.parent.mkdir(parents=True, exist_ok=True)
+                _replace_cross_device_safe(staged_txt, lang_txt_target)
+            if staged_dat is not None and lang_dat_target is not None:
+                lang_dat_target.parent.mkdir(parents=True, exist_ok=True)
+                _replace_cross_device_safe(staged_dat, lang_dat_target)
+        result["scr"] = str(scr_output)
+        result["scr_sha256"] = sha256_file(scr_output)
+        result["scr_info"] = inspect_scr(scr_output)
+        result["language"] = {
+            **result.get("language", {}),
+            "txt": str(lang_txt_target) if lang_txt_target is not None else None,
+            "dat": str(lang_dat_target) if lang_dat_target is not None else None,
+        }
+        result["published_outputs"] = True
+        return result
+
     def convert_script_project(
         self,
         source: str | Path,
@@ -2031,7 +2774,22 @@ class Toolchain:
             errors = [item for item in load_rson(source).validate() if item.severity == "error"]
             if errors:
                 raise ValueError(f"RSON не прошёл проверку: {errors[0].message}")
-        tool = self.require("rscript")
+        tool, cli_profile = self._require_supported_rscript("convert")
+        if cli_profile == "modern-cli":
+            fallback = self.tools["rscript410"]
+            fallback_version = self.rscript410_version
+            if (
+                not fallback.path.is_file()
+                or fallback_version is None
+                or fallback_version.parts[:2] != (4, 10)
+            ):
+                raise RuntimeError(
+                    "RScript 4.15f больше не публикует RSON/SVR-конвертацию через "
+                    "CLI. Штатный setup сохраняет прежнюю 4.10f в RScript410; "
+                    "без неё применяйте RSON или RSM напрямую. GUI ModKit не запускает."
+                )
+            tool = fallback
+            cli_profile = "legacy-cli"
         destination.parent.mkdir(parents=True, exist_ok=True)
         timeout_seconds, timeout_policy = _rscript_timeout_policy(source, "convert", None)
         # RScript 4.10f crashes with Runtime error 217 for absolute paths and
