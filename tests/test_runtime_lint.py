@@ -154,6 +154,45 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-cross-block-function-call", codes)
 
+    def test_init_world_access_is_not_misclassified_as_pre_grun_global_code(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        init = data["Visual.Objects"][0]["Operations"][0]
+        init["Code.Type"] = "Init"
+        init["Code"] = [
+            "if(ShipFindCustomShipInfoByType(Player(), 'Helper') == -1)",
+            "    ShipAddCustomShipInfo(Player(), 'Helper', 'NoShow');",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("post-grun-init.rson")))
+        }
+        self.assertNotIn("runtime-startup-world-access", codes)
+
+    def test_official_style_player_bootstrap_guard_is_not_startup_noise(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        global_code = data["Visual.Objects"][0]["Operations"][0]["Code"]
+        global_code[:] = [
+            "if(GetShipPirateRank(Player()) < 2)",
+            "    GRun();",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("bootstrap.rson")))
+        }
+        self.assertNotIn("runtime-startup-world-access", codes)
+
+    def test_global_world_mutation_is_a_nonblocking_startup_warning(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        global_code = data["Visual.Objects"][0]["Operations"][0]["Code"]
+        global_code[:] = ["ShipDestroy(Player());", "GRun();"]
+        matching = [
+            issue
+            for issue in lint_rson_runtime(RsonProject(data, Path("global-mutation.rson")))
+            if issue.code == "runtime-startup-world-access"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "warning")
+
     def test_tvar_is_a_shared_rscript_variable(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Variables"] = [

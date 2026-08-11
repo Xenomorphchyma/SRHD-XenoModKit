@@ -637,8 +637,23 @@ def _resource_integrity_check(context: AuditContext) -> AuditCheck:
     unsupported: list[dict[str, str]] = []
     for path in resources:
         try:
-            verify_resource(path)
+            result = verify_resource(path)
             checked.append(str(path))
+            if path.suffix.casefold() == ".gai" and result.get("empty_placeholder"):
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "warning",
+                        "resource-empty-animation-placeholder",
+                        "GAI структурно корректен, но не содержит ни одного "
+                        "отрисовываемого кадра. Движок допускает такой ресурс как "
+                        "намеренную пустую анимацию; проверьте, что скрытие изображения "
+                        "действительно задумано",
+                        path,
+                        evidence=f"empty_frames={result.get('empty_frame_count', 0)}",
+                    )
+                )
         except UnsupportedResourceFormat as exc:
             unsupported.append({"path": str(path), "reason": str(exc)})
         except Exception as exc:

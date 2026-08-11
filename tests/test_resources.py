@@ -35,6 +35,10 @@ def _gai(frames: list[bytes], width: int, height: int) -> bytes:
     return bytes(header) + b"".join(frames)
 
 
+def _zl01(payload: bytes) -> bytes:
+    return b"ZL01" + struct.pack("<I", len(payload)) + zlib.compress(payload, level=9)
+
+
 def _pkg(payload: bytes, name: str = "Frame.gi") -> bytes:
     compressed = zlib.compress(payload, level=9)
     chunk = b"ZL02" + struct.pack("<I", len(payload)) + compressed
@@ -83,6 +87,62 @@ class ResourceTests(unittest.TestCase):
             data = bytearray(_gai([_gi(1, 1)], 1, 1))
             struct.pack_into("<I", data, 48, 999)
             path.write_bytes(data)
+            with self.assertRaises(ResourceFormatError):
+                inspect_gai(path)
+
+    def test_gai_accepts_table_level_blank_frames_and_roundtrips_them(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            blank = root / "0000.gi"
+            visible = root / "0001.gi"
+            blank.write_bytes(b"")
+            visible.write_bytes(_gi(10, 12))
+            first = root / "first.gai"
+            build_gai([blank, visible], first, width=20, height=20, auxiliary=b"aux")
+
+            info = inspect_gai(first)
+            self.assertEqual(info.summary()["empty_frame_count"], 1)
+            self.assertEqual(info.summary()["drawable_frame_count"], 1)
+            self.assertEqual(info.frames[0].empty_kind, "empty-table-entry")
+
+            extracted = root / "frames"
+            extract_resource(first, extracted)
+            self.assertEqual((extracted / "first_0000.gi").read_bytes(), b"")
+            second = root / "second.gai"
+            build_gai([extracted], second, template=first)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_gai_accepts_zero_canvas_gi_as_blank_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "transparent.gai"
+            path.write_bytes(_gai([_gi(0, 0)], 650, 650))
+            info = inspect_gai(path)
+            self.assertTrue(info.summary()["empty_placeholder"])
+            self.assertEqual(info.frames[0].empty_kind, "zero-canvas-gi")
+
+    def test_gai_reads_and_extracts_zl01_compressed_gi_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            frame = _gi(18, 22, 7)
+            path = root / "compressed.gai"
+            path.write_bytes(_gai([_zl01(frame)], 32, 32))
+            info = inspect_gai(path)
+            self.assertEqual(info.frames[0].storage, "zl01")
+            self.assertEqual(info.frames[0].decoded_size, len(frame))
+            extract_resource(path, root / "out")
+            self.assertEqual((root / "out" / "compressed_0000.gi").read_bytes(), frame)
+
+    def test_gai_rejects_truncated_zl01_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "broken-compressed.gai"
+            path.write_bytes(_gai([_zl01(_gi(18, 22))[:-1]], 32, 32))
+            with self.assertRaises(ResourceFormatError):
+                inspect_gai(path)
+
+    def test_gai_rejects_partially_zero_gi_canvas(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "broken-empty.gai"
+            path.write_bytes(_gai([_gi(0, 10)], 10, 10))
             with self.assertRaises(ResourceFormatError):
                 inspect_gai(path)
 

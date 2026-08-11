@@ -557,6 +557,29 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(check.status, "issues")
             self.assertTrue(any(item.code == "resource-invalid" for item in check.issues))
 
+    def test_empty_gai_placeholder_is_warning_not_corruption(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            path = root / "DATA" / "empty.gai"
+            header = bytearray(48 + 3 * 8)
+            struct.pack_into("<4sI", header, 0, b"gai\0", 1)
+            struct.pack_into("<III", header, 16, 20, 20, 3)
+            auxiliary = b"timeline"
+            struct.pack_into("<II", header, 32, len(header), len(auxiliary))
+            path.write_bytes(bytes(header) + auxiliary)
+
+            report = audit_mod(root, profile="release")
+            check = next(item for item in report.checks if item.name == "resource-integrity")
+            issue = next(
+                item
+                for item in check.issues
+                if item.code == "resource-empty-animation-placeholder"
+            )
+            self.assertEqual(issue.severity, "warning")
+            self.assertFalse(any(item.code == "resource-invalid" for item in check.issues))
+            self.assertNotIn(issue, report.blocking_issues())
+
     def test_unknown_format_is_passthrough_but_coverage_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"

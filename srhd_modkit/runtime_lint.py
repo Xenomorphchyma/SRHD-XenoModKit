@@ -65,6 +65,18 @@ CONTROL_CALLS = {
     "function",
 }
 
+# Official RScript examples use Player() in onGlobal to decide whether GRun()
+# should start the script.  These read-only bootstrap calls are therefore not
+# evidence of unsafe world mutation by themselves.  Keep the allow-list narrow:
+# any additional call on the same statement remains a startup warning.
+STARTUP_BOOTSTRAP_CALLS = {
+    "player",
+    "getshippiraterank",
+    "gcntrun",
+    "isscriptactive",
+    "grun",
+}
+
 _KNOWN_UNAVAILABLE_ENGINE_CALLS = {
     "idtostar": (
         "IdToStar отсутствует в игровом API SRHD 2.1.2500; "
@@ -3151,11 +3163,17 @@ def _lint_hot_world_complexity(
     return issues
 
 
-def _global_initialization_lines(project: RsonProject) -> list[tuple[int | None, int, str]]:
+def _global_initialization_lines(
+    project: RsonProject,
+    *,
+    include_init: bool = True,
+) -> list[tuple[int | None, int, str]]:
     result: list[tuple[int | None, int, str]] = []
     for item in project.iter_objects():
         code_type = str(item.get("Code.Type", "")).casefold()
         if code_type not in {"", "global", "init"}:
+            continue
+        if code_type == "init" and not include_init:
             continue
         if not code_type and str(item.get("Type", "")).casefold() != "top":
             continue
@@ -8093,14 +8111,27 @@ def lint_rson_runtime(
                 )
             )
 
-    for object_id, line_number, line in global_initialization:
+    # Code.Type=Init is executed by RScript after GRun and is also used as a
+    # shared function/initialization section.  Treating it as pre-world global
+    # code produced false blockers for valid player-bound helper scripts.
+    # Only the actual Global/legacy Top phase participates in this check.
+    startup_global_lines = _global_initialization_lines(project, include_init=False)
+    for object_id, line_number, line in startup_global_lines:
         calls = {value.casefold() for value in _calls(line)}
-        if calls & WORLD_CALLS or calls & risky:
+        direct_risk = calls & WORLD_CALLS
+        custom_risk = calls & risky
+        bootstrap_only = bool(direct_risk) and not custom_risk and (
+            calls - CONTROL_CALLS <= STARTUP_BOOTSTRAP_CALLS
+        )
+        if (direct_risk or custom_risk) and not bootstrap_only:
             issues.append(
                 RuntimeIssue(
-                    "error",
+                    "warning",
                     "runtime-startup-world-access",
-                    "Глобальная инициализация обращается к игровому миру до подтверждения готовности интерфейса",
+                    "Global-код обращается к игровому миру до GRun или вызывает "
+                    "достижимый world-helper. Это допустимо для лёгкой проверки "
+                    "условия запуска, но тяжёлую работу и изменение мира лучше "
+                    "перенести в Init либо защищённый runtime-обработчик",
                     path,
                     f"object #{object_id} Code:{line_number}",
                     line.strip(),

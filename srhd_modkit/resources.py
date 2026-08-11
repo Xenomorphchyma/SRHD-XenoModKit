@@ -62,8 +62,12 @@ class GaiFrame:
     size: int
     width: int
     height: int
+    empty: bool = False
+    empty_kind: str | None = None
+    storage: str = "raw"
+    decoded_size: int = 0
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -79,6 +83,7 @@ class GaiInfo:
     frames: tuple[GaiFrame, ...]
 
     def summary(self) -> dict[str, Any]:
+        empty_frames = sum(frame.empty for frame in self.frames)
         return {
             "path": str(self.path),
             "format": "GAI animation",
@@ -87,6 +92,9 @@ class GaiInfo:
             "width": self.width,
             "height": self.height,
             "frame_count": len(self.frames),
+            "drawable_frame_count": len(self.frames) - empty_frames,
+            "empty_frame_count": empty_frames,
+            "empty_placeholder": bool(self.frames) and empty_frames == len(self.frames),
             "auxiliary_offset": self.auxiliary_offset,
             "auxiliary_size": self.auxiliary_size,
             "valid": True,
@@ -140,7 +148,27 @@ def inspect_gai(path: str | Path) -> GaiInfo:
     for index in range(frame_count):
         offset, size = struct.unpack_from("<II", data, 48 + index * 8)
         if not size:
-            raise ResourceFormatError(f"GAI: кадр {index} имеет нулевой размер")
+            if offset:
+                raise ResourceFormatError(
+                    f"GAI: пустой кадр {index} имеет ненулевое смещение {offset}"
+                )
+            # The engine and shipped mods use an exact (offset=0, size=0)
+            # table entry as a deliberate blank animation frame.  It occupies
+            # no payload and therefore must not advance the contiguous stream.
+            frames.append(
+                GaiFrame(
+                    index,
+                    0,
+                    0,
+                    0,
+                    0,
+                    True,
+                    "empty-table-entry",
+                    "empty",
+                    0,
+                )
+            )
+            continue
         if offset != expected_offset:
             raise ResourceFormatError(
                 f"GAI: кадр {index} начинается с {offset}, ожидалось {expected_offset}"
@@ -148,16 +176,65 @@ def inspect_gai(path: str | Path) -> GaiInfo:
         end = offset + size
         if end > len(data):
             raise ResourceFormatError(f"GAI: кадр {index} выходит за границы файла")
-        if data[offset : offset + 4] != GI_MAGIC or size < 24:
-            raise ResourceFormatError(f"GAI: кадр {index} не является вложенным GI")
-        frame_width, frame_height = struct.unpack_from("<II", data, offset + 16)
-        if not frame_width or not frame_height:
-            raise ResourceFormatError(f"GAI: кадр {index} имеет нулевой размер GI")
-        frames.append(GaiFrame(index, offset, size, frame_width, frame_height))
+        payload = data[offset:end]
+        decoded, storage = _decode_gai_frame(payload, index)
+        frame_width, frame_height = struct.unpack_from("<II", decoded, 16)
+        if bool(frame_width) != bool(frame_height):
+            raise ResourceFormatError(
+                f"GAI: кадр {index} имеет частично нулевой размер GI "
+                f"{frame_width}x{frame_height}"
+            )
+        is_empty = frame_width == 0 and frame_height == 0
+        frames.append(
+            GaiFrame(
+                index,
+                offset,
+                size,
+                frame_width,
+                frame_height,
+                is_empty,
+                "zero-canvas-gi" if is_empty else None,
+                storage,
+                len(decoded),
+            )
+        )
         expected_offset = end
     if expected_offset != len(data):
         raise ResourceFormatError(f"GAI: после кадров осталось {len(data) - expected_offset} байт")
     return GaiInfo(path, len(data), version, width, height, auxiliary_offset, auxiliary_size, tuple(frames))
+
+
+def _decode_gai_frame(payload: bytes, index: int) -> tuple[bytes, str]:
+    """Return the GI payload of a raw or ZL01-compressed GAI frame."""
+
+    if len(payload) >= 24 and payload[:4] == GI_MAGIC:
+        return payload, "raw"
+    if len(payload) < 8 or payload[:4] != b"ZL01":
+        raise ResourceFormatError(f"GAI: кадр {index} не является GI или ZL01(GI)")
+    expected = _u32(payload, 4, f"GAI frame {index} ZL01 size")
+    if expected < 24 or expected > 512 * 1024 * 1024:
+        raise ResourceFormatError(
+            f"GAI: кадр {index} задаёт неправдоподобный размер ZL01 {expected}"
+        )
+    decoder = zlib.decompressobj()
+    try:
+        decoded = decoder.decompress(payload[8:], expected + 1)
+        if decoder.unconsumed_tail:
+            raise ResourceFormatError(
+                f"GAI: ZL01 кадра {index} превышает заявленный размер {expected}"
+            )
+        decoded += decoder.flush()
+    except zlib.error as exc:
+        raise ResourceFormatError(f"GAI: повреждён ZL01 кадра {index}: {exc}") from exc
+    if decoder.unused_data or not decoder.eof:
+        raise ResourceFormatError(f"GAI: ZL01 кадра {index} имеет лишние или неполные данные")
+    if len(decoded) != expected:
+        raise ResourceFormatError(
+            f"GAI: ZL01 кадра {index} дал {len(decoded)} байт вместо {expected}"
+        )
+    if decoded[:4] != GI_MAGIC:
+        raise ResourceFormatError(f"GAI: ZL01 кадра {index} не содержит GI")
+    return decoded, "zl01"
 
 
 @dataclass(frozen=True)
@@ -554,16 +631,30 @@ def build_gai(
     frame_dimensions: list[tuple[int, int]] = []
     for path in frame_paths:
         data = path.read_bytes()
+        if not data:
+            # ``resource extract`` represents a table-level blank frame as an
+            # empty .gi file.  Accepting it here makes extraction and template
+            # rebuilding lossless without inventing a drawable GI payload.
+            payloads.append(b"")
+            frame_dimensions.append((0, 0))
+            continue
         if len(data) < 24 or data[:4] != GI_MAGIC:
             raise ResourceFormatError(f"GAI: {path} не является корректным GI-кадром")
         frame_width, frame_height = struct.unpack_from("<II", data, 16)
-        if not frame_width or not frame_height:
-            raise ResourceFormatError(f"GAI: {path} содержит нулевой размер GI")
+        if bool(frame_width) != bool(frame_height):
+            raise ResourceFormatError(
+                f"GAI: {path} содержит частично нулевой размер GI "
+                f"{frame_width}x{frame_height}"
+            )
         payloads.append(data)
         frame_dimensions.append((frame_width, frame_height))
 
-    canvas_width = width or (template_info.width if template_info else max(item[0] for item in frame_dimensions))
-    canvas_height = height or (template_info.height if template_info else max(item[1] for item in frame_dimensions))
+    canvas_width = width or (
+        template_info.width if template_info else max(item[0] for item in frame_dimensions)
+    )
+    canvas_height = height or (
+        template_info.height if template_info else max(item[1] for item in frame_dimensions)
+    )
     if canvas_width <= 0 or canvas_height <= 0:
         raise ValueError("Размер холста GAI должен быть положительным")
     if any(frame_width > canvas_width or frame_height > canvas_height for frame_width, frame_height in frame_dimensions):
@@ -587,8 +678,11 @@ def build_gai(
     table = bytearray(len(payloads) * 8)
     offset = table_end + len(auxiliary_payload)
     for index, payload in enumerate(payloads):
-        struct.pack_into("<II", table, index * 8, offset, len(payload))
-        offset += len(payload)
+        if payload:
+            struct.pack_into("<II", table, index * 8, offset, len(payload))
+            offset += len(payload)
+        else:
+            struct.pack_into("<II", table, index * 8, 0, 0)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".srhd-gai-", dir=output.parent) as name:
@@ -900,13 +994,16 @@ def extract_resource(path: str | Path, output: str | Path, *, overwrite: bool = 
         )
         output.mkdir(parents=True, exist_ok=True)
         for destination, frame in zip(outputs, info.frames):
-            destination.write_bytes(data[frame.offset : frame.offset + frame.size])
+            payload = data[frame.offset : frame.offset + frame.size]
+            if frame.storage == "zl01":
+                payload, _storage = _decode_gai_frame(payload, frame.index)
+            destination.write_bytes(payload)
         return {
             "source": str(path),
             "output": str(output),
             "format": "GAI animation",
             "files": len(outputs),
-            "written_size": sum(frame.size for frame in info.frames),
+            "written_size": sum(frame.decoded_size for frame in info.frames),
         }
     if extension == ".pkg":
         info = inspect_pkg(path)

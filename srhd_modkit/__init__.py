@@ -262,4 +262,4 @@ __all__ = [
     "build_quest_from_json",
 ]
 
-__version__ = "0.9.7"
+__version__ = "0.9.8"
