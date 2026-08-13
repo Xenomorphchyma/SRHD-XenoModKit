@@ -294,8 +294,20 @@ def cmd_compat(args: argparse.Namespace) -> int:
     else:
         print(f"Включено модов: {len(report.load_order)}")
         for item in report.load_order:
-            priority = item["priority"] if item["priority"] is not None else "—"
-            print(f"  [{item['order']}] Priority={priority} {item['name']} ({item['path']})")
+            priority = (
+                item["priority"]
+                if item["priority"] is not None
+                else f"0 ({item['priority_source']})"
+            )
+            configured = (
+                f"; CurrentMod={item['configured_order']}"
+                if item["configured_order"] != item["order"]
+                else ""
+            )
+            print(
+                f"  [{item['order']}] Priority={priority}{configured} "
+                f"{item['name']} ({item['path']})"
+            )
         print(f"Зависимостей: {len(report.dependency_edges)}; объявленных конфликтов: {len(report.conflict_edges)}")
         print(f"Циклов зависимостей: {len(report.cycles)}")
         for cycle in report.cycles:

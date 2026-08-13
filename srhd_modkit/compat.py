@@ -27,6 +27,9 @@ class OverlayOwner:
     priority: int | None
     order: int
     sha256: str
+    effective_priority: int = 0
+    priority_source: str = "default-zero"
+    configured_order: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -34,9 +37,21 @@ class OverlayOwner:
             "mod_path": self.mod_path,
             "file": self.file,
             "priority": self.priority,
+            "effective_priority": self.effective_priority,
+            "priority_source": self.priority_source,
+            "configured_order": self.configured_order,
             "order": self.order,
             "sha256": self.sha256,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _EnabledMod:
+    reference: str
+    mod: ModRecord
+    configured_order: int
+    effective_priority: int
+    priority_source: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +91,14 @@ class ModSetReport:
             "schema": self.schema,
             "config": self.config,
             "mods_root": self.mods_root,
+            "order_policy": {
+                "field": "Priority",
+                "direction": "ascending",
+                "stable": True,
+                "missing_priority": 0,
+                "tie_breaker": "CurrentMod",
+                "writes_config": False,
+            },
             "load_order": list(self.load_order),
             "dependency_edges": list(self.dependency_edges),
             "conflict_edges": list(self.conflict_edges),
@@ -111,19 +134,53 @@ def _indexes(mods: Iterable[ModRecord]) -> tuple[dict[str, ModRecord], dict[str,
     return by_path, by_ref
 
 
-def _enabled(config: ModConfig, mods: list[ModRecord]) -> list[tuple[str, ModRecord]]:
+def _enabled(config: ModConfig, mods: list[ModRecord]) -> list[tuple[int, str, ModRecord]]:
     by_path, _ = _indexes(mods)
-    result: list[tuple[str, ModRecord]] = []
+    result: list[tuple[int, str, ModRecord]] = []
     seen: set[str] = set()
-    for ref in config.enabled:
+    for configured_order, ref in enumerate(config.enabled):
         key = normalize_ref(ref)
         if key in seen:
             continue
         seen.add(key)
         mod = by_path.get(key)
         if mod is not None:
-            result.append((ref, mod))
+            result.append((configured_order, ref, mod))
     return result
+
+
+def _effective_enabled(
+    configured: list[tuple[int, str, ModRecord]],
+) -> list[_EnabledMod]:
+    """Model the engine's stable ascending Priority order without editing ModCFG."""
+
+    entries: list[_EnabledMod] = []
+    for configured_order, reference, mod in configured:
+        raw = mod.module.first("Priority").strip()
+        if not raw:
+            effective_priority = 0
+            source = "default-zero"
+        elif mod.module.priority is None:
+            # Invalid Priority is reported separately.  Zero is the safest
+            # deterministic fallback for analysis and matches an absent field.
+            effective_priority = 0
+            source = "invalid-assumed-zero"
+        else:
+            effective_priority = mod.module.priority
+            source = "explicit"
+        entries.append(
+            _EnabledMod(
+                reference,
+                mod,
+                configured_order,
+                effective_priority,
+                source,
+            )
+        )
+    # Python's sort is stable: CurrentMod remains the tie-breaker when two mods
+    # have the same effective Priority, matching the engine's swap-on-greater
+    # behavior instead of inventing an alphabetical order.
+    return sorted(entries, key=lambda item: item.effective_priority)
 
 
 def _dependency_edges(
@@ -283,17 +340,18 @@ def _classify_collision(
 
 
 def _collisions(
-    enabled: list[ModRecord],
+    enabled: list[_EnabledMod],
     tools: Toolchain,
 ) -> tuple[list[OverlayCollision], list[AuditIssue]]:
-    owners: dict[str, list[tuple[int, ModRecord, Path, str]]] = {}
-    for order, mod in enumerate(enabled):
+    owners: dict[str, list[tuple[int, _EnabledMod, Path, str]]] = {}
+    for order, entry in enumerate(enabled):
+        mod = entry.mod
         for path in iter_files(mod.root):
             relative = path.relative_to(mod.root).as_posix()
             folded = relative.casefold()
             if not (folded.startswith("cfg/") or folded.startswith("data/")):
                 continue
-            owners.setdefault(folded, []).append((order, mod, path, relative))
+            owners.setdefault(folded, []).append((order, entry, path, relative))
 
     collisions: list[OverlayCollision] = []
     issues: list[AuditIssue] = []
@@ -327,14 +385,17 @@ def _collisions(
                 )
             collision_owners = tuple(
                 OverlayOwner(
-                    mod.name,
-                    mod.relative_path.as_posix(),
-                    str(path),
-                    mod.module.priority,
-                    order,
-                    digest,
+                    mod=entry.mod.name,
+                    mod_path=entry.mod.relative_path.as_posix(),
+                    file=str(path),
+                    priority=entry.mod.module.priority,
+                    order=order,
+                    sha256=digest,
+                    effective_priority=entry.effective_priority,
+                    priority_source=entry.priority_source,
+                    configured_order=entry.configured_order,
                 )
-                for (order, mod, path, _), digest in zip(entries, hashes)
+                for (order, entry, path, _), digest in zip(entries, hashes)
             )
             collisions.append(
                 OverlayCollision(relative, kind, collision_owners, identical, "unknown", operators)
@@ -351,8 +412,9 @@ def analyze_modset(
     parsed = parse_modcfg(config) if not isinstance(config, ModConfig) else config
     root = Path(mods_root).resolve()
     mods = discover_mods(root)
-    enabled_entries = _enabled(parsed, mods)
-    enabled = [mod for _, mod in enabled_entries]
+    configured_entries = _enabled(parsed, mods)
+    enabled_entries = _effective_enabled(configured_entries)
+    enabled = [entry.mod for entry in enabled_entries]
     issues = [
         AuditIssue.from_value(item, validator="compat", mod=getattr(item, "mod", ""))
         for item in validate_modcfg(parsed, root, mods)
@@ -362,6 +424,44 @@ def analyze_modset(
         for item in validate_collection(mods)
         if item.code == "duplicate-name"
     )
+    for entry in enabled_entries:
+        if entry.priority_source != "invalid-assumed-zero":
+            continue
+        issues.append(
+            AuditIssue(
+                "warning",
+                "invalid-priority",
+                f"{entry.mod.name}: Priority не является целым числом; compat "
+                "использует 0 только как безопасное допущение для порядка анализа",
+                str(entry.mod.module.path),
+                entry.mod.name,
+                "compat",
+                evidence=entry.mod.module.first("Priority"),
+            )
+        )
+    effective_configured_orders = [entry.configured_order for entry in enabled_entries]
+    configured_orders = [item[0] for item in configured_entries]
+    if effective_configured_orders != configured_orders:
+        moved = sum(
+            left != right
+            for left, right in zip(configured_orders, effective_configured_orders)
+        )
+        issues.append(
+            AuditIssue(
+                "warning",
+                "modcfg-priority-order-mismatch",
+                "Порядок CurrentMod не совпадает со стабильной сортировкой по "
+                f"возрастанию Priority ({moved} позиций отличаются). Игра может "
+                "предложить переставить моды; compat уже использует эффективный "
+                "порядок, но ModCFG.txt не изменяет",
+                str(parsed.path),
+                validator="compat",
+                evidence="configured="
+                + ",".join(str(value) for value in configured_orders)
+                + "; effective="
+                + ",".join(str(value) for value in effective_configured_orders),
+            )
+        )
     edges, graph = _dependency_edges(enabled, mods)
     conflicts = _conflict_edges(enabled, mods)
     found_cycles = _cycles(graph)
@@ -375,17 +475,20 @@ def analyze_modset(
                 validator="compat",
             )
         )
-    collision_items, collision_issues = _collisions(enabled, Toolchain(tools_root))
+    collision_items, collision_issues = _collisions(enabled_entries, Toolchain(tools_root))
     issues.extend(collision_issues)
     order = tuple(
         {
             "order": index,
-            "reference": reference,
-            "name": mod.name,
-            "path": mod.relative_path.as_posix(),
-            "priority": mod.module.priority,
+            "configured_order": entry.configured_order,
+            "reference": entry.reference,
+            "name": entry.mod.name,
+            "path": entry.mod.relative_path.as_posix(),
+            "priority": entry.mod.module.priority,
+            "effective_priority": entry.effective_priority,
+            "priority_source": entry.priority_source,
         }
-        for index, (reference, mod) in enumerate(enabled_entries)
+        for index, entry in enumerate(enabled_entries)
     )
     return ModSetReport(
         str(parsed.path),

@@ -187,6 +187,13 @@ python -B srhd.py doctor processes --json
 python -B srhd.py doctor processes --terminate --json
 ```
 
+`compat` не изменяет `ModCFG.txt`. В `srhd-modkit-modset-v1` поле
+`configured_order` означает исходную позицию CurrentMod, `order` — стабильный
+порядок по возрастанию `effective_priority`; отсутствующий Priority равен `0`,
+а исходный список разрешает равенство. Поле `order_policy` фиксирует эти правила
+машиночитаемо. Владельцы collision расположены в том же эффективном порядке,
+но `resolution: unknown` сохраняется для недоказанной семантики наложения.
+
 `stage` требует отсутствующую папку назначения и проверяет каждый скопированный файл по SHA-256.
 
 ## Python API
