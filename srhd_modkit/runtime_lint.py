@@ -4821,6 +4821,449 @@ def _has_late_transit_guard(
     return False
 
 
+_SHIP_TRANSITION_CALLS = {
+    "orderjump": 0,
+    "orderlanding": 0,
+    "ordertakeoff": 0,
+    "shipout": 0,
+    "transfership": 0,
+}
+
+
+def _condition_is_exact_ship_call(
+    condition: str,
+    call: str,
+    variable: str,
+    *,
+    positive: bool,
+) -> bool:
+    value = _strip_balanced_outer_parentheses(condition)
+    if "&&" in value or "||" in value:
+        return False
+    polarity = _condition_call_polarity(value, call, variable)
+    if polarity != {positive}:
+        return False
+    masked = _mask_non_code(value)
+    return len(_line_call_sites(masked)) == 1
+
+
+def _success_condition_for_line(
+    block: FunctionBlock,
+    line_offset: int,
+) -> str | None:
+    current = _leading_if_condition(block.lines[line_offset])
+    if current is not None:
+        return current[0]
+    for header in range(1, line_offset):
+        parsed = _leading_if_condition(block.lines[header])
+        if parsed is None:
+            continue
+        body = _statement_body_range(block.lines, header)
+        if body is not None and body[0] <= line_offset <= body[1]:
+            return parsed[0]
+    return None
+
+
+def _ship_data_stability_predicates(
+    functions: Mapping[str, FunctionBlock],
+) -> dict[str, frozenset[int]]:
+    """Infer predicates whose true result proves stable mobile-ship data access.
+
+    The proof deliberately requires separate null, takeoff and hyperspace exit
+    guards.  Every non-zero result must then be restricted to either a proven
+    docked place or normal space.  A compact eager boolean expression is not
+    treated as an equivalent proof.
+    """
+
+    summaries: dict[str, frozenset[int]] = {}
+    for name, block in functions.items():
+        parameters = _function_parameters(block)
+        proven: set[int] = set()
+        for parameter_index, parameter in enumerate(parameters):
+            if _variable_reassigned(block.lines, parameter, 1, len(block.lines)):
+                continue
+            result_assignments: list[tuple[int, int]] = []
+            invalid_result = False
+            place_variables: dict[str, int] = {}
+            for line_offset, line in enumerate(block.lines[1:], start=1):
+                masked = _mask_non_code(line)
+                assignment = _assignment_parts(masked)
+                if assignment is not None:
+                    target, expression = assignment
+                    calls = {
+                        call.casefold() for call in _calls(expression)
+                    }
+                    if calls & {"getshipplanet", "getshipruins"} and re.search(
+                        rf"\b(?:GetShipPlanet|GetShipRuins)\s*\(\s*{re.escape(parameter)}\s*\)",
+                        expression,
+                        re.IGNORECASE,
+                    ):
+                        place_variables[target] = line_offset
+                for match in re.finditer(
+                    r"\bresult\s*=(?!=)\s*([^;]+)",
+                    masked,
+                    re.IGNORECASE,
+                ):
+                    value = _constant_int(match.group(1).strip())
+                    if value is None:
+                        invalid_result = True
+                    else:
+                        result_assignments.append((line_offset, value))
+            success_lines = [line for line, value in result_assignments if value != 0]
+            if invalid_result or not success_lines or not any(
+                value == 0 for _line, value in result_assignments
+            ):
+                continue
+
+            first_success = min(success_lines)
+            null_guard_line: int | None = None
+            takeoff_guard_line: int | None = None
+            hyperspace_guard_line: int | None = None
+            for guard_line in range(1, first_success):
+                if re.match(
+                    r"\s*if\b",
+                    _mask_non_code(block.lines[guard_line]),
+                    re.IGNORECASE,
+                ) is None:
+                    continue
+                condition = _exiting_if_condition(
+                    "\n".join(
+                        block.lines[guard_line : min(len(block.lines), guard_line + 8)]
+                    )
+                )
+                if condition is None or "&&" in condition or "||" in condition:
+                    continue
+                if _negative_null_condition(condition, parameter):
+                    null_guard_line = guard_line
+                if _condition_is_exact_ship_call(
+                    condition, "ShipIsTakeoff", parameter, positive=True
+                ):
+                    takeoff_guard_line = guard_line
+                if _condition_is_exact_ship_call(
+                    condition, "ShipInHyperSpace", parameter, positive=True
+                ):
+                    hyperspace_guard_line = guard_line
+            if None in (null_guard_line, takeoff_guard_line, hyperspace_guard_line):
+                continue
+            last_transition_guard = max(takeoff_guard_line, hyperspace_guard_line)
+
+            successes_are_stable = True
+            for success_line in success_lines:
+                condition = _success_condition_for_line(block, success_line)
+                if condition is None or "&&" in condition or "||" in condition:
+                    successes_are_stable = False
+                    break
+                compact = _strip_balanced_outer_parentheses(condition).strip()
+                place_proof = any(
+                    _positive_object_condition(compact, place)
+                    and last_transition_guard < origin_line <= success_line
+                    for place, origin_line in place_variables.items()
+                )
+                normal_proof = _condition_is_exact_ship_call(
+                    compact,
+                    "ShipInNormalSpace",
+                    parameter,
+                    positive=True,
+                )
+                if not (place_proof or normal_proof):
+                    successes_are_stable = False
+                    break
+            if successes_are_stable:
+                proven.add(parameter_index)
+        if proven:
+            summaries[name] = frozenset(proven)
+    return summaries
+
+
+def _id_to_ship_returning_functions(
+    blocks: Mapping[str, FunctionBlock],
+) -> set[str]:
+    result: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, block in blocks.items():
+            tainted: set[str] = set()
+            returns_tainted = False
+            for line in block.lines[1:]:
+                assignment = _assignment_parts(_mask_non_code(line))
+                if assignment is None:
+                    continue
+                target, expression = assignment
+                calls = {call.casefold() for call in _calls(expression)}
+                source = bool("idtoship" in calls or calls & result)
+                alias = _simple_identifier(expression)
+                source |= alias in tainted
+                if target == "result":
+                    returns_tainted |= source
+                elif source:
+                    tainted.add(target)
+                else:
+                    tainted.discard(target)
+            if returns_tainted and name not in result:
+                result.add(name)
+                changed = True
+    return result
+
+
+def _id_to_ship_parameter_taint(
+    blocks: Mapping[str, FunctionBlock],
+    reachable: set[str],
+    returning: set[str],
+) -> dict[str, set[int]]:
+    tainted_parameters: dict[str, set[int]] = {name: set() for name in blocks}
+    changed = True
+    while changed:
+        changed = False
+        for name in sorted(reachable):
+            block = blocks[name]
+            parameters = _function_parameters(block)
+            tainted = {
+                parameter
+                for index, parameter in enumerate(parameters)
+                if index in tainted_parameters[name]
+            }
+            for line in block.lines[1:]:
+                masked = _mask_non_code(line)
+                assignment = _assignment_parts(masked)
+                if assignment is not None:
+                    target, expression = assignment
+                    calls = {call.casefold() for call in _calls(expression)}
+                    alias = _simple_identifier(expression)
+                    if "idtoship" in calls or calls & returning or alias in tainted:
+                        tainted.add(target)
+                    else:
+                        tainted.discard(target)
+                for _position, call, arguments in _line_call_sites(masked):
+                    if call not in blocks:
+                        continue
+                    callee_parameters = _function_parameters(blocks[call])
+                    for argument_index, argument in enumerate(arguments):
+                        actual = _simple_identifier(argument)
+                        if actual not in tainted or argument_index >= len(callee_parameters):
+                            continue
+                        if argument_index not in tainted_parameters[call]:
+                            tainted_parameters[call].add(argument_index)
+                            changed = True
+    return tainted_parameters
+
+
+def _data_stability_predicate_call(
+    condition: str,
+    variable: str,
+    predicates: Mapping[str, frozenset[int]],
+    *,
+    positive: bool,
+) -> bool:
+    value = _strip_balanced_outer_parentheses(condition)
+    if "&&" in value or "||" in value:
+        return False
+    if not positive:
+        if not value.startswith("!"):
+            return False
+        value = _strip_balanced_outer_parentheses(value[1:].strip())
+    match = CALL_RE.match(value)
+    if match is None or match.start() != 0:
+        return False
+    indexes = predicates.get(match.group(1).casefold())
+    if not indexes:
+        return False
+    parsed = _split_call_arguments(value, value.find("(", match.start()))
+    if parsed is None:
+        return False
+    arguments, end = parsed
+    if value[end:].strip():
+        return False
+    return any(
+        index < len(arguments)
+        and _simple_identifier(arguments[index]) == variable.casefold()
+        for index in indexes
+    )
+
+
+def _has_ship_data_stability_guard_before(
+    block: FunctionBlock,
+    line_offset: int,
+    variable: str,
+    predicates: Mapping[str, frozenset[int]],
+) -> bool:
+    depths = _line_depths(block.lines)
+    takeoff = False
+    hyperspace = False
+    normal = False
+    for guard_line in range(1, line_offset):
+        if re.match(
+            r"\s*if\b",
+            _mask_non_code(block.lines[guard_line]),
+            re.IGNORECASE,
+        ) is None:
+            continue
+        window = "\n".join(
+            block.lines[guard_line : min(line_offset, guard_line + 8)]
+        )
+        condition = _exiting_if_condition(window)
+        if condition is not None and depths[guard_line] <= depths[line_offset]:
+            if _variable_reassigned(
+                block.lines,
+                variable,
+                guard_line + 1,
+                line_offset + 1,
+            ):
+                continue
+            if _data_stability_predicate_call(
+                condition,
+                variable,
+                predicates,
+                positive=False,
+            ):
+                return True
+            if "&&" not in condition and "||" not in condition:
+                takeoff |= _condition_is_exact_ship_call(
+                    condition,
+                    "ShipIsTakeoff",
+                    variable,
+                    positive=True,
+                )
+                hyperspace |= _condition_is_exact_ship_call(
+                    condition,
+                    "ShipInHyperSpace",
+                    variable,
+                    positive=True,
+                )
+                normal |= _condition_is_exact_ship_call(
+                    condition,
+                    "ShipInNormalSpace",
+                    variable,
+                    positive=False,
+                )
+
+        body = _statement_body_range(block.lines, guard_line)
+        leading = _leading_if_condition(block.lines[guard_line])
+        if (
+            leading is not None
+            and body is not None
+            and body[0] <= line_offset <= body[1]
+            and depths[guard_line] <= depths[line_offset]
+        ):
+            condition = leading[0]
+            if _data_stability_predicate_call(
+                condition,
+                variable,
+                predicates,
+                positive=True,
+            ):
+                return True
+            if "&&" not in condition and "||" not in condition:
+                normal |= _condition_is_exact_ship_call(
+                    condition,
+                    "ShipInNormalSpace",
+                    variable,
+                    positive=True,
+                )
+    return takeoff and hyperspace and normal
+
+
+def _has_ship_transition_evidence(block: FunctionBlock, variable: str) -> bool:
+    has_takeoff_probe = False
+    has_hyperspace_probe = False
+    for line in block.lines[1:]:
+        for _position, call, arguments in _line_call_sites(_mask_non_code(line)):
+            if arguments and _simple_identifier(arguments[0]) == variable:
+                has_takeoff_probe |= call == "shipistakeoff"
+                has_hyperspace_probe |= call == "shipinhyperspace"
+            position = _SHIP_TRANSITION_CALLS.get(call)
+            if (
+                position is not None
+                and position < len(arguments)
+                and _simple_identifier(arguments[position]) == variable
+            ):
+                return True
+    return has_takeoff_probe and has_hyperspace_probe
+
+
+def _lint_transitional_ship_data_access(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Warn when GetData precedes lifecycle proof for an IdToShip object."""
+
+    path = str(project.path) if project.path else None
+    blocks = _runtime_analysis_blocks(project, functions)
+    graph = _call_graph(blocks)
+    dialog_scoped = _dialog_scoped_turn_objects(project)
+    background_roots = {
+        name
+        for name, block in blocks.items()
+        if name.startswith("__handler_")
+        and block.code_type == "turn"
+        and block.object_id not in dialog_scoped
+    }
+    reachable = _reachable(background_roots, graph)
+    if not background_roots:
+        return []
+    returning = _id_to_ship_returning_functions(blocks)
+    parameter_taint = _id_to_ship_parameter_taint(blocks, reachable, returning)
+    stable_predicates = _ship_data_stability_predicates(functions)
+
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[str, str]] = set()
+    for name in sorted(reachable):
+        block = blocks[name]
+        parameters = _function_parameters(block)
+        tainted = {
+            parameter
+            for index, parameter in enumerate(parameters)
+            if index in parameter_taint[name]
+        }
+        for line_offset, line in enumerate(block.lines[1:], start=1):
+            masked = _mask_non_code(line)
+            assignment = _assignment_parts(masked)
+            if assignment is not None:
+                target, expression = assignment
+                calls = {call.casefold() for call in _calls(expression)}
+                alias = _simple_identifier(expression)
+                if "idtoship" in calls or calls & returning or alias in tainted:
+                    tainted.add(target)
+                else:
+                    tainted.discard(target)
+            for _position, call, arguments in _line_call_sites(masked):
+                if call != "getdata" or len(arguments) < 2:
+                    continue
+                ship = _simple_identifier(arguments[1])
+                if ship not in tainted or (name, ship or "") in reported:
+                    continue
+                if not _has_ship_transition_evidence(block, ship):
+                    continue
+                if _has_ship_data_stability_guard_before(
+                    block,
+                    line_offset,
+                    ship,
+                    stable_predicates,
+                ):
+                    continue
+                reported.add((name, ship))
+                call_path = _runtime_call_path(background_roots, graph, blocks, name)
+                issues.append(
+                    RuntimeIssue(
+                        "warning",
+                        "runtime-transitional-ship-data-access",
+                        f"Фоновый Turn-граф ({call_path}) читает GetData у корабля "
+                        f"{ship}, восстановленного через IdToShip, до доказательства "
+                        "стабильного lifecycle. Ненулевой handle может уже существовать "
+                        "во время взлёта или перехода в гиперпространство, когда "
+                        "внутренний объект ещё небезопасен для script-data. Выполните "
+                        "отдельные ранние проверки ShipIsTakeoff и ShipInHyperSpace, "
+                        "затем докажите посадку либо ShipInNormalSpace; допустим также "
+                        "пользовательский предикат, где все эти проверки доминируют над "
+                        "каждым успешным result. Проверка после GetData слишком поздняя",
+                        path,
+                        f"{block.location} line {block.start_line + line_offset}",
+                        line.strip(),
+                    )
+                )
+    return issues
+
+
 _MOBILE_SHIP_SOURCES = {
     "buyranger",
     "buytransport",
@@ -8398,6 +8841,7 @@ def lint_rson_runtime(
     issues.extend(_lint_repeated_detached_item_free(project, functions))
     issues.extend(_lint_shippicksitem_forced_transfer(project, functions))
     issues.extend(_lint_order_rewrite_before_hyperspace_guard(project, functions))
+    issues.extend(_lint_transitional_ship_data_access(project, functions))
     issues.extend(_lint_post_group_mutation_dereference(project, functions, ship_effects))
     issues.extend(_lint_cleanup_without_turn_gate(project, functions, ship_effects))
     issues.extend(_lint_stale_shipgetbad_follow(project, functions))

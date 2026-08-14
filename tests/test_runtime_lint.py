@@ -2359,6 +2359,163 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-order-rewrite-in-hyperspace", branch_codes)
 
+    def _transitional_ship_data_project(
+        self,
+        process_code: list[str],
+        *,
+        predicate_code: list[str] | None = None,
+    ) -> RsonProject:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "saved_ship_id", "Parent": -1, "#": 20}
+        ]
+        init = group["Operations"][0]
+        init["Code.Type"] = "Init"
+        init["Code"] = []
+        if predicate_code:
+            init["Code"].extend(predicate_code)
+        init["Code"].extend(
+            [
+                "function ProcessSavedShip(dword ship)",
+                "{",
+                *[f"    {line}" for line in process_code],
+                "}",
+            ]
+        )
+        group["Operations"][1]["Code"] = [
+            "dword restored_ship = IdToShip(saved_ship_id);",
+            "if(!restored_ship) exit;",
+            "ProcessSavedShip(restored_ship);",
+        ]
+        return RsonProject(data, Path("transitional-ship-data.rson"))
+
+    def test_getdata_before_late_transition_guard_warns(self) -> None:
+        project = self._transitional_ship_data_project(
+            [
+                "int state = GetData(2, ship);",
+                "if(ShipIsTakeoff(ship) || ShipInHyperSpace(ship, 1)) exit;",
+            ]
+        )
+        matching = [
+            issue
+            for issue in lint_rson_runtime(project)
+            if issue.code == "runtime-transitional-ship-data-access"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "warning")
+        self.assertIn("ProcessSavedShip", matching[0].message)
+        self.assertIn("GetData", matching[0].evidence or "")
+
+    def test_proven_ship_data_stability_predicate_is_allowed(self) -> None:
+        predicate = [
+            "function ShipDataStable(dword ship)",
+            "{",
+            "    result = 0;",
+            "    if(!ship) exit;",
+            "    if(ShipIsTakeoff(ship)) exit;",
+            "    if(ShipInHyperSpace(ship, 1)) exit;",
+            "    dword place = GetShipPlanet(ship);",
+            "    if(!place) place = GetShipRuins(ship);",
+            "    if(place) { result = 1; exit; }",
+            "    if(ShipInNormalSpace(ship)) result = 1;",
+            "}",
+        ]
+        project = self._transitional_ship_data_project(
+            [
+                "if(!ShipDataStable(ship)) exit;",
+                "int state = GetData(2, ship);",
+                "if(ShipIsTakeoff(ship) || ShipInHyperSpace(ship, 1)) exit;",
+            ],
+            predicate_code=predicate,
+        )
+        codes = {issue.code for issue in lint_rson_runtime(project)}
+        self.assertNotIn("runtime-transitional-ship-data-access", codes)
+
+    def test_separate_direct_transition_and_normal_guards_are_allowed(self) -> None:
+        project = self._transitional_ship_data_project(
+            [
+                "if(ShipIsTakeoff(ship)) exit;",
+                "if(ShipInHyperSpace(ship, 1)) exit;",
+                "if(!ShipInNormalSpace(ship)) exit;",
+                "int state = GetData(2, ship);",
+            ]
+        )
+        codes = {issue.code for issue in lint_rson_runtime(project)}
+        self.assertNotIn("runtime-transitional-ship-data-access", codes)
+
+    def test_compound_transition_guard_is_not_stability_proof(self) -> None:
+        project = self._transitional_ship_data_project(
+            [
+                "if(ShipIsTakeoff(ship) || ShipInHyperSpace(ship, 1)) exit;",
+                "if(!ShipInNormalSpace(ship)) exit;",
+                "int state = GetData(2, ship);",
+            ]
+        )
+        codes = {issue.code for issue in lint_rson_runtime(project)}
+        self.assertIn("runtime-transitional-ship-data-access", codes)
+
+    def test_idtoship_getdata_without_transition_evidence_is_not_banned(self) -> None:
+        project = self._transitional_ship_data_project(
+            [
+                "int state = GetData(2, ship);",
+            ]
+        )
+        codes = {issue.code for issue in lint_rson_runtime(project)}
+        self.assertNotIn("runtime-transitional-ship-data-access", codes)
+
+    def test_reassigned_idtoship_variable_is_not_treated_as_stale_taint(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword ship = IdToShip(saved_ship_id);",
+            "ship = Player();",
+            "int state = GetData(2, ship);",
+            "if(ShipIsTakeoff(ship) || ShipInHyperSpace(ship, 1)) exit;",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("reassigned-ship.rson")))
+        }
+        self.assertNotIn("runtime-transitional-ship-data-access", codes)
+
+    def test_incomplete_user_predicate_does_not_hide_late_data_guard(self) -> None:
+        predicate = [
+            "function WeakShipDataCheck(dword ship)",
+            "{",
+            "    result = 0;",
+            "    if(!ship) exit;",
+            "    if(ShipIsTakeoff(ship)) exit;",
+            "    if(ShipInHyperSpace(ship, 1)) exit;",
+            "    result = 1;",
+            "}",
+        ]
+        project = self._transitional_ship_data_project(
+            [
+                "if(!WeakShipDataCheck(ship)) exit;",
+                "int state = GetData(2, ship);",
+                "if(ShipIsTakeoff(ship) || ShipInHyperSpace(ship, 1)) exit;",
+            ],
+            predicate_code=predicate,
+        )
+        codes = {issue.code for issue in lint_rson_runtime(project)}
+        self.assertIn("runtime-transitional-ship-data-access", codes)
+
+    def test_fresh_buy_ship_getdata_is_not_idtoship_transition_warning(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword factory = GetShipPlanet(Player());",
+            "if(!factory) exit;",
+            "dword pirate = BuyPirate(factory, 100);",
+            "if(!pirate) exit;",
+            "int state = GetData(2, pirate);",
+            "if(ShipIsTakeoff(pirate) || ShipInHyperSpace(pirate, 1)) exit;",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("fresh-buy-data.rson")))
+        }
+        self.assertNotIn("runtime-transitional-ship-data-access", codes)
+
     def test_helper_group_mutation_cannot_be_reread_same_call(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][1]["Code"] = [
