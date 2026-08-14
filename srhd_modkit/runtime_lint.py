@@ -3850,7 +3850,7 @@ def _lint_persistent_item_handles(
     helper_sinks = _persistent_item_parameter_sinks(functions, shared)
     path = str(project.path) if project.path else None
     issues: list[RuntimeIssue] = []
-    reported: set[tuple[str, int, str]] = set()
+    reported: set[tuple[str, int]] = set()
     assignment = re.compile(
         r"(?:\b(?:int|dword|str|float|double|bool)\s+)?"
         r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([^;]+)",
@@ -7728,6 +7728,503 @@ def _lint_state_unconditional_shipbad_write(project: RsonProject) -> list[Runtim
     return issues
 
 
+_MOBILE_SHIP_FACTORY_CALLS = {
+    "buybigwarrior",
+    "buypirate",
+    "buyranger",
+    "buytranclucator",
+    "buytransport",
+    "buywarrior",
+}
+
+
+_SHIP_MUTATION_ARGUMENTS: dict[str, tuple[int, ...]] = {
+    "additemtoship": (1,),
+    "chameleon": (0,),
+    "delitemfromship": (1,),
+    "notalktoship": (0,),
+    "setdata": (2,),
+    "setname": (0,),
+    "shipcalcparam": (0,),
+    "shipcustomfaction": (0,),
+    "shipdestroy": (0,),
+    "shipface": (0,),
+    "shipfreeflight": (0,),
+    "shipjoin": (1,),
+    "shipjointoscript": (1,),
+    "shipout": (0,),
+    "shipowner": (0,),
+    "shippicksitem": (0,),
+    "shiprefuel": (0,),
+    "shiprepaireq": (0,),
+    "shipsetbad": (0,),
+    "shipsetcoords": (0,),
+    "shipstanding": (0,),
+    "transfership": (0,),
+}
+
+
+def _ship_mutation_positions(call: str, arguments: Sequence[str]) -> tuple[int, ...]:
+    """Return ship argument positions for proven state-changing APIs."""
+
+    if call.startswith("order") and arguments:
+        return (0,)
+    return tuple(
+        position
+        for position in _SHIP_MUTATION_ARGUMENTS.get(call, ())
+        if position < len(arguments)
+    )
+
+
+def _shared_runtime_registries(project: RsonProject) -> tuple[set[str], set[str]]:
+    tvars: set[str] = set()
+    groups: set[str] = set()
+    for item in project.iter_objects():
+        name = str(item.get("Name", "")).strip().casefold()
+        kind = str(item.get("Type", "")).casefold()
+        if not name:
+            continue
+        if kind == "tvar":
+            tvars.add(name)
+        elif kind == "tgroup":
+            groups.add(name)
+    return tvars, groups
+
+
+def _assignment_parts(masked: str) -> tuple[str, str] | None:
+    match = re.search(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]+\])?\s*=(?!=)\s*([^;]+)",
+        masked,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1).casefold(), match.group(2).strip()
+
+
+def _registry_publisher_summaries(
+    blocks: Mapping[str, FunctionBlock],
+    tvars: set[str],
+    groups: set[str],
+) -> dict[str, dict[int, set[str]]]:
+    """Map helper parameter positions to persistent registries they publish."""
+
+    summaries: dict[str, dict[int, set[str]]] = {name: {} for name in blocks}
+    changed = True
+    while changed:
+        changed = False
+        for name, block in blocks.items():
+            parameters = _function_parameters(block)
+            if not parameters:
+                continue
+            found: dict[int, set[str]] = {
+                index: set(values) for index, values in summaries[name].items()
+            }
+            for line in block.lines[1:]:
+                masked = _mask_non_code(line)
+                assignment = _assignment_parts(masked)
+                if assignment is not None and assignment[0] in tvars:
+                    target, expression = assignment
+                    identifiers = {value.casefold() for value in IDENTIFIER_RE.findall(expression)}
+                    for index, parameter in enumerate(parameters):
+                        if parameter in identifiers:
+                            found.setdefault(index, set()).add(target)
+                for _position, call, arguments in _line_call_sites(masked):
+                    if call == "arrayadd" and len(arguments) >= 2:
+                        registry = _simple_identifier(arguments[0])
+                        value = _simple_identifier(arguments[1])
+                        if registry in tvars and value in parameters:
+                            found.setdefault(parameters.index(value), set()).add(registry)
+                    elif call == "shipjoin" and len(arguments) >= 2:
+                        registry = _simple_identifier(arguments[0])
+                        value = _simple_identifier(arguments[1])
+                        if registry in groups and value in parameters:
+                            found.setdefault(parameters.index(value), set()).add(registry)
+                    if call not in summaries:
+                        continue
+                    for callee_index, registries in summaries[call].items():
+                        if callee_index >= len(arguments):
+                            continue
+                        value = _simple_identifier(arguments[callee_index])
+                        if value in parameters:
+                            found.setdefault(parameters.index(value), set()).update(registries)
+            if found != summaries[name]:
+                summaries[name] = found
+                changed = True
+    return summaries
+
+
+def _registry_reader_summaries(
+    blocks: Mapping[str, FunctionBlock],
+    registries: set[str],
+) -> dict[str, set[str]]:
+    """Infer helpers whose result returns a value from a shared registry."""
+
+    summaries: dict[str, set[str]] = {name: set() for name in blocks}
+    changed = True
+    while changed:
+        changed = False
+        for name, block in blocks.items():
+            found = set(summaries[name])
+            for line in block.lines[1:]:
+                assignment = _assignment_parts(_mask_non_code(line))
+                if assignment is None or assignment[0] != "result":
+                    continue
+                expression = assignment[1]
+                found.update(
+                    value.casefold()
+                    for value in IDENTIFIER_RE.findall(expression)
+                    if value.casefold() in registries
+                )
+                for call in _calls(expression):
+                    found.update(summaries.get(call.casefold(), ()))
+            if found != summaries[name]:
+                summaries[name] = found
+                changed = True
+    return summaries
+
+
+def _ship_mutator_parameter_summaries(
+    blocks: Mapping[str, FunctionBlock],
+) -> dict[str, set[int]]:
+    """Infer helper parameters that are passed to ship-mutating APIs."""
+
+    summaries: dict[str, set[int]] = {name: set() for name in blocks}
+    changed = True
+    while changed:
+        changed = False
+        for name, block in blocks.items():
+            parameters = _function_parameters(block)
+            if not parameters:
+                continue
+            found = set(summaries[name])
+            for line in block.lines[1:]:
+                for _position, call, arguments in _line_call_sites(_mask_non_code(line)):
+                    positions = _ship_mutation_positions(call, arguments)
+                    positions += tuple(summaries.get(call, ()))
+                    for position in positions:
+                        if position >= len(arguments):
+                            continue
+                        value = _simple_identifier(arguments[position])
+                        if value in parameters:
+                            found.add(parameters.index(value))
+            if found != summaries[name]:
+                summaries[name] = found
+                changed = True
+    return summaries
+
+
+def _expression_registries(
+    expression: str,
+    registries: set[str],
+    reader_summaries: Mapping[str, set[str]],
+) -> set[str]:
+    found = {
+        value.casefold()
+        for value in IDENTIFIER_RE.findall(expression)
+        if value.casefold() in registries
+    }
+    for call in _calls(expression):
+        found.update(reader_summaries.get(call.casefold(), ()))
+    return found
+
+
+def _registry_mutation_sites(
+    block: FunctionBlock,
+    registries: set[str],
+    reader_summaries: Mapping[str, set[str]],
+    mutator_summaries: Mapping[str, set[int]],
+) -> list[tuple[int, str, str]]:
+    """Find mutations of ships restored from a persistent registry."""
+
+    resolved: dict[str, set[str]] = {}
+    sites: list[tuple[int, str, str]] = []
+    for line_index, line in enumerate(block.lines[1:], start=1):
+        masked = _mask_non_code(line)
+        assignment = _assignment_parts(masked)
+        if assignment is not None:
+            target, expression = assignment
+            sources: set[str] = set()
+            for _position, call, arguments in _line_call_sites(expression):
+                if call == "idtoship" and arguments:
+                    sources.update(
+                        _expression_registries(arguments[0], registries, reader_summaries)
+                    )
+                elif call == "groupship" and arguments:
+                    registry = _simple_identifier(arguments[0])
+                    if registry in registries:
+                        sources.add(registry)
+            alias = _simple_identifier(expression)
+            if alias in resolved:
+                sources.update(resolved[alias])
+            if sources:
+                resolved[target] = sources
+            elif target in resolved:
+                resolved.pop(target)
+
+        for _position, call, arguments in _line_call_sites(masked):
+            positions = _ship_mutation_positions(call, arguments)
+            positions += tuple(mutator_summaries.get(call, ()))
+            for position in positions:
+                if position >= len(arguments):
+                    continue
+                value = _simple_identifier(arguments[position])
+                for registry in sorted(resolved.get(value or "", ())):
+                    sites.append((line_index, registry, line.strip()))
+    return sites
+
+
+def _loop_ranges(block: FunctionBlock) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    for line_index, line in enumerate(block.lines[1:], start=1):
+        if not re.search(r"\b(?:for|while)\s*\(", _mask_non_code(line), re.IGNORECASE):
+            continue
+        body = _statement_body_range(block.lines, line_index)
+        if body is None:
+            continue
+        literal_range = _simple_for_range(line, {})
+        if literal_range is not None and literal_range[2] <= literal_range[1]:
+            continue
+        ranges.append((line_index, body[1]))
+    return tuple(ranges)
+
+
+def _batch_publications(
+    block: FunctionBlock,
+    publisher_summaries: Mapping[str, Mapping[int, set[str]]],
+    tvars: set[str],
+    groups: set[str],
+) -> list[tuple[int, int, str, str, str]]:
+    """Return constructor/publication pairs inside potentially repeated loops."""
+
+    publications: list[tuple[int, int, str, str, str]] = []
+    registries = tvars | groups
+    for loop_start, loop_end in _loop_ranges(block):
+        fresh_handles: set[str] = set()
+        fresh_ids: set[str] = set()
+        constructor_line: int | None = None
+        constructor_call = ""
+        for line_index in range(loop_start, loop_end + 1):
+            line = block.lines[line_index]
+            masked = _mask_non_code(line)
+            assignment = _assignment_parts(masked)
+            if assignment is not None:
+                target, expression = assignment
+                calls = {call.casefold() for call in _calls(expression)}
+                factories = calls & _MOBILE_SHIP_FACTORY_CALLS
+                if factories:
+                    fresh_handles.add(target)
+                    constructor_line = constructor_line or line_index
+                    constructor_call = constructor_call or sorted(factories)[0]
+                elif re.search(
+                    rf"\bId\s*\(\s*(?:{'|'.join(re.escape(value) for value in sorted(fresh_handles))})\s*\)",
+                    expression,
+                    re.IGNORECASE,
+                ) if fresh_handles else False:
+                    fresh_ids.add(target)
+                else:
+                    alias = _simple_identifier(expression)
+                    if alias in fresh_handles:
+                        fresh_handles.add(target)
+                    elif alias in fresh_ids:
+                        fresh_ids.add(target)
+
+                if target in tvars:
+                    identifiers = {
+                        value.casefold() for value in IDENTIFIER_RE.findall(expression)
+                    }
+                    if identifiers & (fresh_handles | fresh_ids) and constructor_line is not None:
+                        publications.append(
+                            (constructor_line, line_index, constructor_call, target, line.strip())
+                        )
+
+            for _position, call, arguments in _line_call_sites(masked):
+                published: set[str] = set()
+                if call == "arrayadd" and len(arguments) >= 2:
+                    registry = _simple_identifier(arguments[0])
+                    value = _simple_identifier(arguments[1])
+                    if registry in tvars and value in fresh_handles | fresh_ids:
+                        published.add(registry)
+                elif call == "shipjoin" and len(arguments) >= 2:
+                    registry = _simple_identifier(arguments[0])
+                    value = _simple_identifier(arguments[1])
+                    if registry in groups and value in fresh_handles:
+                        published.add(registry)
+                for parameter, targets in publisher_summaries.get(call, {}).items():
+                    if parameter >= len(arguments):
+                        continue
+                    value = _simple_identifier(arguments[parameter])
+                    if value in fresh_handles | fresh_ids:
+                        published.update(targets & registries)
+                if constructor_line is None:
+                    continue
+                for registry in sorted(published):
+                    publications.append(
+                        (constructor_line, line_index, constructor_call, registry, line.strip())
+                    )
+    return publications
+
+
+def _early_exit_guard_variables(
+    block: FunctionBlock,
+    before_line: int,
+    tvars: set[str],
+) -> set[str]:
+    depths = _line_depths(block.lines)
+    guarded: set[str] = set()
+    for line_index in range(1, min(before_line, len(block.lines))):
+        if depths[line_index] > 1:
+            continue
+        parsed = _leading_if_condition(block.lines[line_index])
+        if parsed is None:
+            continue
+        body = _statement_body_range(block.lines, line_index)
+        same_line_exit = bool(
+            re.search(
+                r"\b(?:exit|return)\s*;",
+                _mask_non_code(block.lines[line_index])[parsed[1] + 1 :],
+                re.IGNORECASE,
+            )
+        )
+        if not same_line_exit and (
+            body is None or not _range_has_unconditional_exit(block.lines, body[0], body[1])
+        ):
+            continue
+        guarded.update(
+            value.casefold()
+            for value in IDENTIFIER_RE.findall(parsed[0])
+            if value.casefold() in tvars
+        )
+    return guarded
+
+
+def _has_batch_reentry_barrier(
+    block: FunctionBlock,
+    constructor_line: int,
+    traversal_line: int,
+    tvars: set[str],
+) -> bool:
+    assigned_before_spawn = {
+        assignment[0]
+        for line in block.lines[1:constructor_line]
+        if (assignment := _assignment_parts(_mask_non_code(line))) is not None
+        and assignment[0] in tvars
+    }
+    if not assigned_before_spawn:
+        return False
+    guarded = _early_exit_guard_variables(block, traversal_line + 1, tvars)
+    return bool(assigned_before_spawn & guarded)
+
+
+def _lint_batch_ship_spawn_reentry(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Warn about a partially published ship batch visible to nested Turn code."""
+
+    path = str(project.path) if project.path else None
+    blocks = _runtime_analysis_blocks(project, functions)
+    graph = _call_graph(blocks)
+    dialog_scoped = _dialog_scoped_turn_objects(project)
+    background_roots = {
+        name
+        for name, block in blocks.items()
+        if name.startswith("__handler_")
+        and block.code_type == "turn"
+        and block.object_id not in dialog_scoped
+    }
+    reachable = _reachable(background_roots, graph)
+    tvars, groups = _shared_runtime_registries(project)
+    registries = tvars | groups
+    if not background_roots or not registries:
+        return []
+    registry_labels = {
+        str(item.get("Name", "")).strip().casefold(): str(item.get("Name", "")).strip()
+        for item in project.iter_objects()
+        if str(item.get("Name", "")).strip().casefold() in registries
+    }
+
+    publishers = _registry_publisher_summaries(blocks, tvars, groups)
+    readers = _registry_reader_summaries(blocks, registries)
+    mutators = _ship_mutator_parameter_summaries(blocks)
+    direct_traversals = {
+        name: _registry_mutation_sites(block, registries, readers, mutators)
+        for name, block in blocks.items()
+    }
+
+    traversal_summaries: dict[str, set[str]] = {
+        name: {registry for _line, registry, _evidence in sites}
+        for name, sites in direct_traversals.items()
+    }
+    changed = True
+    while changed:
+        changed = False
+        for name, callees in graph.items():
+            found = set(traversal_summaries[name])
+            for callee in callees:
+                found.update(traversal_summaries.get(callee, ()))
+            if found != traversal_summaries[name]:
+                traversal_summaries[name] = found
+                changed = True
+
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[str, int, str]] = set()
+    for name in sorted(reachable):
+        block = blocks[name]
+        for constructor_line, publication_line, constructor, registry, publication in _batch_publications(
+            block, publishers, tvars, groups
+        ):
+            traversal: tuple[int, str] | None = next(
+                (
+                    (line_index, evidence)
+                    for line_index, candidate, evidence in direct_traversals[name]
+                    if candidate == registry and line_index < constructor_line
+                ),
+                None,
+            )
+            if traversal is None:
+                for line_index, line in enumerate(block.lines[1:constructor_line], start=1):
+                    callees = {
+                        call.casefold()
+                        for call in _calls(line)
+                        if call.casefold() in traversal_summaries
+                        and registry in traversal_summaries[call.casefold()]
+                    }
+                    if callees:
+                        traversal = (line_index, line.strip())
+                        break
+            if traversal is None or _has_batch_reentry_barrier(
+                block, constructor_line, traversal[0], tvars
+            ):
+                continue
+            key = (name, constructor_line)
+            if key in reported:
+                continue
+            reported.add(key)
+            call_path = _runtime_call_path(background_roots, graph, blocks, name)
+            registry_label = registry_labels.get(registry, registry)
+            issues.append(
+                RuntimeIssue(
+                    "warning",
+                    "runtime-batch-ship-spawn-partial-registry-reentry",
+                    f"Фоновый Turn-граф ({call_path}) создаёт несколько кораблей через "
+                    f"{constructor} в цикле и публикует часть партии в общий реестр "
+                    f"{registry_label} до завершения цикла. Ранее тот же обработчик обходит "
+                    "этот реестр и изменяет восстановленные корабли, а ранний re-entry "
+                    "barrier не доказан. Если конструктор повторно запустит Turn/AI, "
+                    "вложенный вызов увидит частично созданную партию. Установите "
+                    "persistent/scalar barrier до первого Buy* и проверяйте его до "
+                    "обхода реестра либо публикуйте партию только после завершения "
+                    "создания. Одиночная настройка свежего Buy* этим правилом не "
+                    "запрещается",
+                    path,
+                    f"{block.location} line {block.start_line + constructor_line}",
+                    f"traversal: {traversal[1]} | publication: {publication}",
+                )
+            )
+    return issues
+
+
 def _lint_synchronous_runtime_reentry(
     project: RsonProject,
     functions: dict[str, FunctionBlock],
@@ -7910,6 +8407,7 @@ def lint_rson_runtime(
     issues.extend(_lint_warrior_home_release(project, functions))
     issues.extend(_lint_shared_state_mutates_player(project))
     issues.extend(_lint_state_unconditional_shipbad_write(project))
+    issues.extend(_lint_batch_ship_spawn_reentry(project, functions))
     issues.extend(_lint_synchronous_runtime_reentry(project, functions))
     graph = _call_graph(functions)
     risky = _risky_functions(functions, graph)

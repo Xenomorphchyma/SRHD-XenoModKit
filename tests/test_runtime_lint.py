@@ -365,6 +365,178 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-truce-state-reentry-cycle", safe_codes)
 
+    def _batch_spawn_project(self, *, barrier: bool) -> RsonProject:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "pending_a", "Parent": -1, "#": 20},
+            {"Type": "TVar", "Name": "pending_b", "Parent": -1, "#": 21},
+        ]
+        if barrier:
+            group["Variables"].append(
+                {"Type": "TVar", "Name": "spawn_busy", "Parent": -1, "#": 22}
+            )
+        init = group["Operations"][0]
+        init["Code.Type"] = "Init"
+        init["Code"] = [
+            "function GetPending(int slot)",
+            "{",
+            "    result = 0;",
+            "    if(slot == 1) result = pending_a;",
+            "    if(slot == 2) result = pending_b;",
+            "}",
+            "function SetPending(int slot, int value)",
+            "{",
+            "    if(slot == 1) pending_a = value;",
+            "    if(slot == 2) pending_b = value;",
+            "}",
+            "function ConfigurePending(dword ship)",
+            "{",
+            "    SetData(1, 0, ship);",
+            "}",
+            "function SpawnAmbush()",
+            "{",
+        ]
+        if barrier:
+            init["Code"].append("    if(spawn_busy) exit;")
+        init["Code"].extend(
+            [
+                "    for(int probe = 1; probe <= 2; probe = probe + 1)",
+                "    {",
+                "        dword pending = IdToShip(GetPending(probe));",
+                "        if(!pending) continue;",
+                "        ConfigurePending(pending);",
+                "    }",
+            ]
+        )
+        if barrier:
+            init["Code"].append("    spawn_busy = 1;")
+        init["Code"].extend(
+            [
+                "    dword factory = GetShipPlanet(Player());",
+                "    if(!factory) exit;",
+                "    for(int slot = 1; slot <= 2; slot = slot + 1)",
+                "    {",
+                "        dword pirate = BuyPirate(factory, 100);",
+                "        if(!pirate) continue;",
+                "        int pirate_id = Id(pirate);",
+                "        SetPending(slot, pirate_id);",
+                "    }",
+            ]
+        )
+        if barrier:
+            init["Code"].append("    spawn_busy = 0;")
+        init["Code"].append("}")
+        group["Operations"][1]["Code"] = ["SpawnAmbush();"]
+        return RsonProject(
+            data,
+            Path("batch-with-barrier.rson" if barrier else "batch-without-barrier.rson"),
+        )
+
+    def test_batch_spawn_published_to_traversed_registry_warns(self) -> None:
+        matching = [
+            issue
+            for issue in lint_rson_runtime(self._batch_spawn_project(barrier=False))
+            if issue.code == "runtime-batch-ship-spawn-partial-registry-reentry"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "warning")
+        self.assertIn("pending_", matching[0].message)
+        self.assertIn("ConfigurePending", matching[0].evidence or "")
+        self.assertIn("SetPending", matching[0].evidence or "")
+
+    def test_batch_spawn_with_early_reentry_barrier_is_allowed(self) -> None:
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(self._batch_spawn_project(barrier=True))
+        }
+        self.assertNotIn(
+            "runtime-batch-ship-spawn-partial-registry-reentry",
+            codes,
+        )
+
+    def test_single_fresh_ship_configuration_matches_official_example(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Groups"] = [
+            {"Type": "TGroup", "Name": "Dummy", "AddPlayer": False, "#": 20}
+        ]
+        group["Operations"][1]["Code"] = [
+            "dword factory = GetShipPlanet(Player());",
+            "if(!factory) exit;",
+            "dword quest_ship = BuyPirate(factory, 100);",
+            "if(!quest_ship) exit;",
+            "ShipFace(quest_ship, face);",
+            "SetName(quest_ship, name);",
+            "ShipSetCoords(quest_ship, 100, 200);",
+            "ShipJoin(Dummy, quest_ship);",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("single-buy-pirate.rson")))
+        }
+        self.assertNotIn(
+            "runtime-batch-ship-spawn-partial-registry-reentry",
+            codes,
+        )
+
+    def test_batch_configuration_without_prior_registry_traversal_is_allowed(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Groups"] = [
+            {"Type": "TGroup", "Name": "Wave", "AddPlayer": False, "#": 20}
+        ]
+        group["Operations"][1]["Code"] = [
+            "dword factory = GetShipPlanet(Player());",
+            "if(!factory) exit;",
+            "for(int slot = 1; slot <= 3; slot = slot + 1)",
+            "{",
+            "    dword pirate = BuyPirate(factory, 100);",
+            "    if(!pirate) continue;",
+            "    ShipFace(pirate, face);",
+            "    SetName(pirate, name);",
+            "    ShipJoin(Wave, pirate);",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("batch-no-traversal.rson")))
+        }
+        self.assertNotIn(
+            "runtime-batch-ship-spawn-partial-registry-reentry",
+            codes,
+        )
+
+    def test_group_registry_batch_reentry_warns(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Groups"] = [
+            {"Type": "TGroup", "Name": "Wave", "AddPlayer": False, "#": 20}
+        ]
+        group["Operations"][1]["Code"] = [
+            "for(int probe = 0; probe < GroupCount(Wave); probe = probe + 1)",
+            "{",
+            "    dword existing = GroupShip(Wave, probe);",
+            "    if(!existing) continue;",
+            "    OrderNone(existing);",
+            "}",
+            "dword factory = GetShipPlanet(Player());",
+            "if(!factory) exit;",
+            "for(int slot = 1; slot <= 3; slot = slot + 1)",
+            "{",
+            "    dword pirate = BuyPirate(factory, 100);",
+            "    if(!pirate) continue;",
+            "    ShipJoin(Wave, pirate);",
+            "}",
+        ]
+        matching = [
+            issue
+            for issue in lint_rson_runtime(RsonProject(data, Path("group-batch-reentry.rson")))
+            if issue.code == "runtime-batch-ship-spawn-partial-registry-reentry"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("Wave", matching[0].message)
+
     def test_state_handler_cannot_call_function_from_top_code(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][0]["Code.Type"] = "Init"
