@@ -5255,7 +5255,11 @@ def _lint_transitional_ship_data_access(
                         "отдельные ранние проверки ShipIsTakeoff и ShipInHyperSpace, "
                         "затем докажите посадку либо ShipInNormalSpace; допустим также "
                         "пользовательский предикат, где все эти проверки доминируют над "
-                        "каждым успешным result. Проверка после GetData слишком поздняя",
+                        "каждым успешным result. Это устраняет очевидный ранний доступ, "
+                        "но не доказывает сохранность script-data после полного "
+                        "Buy*/persistent-ID/transition lifecycle; для него учитывайте "
+                        "runtime-fresh-ship-script-data-cross-transition. Проверка "
+                        "после GetData слишком поздняя",
                         path,
                         f"{block.location} line {block.start_line + line_offset}",
                         line.strip(),
@@ -8668,6 +8672,504 @@ def _lint_batch_ship_spawn_reentry(
     return issues
 
 
+_SCRIPT_DATA_CROSS_TRANSITION_CALLS = {
+    "orderjump",
+    "orderlanding",
+    "ordertakeoff",
+    "transfership",
+}
+
+
+def _fresh_ship_returning_functions(
+    blocks: Mapping[str, FunctionBlock],
+) -> set[str]:
+    """Infer helpers that return a ship created by a Buy* factory."""
+
+    result: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, block in blocks.items():
+            fresh: set[str] = set()
+            returns_fresh = False
+            for line in block.lines[1:]:
+                assignment = _assignment_parts(_mask_non_code(line))
+                if assignment is None:
+                    continue
+                target, expression = assignment
+                calls = {call.casefold() for call in _calls(expression)}
+                alias = _simple_identifier(expression)
+                source = bool(calls & (_MOBILE_SHIP_FACTORY_CALLS | result))
+                source |= alias in fresh
+                if target == "result":
+                    returns_fresh |= source
+                elif source:
+                    fresh.add(target)
+                else:
+                    fresh.discard(target)
+            if returns_fresh and name not in result:
+                result.add(name)
+                changed = True
+    return result
+
+
+def _fresh_ship_parameter_taint(
+    blocks: Mapping[str, FunctionBlock],
+    reachable: set[str],
+    returning: set[str],
+) -> dict[str, set[int]]:
+    """Propagate fresh Buy* handles through user-function parameters."""
+
+    tainted_parameters: dict[str, set[int]] = {name: set() for name in blocks}
+    changed = True
+    while changed:
+        changed = False
+        for name in sorted(reachable):
+            block = blocks[name]
+            parameters = _function_parameters(block)
+            fresh = {
+                parameter
+                for index, parameter in enumerate(parameters)
+                if index in tainted_parameters[name]
+            }
+            for line in block.lines[1:]:
+                masked = _mask_non_code(line)
+                assignment = _assignment_parts(masked)
+                if assignment is not None:
+                    target, expression = assignment
+                    calls = {call.casefold() for call in _calls(expression)}
+                    alias = _simple_identifier(expression)
+                    if calls & (_MOBILE_SHIP_FACTORY_CALLS | returning) or alias in fresh:
+                        fresh.add(target)
+                    else:
+                        fresh.discard(target)
+                for _position, call, arguments in _line_call_sites(masked):
+                    if call not in blocks:
+                        continue
+                    callee_parameters = _function_parameters(blocks[call])
+                    for argument_index, argument in enumerate(arguments):
+                        actual = _simple_identifier(argument)
+                        if actual not in fresh or argument_index >= len(callee_parameters):
+                            continue
+                        if argument_index not in tainted_parameters[call]:
+                            tainted_parameters[call].add(argument_index)
+                            changed = True
+    return tainted_parameters
+
+
+def _expression_has_fresh_ship_id(expression: str, fresh: set[str]) -> bool:
+    return any(
+        call == "id"
+        and bool(arguments)
+        and _simple_identifier(arguments[0]) in fresh
+        for _position, call, arguments in _line_call_sites(expression)
+    )
+
+
+def _fresh_registry_publication_sites(
+    blocks: Mapping[str, FunctionBlock],
+    reachable: set[str],
+    tvars: set[str],
+    publisher_summaries: Mapping[str, Mapping[int, set[str]]],
+    returning: set[str],
+    parameter_taint: Mapping[str, set[int]],
+) -> dict[str, tuple[str, int, str]]:
+    """Return the first persistent registry publication of a fresh Buy* ship."""
+
+    sites: dict[str, tuple[str, int, str]] = {}
+    for name in sorted(reachable):
+        block = blocks[name]
+        parameters = _function_parameters(block)
+        fresh = {
+            parameter
+            for index, parameter in enumerate(parameters)
+            if index in parameter_taint[name]
+        }
+        fresh_ids: set[str] = set()
+        for line_index, line in enumerate(block.lines[1:], start=1):
+            masked = _mask_non_code(line)
+            assignment = _assignment_parts(masked)
+            if assignment is not None:
+                target, expression = assignment
+                calls = {call.casefold() for call in _calls(expression)}
+                alias = _simple_identifier(expression)
+                if calls & (_MOBILE_SHIP_FACTORY_CALLS | returning) or alias in fresh:
+                    fresh.add(target)
+                    fresh_ids.discard(target)
+                elif _expression_has_fresh_ship_id(expression, fresh) or alias in fresh_ids:
+                    fresh_ids.add(target)
+                    fresh.discard(target)
+                else:
+                    fresh.discard(target)
+                    fresh_ids.discard(target)
+                if target in tvars:
+                    identifiers = {
+                        value.casefold() for value in IDENTIFIER_RE.findall(expression)
+                    }
+                    if identifiers & (fresh | fresh_ids):
+                        sites.setdefault(target, (name, line_index, line.strip()))
+
+            for _position, call, arguments in _line_call_sites(masked):
+                published: set[str] = set()
+                if call == "arrayadd" and len(arguments) >= 2:
+                    registry = _simple_identifier(arguments[0])
+                    value = _simple_identifier(arguments[1])
+                    if registry in tvars and value in fresh | fresh_ids:
+                        published.add(registry)
+                for parameter, registries in publisher_summaries.get(call, {}).items():
+                    if parameter >= len(arguments):
+                        continue
+                    argument = arguments[parameter]
+                    value = _simple_identifier(argument)
+                    if (
+                        value in fresh | fresh_ids
+                        or _expression_has_fresh_ship_id(argument, fresh)
+                    ):
+                        published.update(registries & tvars)
+                for registry in sorted(published):
+                    sites.setdefault(registry, (name, line_index, line.strip()))
+    return sites
+
+
+def _registry_ship_return_summaries(
+    blocks: Mapping[str, FunctionBlock],
+    registries: set[str],
+    reader_summaries: Mapping[str, set[str]],
+) -> dict[str, set[str]]:
+    """Infer helpers that return IdToShip values from persistent registries."""
+
+    summaries: dict[str, set[str]] = {name: set() for name in blocks}
+    changed = True
+    while changed:
+        changed = False
+        for name, block in blocks.items():
+            resolved: dict[str, set[str]] = {}
+            registry_ids: dict[str, set[str]] = {}
+            found = set(summaries[name])
+            for line in block.lines[1:]:
+                assignment = _assignment_parts(_mask_non_code(line))
+                if assignment is None:
+                    continue
+                target, expression = assignment
+                sources: set[str] = set()
+                id_sources = _expression_registries(
+                    expression, registries, reader_summaries
+                )
+                id_alias = _simple_identifier(expression)
+                if id_alias in registry_ids:
+                    id_sources.update(registry_ids[id_alias])
+                for _position, call, arguments in _line_call_sites(expression):
+                    if call == "idtoship" and arguments:
+                        argument_sources = _expression_registries(
+                            arguments[0], registries, reader_summaries
+                        )
+                        argument_alias = _simple_identifier(arguments[0])
+                        if argument_alias in registry_ids:
+                            argument_sources.update(registry_ids[argument_alias])
+                        sources.update(argument_sources)
+                    sources.update(summaries.get(call, ()))
+                alias = _simple_identifier(expression)
+                if alias in resolved:
+                    sources.update(resolved[alias])
+                if target == "result":
+                    found.update(sources)
+                elif sources:
+                    resolved[target] = sources
+                else:
+                    resolved.pop(target, None)
+                if not sources and id_sources:
+                    registry_ids[target] = id_sources
+                else:
+                    registry_ids.pop(target, None)
+            if found != summaries[name]:
+                summaries[name] = found
+                changed = True
+    return summaries
+
+
+def _registry_ship_parameter_sources(
+    blocks: Mapping[str, FunctionBlock],
+    reachable: set[str],
+    registries: set[str],
+    reader_summaries: Mapping[str, set[str]],
+    return_summaries: Mapping[str, set[str]],
+) -> dict[str, dict[int, set[str]]]:
+    """Propagate registry provenance of IdToShip handles into helpers."""
+
+    parameter_sources: dict[str, dict[int, set[str]]] = {
+        name: {} for name in blocks
+    }
+    changed = True
+    while changed:
+        changed = False
+        for name in sorted(reachable):
+            block = blocks[name]
+            parameters = _function_parameters(block)
+            resolved: dict[str, set[str]] = {
+                parameter: set(parameter_sources[name].get(index, ()))
+                for index, parameter in enumerate(parameters)
+                if parameter_sources[name].get(index)
+            }
+            registry_ids: dict[str, set[str]] = {}
+            for line in block.lines[1:]:
+                masked = _mask_non_code(line)
+                assignment = _assignment_parts(masked)
+                if assignment is not None:
+                    target, expression = assignment
+                    sources: set[str] = set()
+                    id_sources = _expression_registries(
+                        expression, registries, reader_summaries
+                    )
+                    id_alias = _simple_identifier(expression)
+                    if id_alias in registry_ids:
+                        id_sources.update(registry_ids[id_alias])
+                    for _position, call, arguments in _line_call_sites(expression):
+                        if call == "idtoship" and arguments:
+                            argument_sources = _expression_registries(
+                                arguments[0], registries, reader_summaries
+                            )
+                            argument_alias = _simple_identifier(arguments[0])
+                            if argument_alias in registry_ids:
+                                argument_sources.update(registry_ids[argument_alias])
+                            sources.update(argument_sources)
+                        sources.update(return_summaries.get(call, ()))
+                    alias = _simple_identifier(expression)
+                    if alias in resolved:
+                        sources.update(resolved[alias])
+                    if sources:
+                        resolved[target] = sources
+                    else:
+                        resolved.pop(target, None)
+                    if not sources and id_sources:
+                        registry_ids[target] = id_sources
+                    else:
+                        registry_ids.pop(target, None)
+                for _position, call, arguments in _line_call_sites(masked):
+                    if call not in blocks:
+                        continue
+                    callee_parameters = _function_parameters(blocks[call])
+                    for argument_index, argument in enumerate(arguments):
+                        value = _simple_identifier(argument)
+                        sources = resolved.get(value or "", set())
+                        if not sources or argument_index >= len(callee_parameters):
+                            continue
+                        current = parameter_sources[call].setdefault(argument_index, set())
+                        before = len(current)
+                        current.update(sources)
+                        if len(current) != before:
+                            changed = True
+    return parameter_sources
+
+
+def _registry_ship_lifecycle_sites(
+    block: FunctionBlock,
+    parameter_sources: Mapping[int, set[str]],
+    registries: set[str],
+    reader_summaries: Mapping[str, set[str]],
+    return_summaries: Mapping[str, set[str]],
+) -> tuple[
+    list[tuple[int, str, str, str]],
+    list[tuple[int, str, str]],
+]:
+    """Return transition and GetData sites for registry-restored ships."""
+
+    parameters = _function_parameters(block)
+    resolved: dict[str, set[str]] = {
+        parameter: set(parameter_sources.get(index, ()))
+        for index, parameter in enumerate(parameters)
+        if parameter_sources.get(index)
+    }
+    registry_ids: dict[str, set[str]] = {}
+    transitions: list[tuple[int, str, str, str]] = []
+    data_reads: list[tuple[int, str, str]] = []
+    for line_index, line in enumerate(block.lines[1:], start=1):
+        masked = _mask_non_code(line)
+        assignment = _assignment_parts(masked)
+        if assignment is not None:
+            target, expression = assignment
+            sources: set[str] = set()
+            id_sources = _expression_registries(
+                expression, registries, reader_summaries
+            )
+            id_alias = _simple_identifier(expression)
+            if id_alias in registry_ids:
+                id_sources.update(registry_ids[id_alias])
+            for _position, call, arguments in _line_call_sites(expression):
+                if call == "idtoship" and arguments:
+                    argument_sources = _expression_registries(
+                        arguments[0], registries, reader_summaries
+                    )
+                    argument_alias = _simple_identifier(arguments[0])
+                    if argument_alias in registry_ids:
+                        argument_sources.update(registry_ids[argument_alias])
+                    sources.update(argument_sources)
+                sources.update(return_summaries.get(call, ()))
+            alias = _simple_identifier(expression)
+            if alias in resolved:
+                sources.update(resolved[alias])
+            if sources:
+                resolved[target] = sources
+            else:
+                resolved.pop(target, None)
+            if not sources and id_sources:
+                registry_ids[target] = id_sources
+            else:
+                registry_ids.pop(target, None)
+
+        for _position, call, arguments in _line_call_sites(masked):
+            ship_position: int | None = None
+            if call in _SCRIPT_DATA_CROSS_TRANSITION_CALLS and arguments:
+                ship_position = 0
+            elif call == "getdata" and len(arguments) >= 2:
+                ship_position = 1
+            if ship_position is None:
+                continue
+            ship = _simple_identifier(arguments[ship_position])
+            for registry in sorted(resolved.get(ship or "", ())):
+                if call == "getdata":
+                    data_reads.append((line_index, registry, line.strip()))
+                else:
+                    transitions.append((line_index, registry, call, line.strip()))
+    return transitions, data_reads
+
+
+def _lint_fresh_ship_script_data_cross_transition(
+    project: RsonProject,
+    functions: dict[str, FunctionBlock],
+) -> list[RuntimeIssue]:
+    """Warn when object-owned script data crosses a fresh ship transition."""
+
+    path = str(project.path) if project.path else None
+    blocks = _runtime_analysis_blocks(project, functions)
+    graph = _call_graph(blocks)
+    dialog_scoped = _dialog_scoped_turn_objects(project)
+    background_roots = {
+        name
+        for name, block in blocks.items()
+        if name.startswith("__handler_")
+        and block.code_type == "turn"
+        and block.object_id not in dialog_scoped
+    }
+    reachable = _reachable(background_roots, graph)
+    tvars, groups = _shared_runtime_registries(project)
+    if not background_roots or not tvars:
+        return []
+
+    publishers = _registry_publisher_summaries(blocks, tvars, groups)
+    readers = _registry_reader_summaries(blocks, tvars)
+    fresh_returning = _fresh_ship_returning_functions(blocks)
+    fresh_parameters = _fresh_ship_parameter_taint(
+        blocks, reachable, fresh_returning
+    )
+    publications = _fresh_registry_publication_sites(
+        blocks,
+        reachable,
+        tvars,
+        publishers,
+        fresh_returning,
+        fresh_parameters,
+    )
+
+    registry_returns = _registry_ship_return_summaries(blocks, tvars, readers)
+    parameter_sources = _registry_ship_parameter_sources(
+        blocks,
+        reachable,
+        tvars,
+        readers,
+        registry_returns,
+    )
+    transition_sites: dict[str, tuple[str, int, str, str]] = {}
+    transfer_sites: dict[str, tuple[str, int, str, str]] = {}
+    data_sites: list[tuple[str, int, str, str]] = []
+    for name in sorted(reachable):
+        transitions, reads = _registry_ship_lifecycle_sites(
+            blocks[name],
+            parameter_sources[name],
+            tvars,
+            readers,
+            registry_returns,
+        )
+        for line_index, registry, call, evidence in transitions:
+            transition_sites.setdefault(
+                registry, (name, line_index, call, evidence)
+            )
+            if call == "transfership":
+                transfer_sites.setdefault(
+                    registry, (name, line_index, call, evidence)
+                )
+        for line_index, registry, evidence in reads:
+            data_sites.append((name, line_index, registry, evidence))
+
+    issues: list[RuntimeIssue] = []
+    reads_by_registry: dict[str, list[tuple[str, int, str]]] = {}
+    for name, line_index, registry, evidence in data_sites:
+        reads_by_registry.setdefault(registry, []).append(
+            (name, line_index, evidence)
+        )
+    eligible_registries = {
+        registry
+        for registry in reads_by_registry
+        if registry in transition_sites
+        and (registry in publications or registry in transfer_sites)
+    }
+    for registry in sorted(eligible_registries):
+        registry_reads = reads_by_registry[registry]
+        name, line_index, evidence = registry_reads[0]
+        selected_transition = (
+            transition_sites[registry]
+            if registry in publications
+            else transfer_sites[registry]
+        )
+        transition_name, transition_line, transition_call, transition = (
+            selected_transition
+        )
+        block = blocks[name]
+        call_path = _runtime_call_path(background_roots, graph, blocks, name)
+        reader_names = sorted(
+            {
+                blocks[reader].name
+                for reader, _line, _evidence in registry_reads
+            }
+        )
+        if registry in publications:
+            publication_name, publication_line, publication = publications[registry]
+            origin_message = "ID свежего Buy*-корабля публикуется в тот же реестр"
+            publication_evidence = (
+                f"publication {blocks[publication_name].location} line "
+                f"{blocks[publication_name].start_line + publication_line}: "
+                f"{publication} | "
+            )
+        else:
+            origin_message = (
+                "корабль восстановлен из persistent-ID и проходит TransferShip"
+            )
+            publication_evidence = f"persistent registry: {registry} | "
+        issues.append(
+            RuntimeIssue(
+                "warning",
+                "runtime-fresh-ship-script-data-cross-transition",
+                f"В фоновом Turn-графе ({call_path}) обнаружено "
+                f"{len(registry_reads)} чтений GetData у кораблей, "
+                f"восстановленных из persistent-реестра {registry}. Для этого "
+                f"lifecycle доказана опасная граница: {origin_message}; затем "
+                f"фиксируется движковый переход {transition_call}. Runtime-"
+                "свидетельство показывает, что ShipIsTakeoff, ShipInHyperSpace "
+                "и стабильное spatial-размещение не доказывают доступность "
+                "внутреннего script-data после такой границы: GetData способен "
+                "завершить NextDay с EAccessViolation. Храните сценарные поля во "
+                "внешней persistent-таблице по слоту/числовому ID. Обычный GetData "
+                "без полного lifecycle-графа этим правилом не запрещается",
+                path,
+                f"{block.location} line {block.start_line + line_index}",
+                f"{publication_evidence}transition {blocks[transition_name].location} "
+                f"line {blocks[transition_name].start_line + transition_line}: "
+                f"{transition} | readers: {', '.join(reader_names)} | "
+                f"first read: {evidence}",
+            )
+        )
+    return issues
+
+
 def _lint_synchronous_runtime_reentry(
     project: RsonProject,
     functions: dict[str, FunctionBlock],
@@ -8852,6 +9354,7 @@ def lint_rson_runtime(
     issues.extend(_lint_shared_state_mutates_player(project))
     issues.extend(_lint_state_unconditional_shipbad_write(project))
     issues.extend(_lint_batch_ship_spawn_reentry(project, functions))
+    issues.extend(_lint_fresh_ship_script_data_cross_transition(project, functions))
     issues.extend(_lint_synchronous_runtime_reentry(project, functions))
     graph = _call_graph(functions)
     risky = _risky_functions(functions, graph)

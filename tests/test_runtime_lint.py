@@ -2516,6 +2516,138 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-transitional-ship-data-access", codes)
 
+    def _cross_transition_script_data_project(
+        self,
+        *,
+        publish_fresh: bool = True,
+        transition: bool = True,
+        helpers: bool = False,
+    ) -> RsonProject:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "saved_ship_id", "Parent": -1, "#": 20}
+        ]
+        init = group["Operations"][0]
+        init["Code.Type"] = "Init"
+        init["Code"] = [
+            "function ShipDataStable(dword ship)",
+            "{",
+            "    result = 0;",
+            "    if(!ship) exit;",
+            "    if(ShipIsTakeoff(ship)) exit;",
+            "    if(ShipInHyperSpace(ship, 1)) exit;",
+            "    if(ShipInNormalSpace(ship)) result = 1;",
+            "}",
+        ]
+        if helpers:
+            init["Code"].extend(
+                [
+                    "function PublishShipId(int value)",
+                    "{",
+                    "    saved_ship_id = value;",
+                    "}",
+                    "function ReadShipId()",
+                    "{",
+                    "    result = saved_ship_id;",
+                    "}",
+                    "function ReadShipState(dword ship)",
+                    "{",
+                    "    if(!ShipDataStable(ship)) exit;",
+                    "    result = GetData(2, ship);",
+                    "}",
+                ]
+            )
+        turn = group["Operations"][1]
+        turn["Code"] = []
+        if publish_fresh:
+            turn["Code"].extend(
+                [
+                    "dword factory = GetShipPlanet(Player());",
+                    "if(!factory) exit;",
+                    "dword fresh_ship = BuyPirate(factory, 100);",
+                    "if(!fresh_ship) exit;",
+                    "int fresh_id = Id(fresh_ship);",
+                    (
+                        "PublishShipId(fresh_id);"
+                        if helpers
+                        else "saved_ship_id = fresh_id;"
+                    ),
+                ]
+            )
+        turn["Code"].extend(
+            [
+                (
+                    "dword restored_ship = IdToShip(ReadShipId());"
+                    if helpers
+                    else "dword restored_ship = IdToShip(saved_ship_id);"
+                ),
+                "if(!restored_ship) exit;",
+            ]
+        )
+        if transition:
+            turn["Code"].append("OrderTakeOff(restored_ship);")
+        turn["Code"].extend(
+            [
+                "if(!ShipDataStable(restored_ship)) exit;",
+                (
+                    "ReadShipState(restored_ship);"
+                    if helpers
+                    else "int state = GetData(2, restored_ship);"
+                ),
+            ]
+        )
+        return RsonProject(data, Path("cross-transition-script-data.rson"))
+
+    def test_fresh_ship_script_data_cross_transition_warns_despite_spatial_guard(self) -> None:
+        issues = lint_rson_runtime(self._cross_transition_script_data_project())
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-fresh-ship-script-data-cross-transition"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "warning")
+        self.assertIn("saved_ship_id", matching[0].message)
+        self.assertIn("OrderTakeOff", matching[0].evidence or "")
+        self.assertIn("GetData", matching[0].evidence or "")
+
+    def test_cross_transition_lifecycle_flows_through_registry_helpers(self) -> None:
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(
+                self._cross_transition_script_data_project(helpers=True)
+            )
+        }
+        self.assertIn("runtime-fresh-ship-script-data-cross-transition", codes)
+
+    def test_cross_transition_rule_requires_fresh_publication(self) -> None:
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(
+                self._cross_transition_script_data_project(publish_fresh=False)
+            )
+        }
+        self.assertNotIn("runtime-fresh-ship-script-data-cross-transition", codes)
+
+    def test_cross_transition_rule_requires_engine_transition(self) -> None:
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(
+                self._cross_transition_script_data_project(transition=False)
+            )
+        }
+        self.assertNotIn("runtime-fresh-ship-script-data-cross-transition", codes)
+
+    def test_transfer_of_persistent_ship_is_cross_transition_origin(self) -> None:
+        project = self._cross_transition_script_data_project(publish_fresh=False)
+        turn = project.data["Visual.Objects"][0]["Operations"][1]["Code"]
+        turn[turn.index("OrderTakeOff(restored_ship);")] = (
+            "TransferShip(restored_ship, Player());"
+        )
+        codes = {issue.code for issue in lint_rson_runtime(project)}
+        self.assertIn("runtime-fresh-ship-script-data-cross-transition", codes)
+
     def test_helper_group_mutation_cannot_be_reread_same_call(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][1]["Code"] = [
