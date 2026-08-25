@@ -35,7 +35,7 @@ ModKit разворачивает мод в игру только по явно�
 - Реальные JSON Schema для audit, release, project и modset поставляются внутри Python-пакета; `schema list/show/validate` доступны без сторонних зависимостей.
 - `project plan` и диагностика не компилируют мод. `project deploy --dry-run` не меняет игру, но ради точного состава выполняет сборку и может обновить служебные build/cache; это явно отражено в JSON.
 - Диагностика скрытых legacy-процессов отфильтровывает уже завершившиеся Windows desktop, но сохраняет видимость реально работающего помощника и его PID.
-- Связанные SCR/Lang и ZIP/manifest/audit публикуются транзакционно; ZIP-пути, кэш, PKG, variant overlay и cleanup deploy-транзакций проверяются до изменения пользовательских результатов.
+- Связанные SCR/Lang и ZIP/manifest/audit публикуются транзакционно; ZIP/manifest, кэш, variant overlay, rollback и cleanup deploy-транзакций проверяют обход путей, дубли, устаревшие outputs и неопределённый PID до удаления данных.
 
 ## Быстрый старт
 

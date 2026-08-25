@@ -82,20 +82,30 @@ def publish_files_transactionally(
             os.replace(staged, destination)
             published.append(destination)
     except Exception as exc:
+        removal_errors: list[str] = []
+        blocked_destinations: set[Path] = set()
         for destination in reversed(published):
-            destination.unlink(missing_ok=True)
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError as removal_exc:
+                blocked_destinations.add(destination)
+                removal_errors.append(f"{destination}: {removal_exc}")
         rollback_errors: list[str] = []
         for backup, destination in reversed(backups):
+            if destination in blocked_destinations:
+                # Never overwrite a file that could not be removed.  The only
+                # old copy remains under its explicit .srhd-backup-* name.
+                continue
             if backup.exists():
                 try:
                     os.replace(backup, destination)
                 except OSError as rollback_exc:
                     rollback_errors.append(f"{destination}: {rollback_exc}")
-        if rollback_errors:
+        if removal_errors or rollback_errors:
             preserve_backups = True
             raise RuntimeError(
                 "Публикация не удалась, а часть резервных файлов требует ручного "
-                "восстановления: " + "; ".join(rollback_errors)
+                "восстановления: " + "; ".join([*removal_errors, *rollback_errors])
             ) from exc
         raise
     finally:

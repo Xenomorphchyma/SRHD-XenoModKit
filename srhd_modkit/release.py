@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import shutil
@@ -196,21 +197,41 @@ def verify_release_archive(
 ) -> dict[str, Any]:
     archive_path = Path(archive_path).resolve()
     expected: dict[str, dict[str, Any]] = {}
+    expected_folded: set[str] = set()
+    safe_prefix = _safe_archive_name(prefix) if prefix else None
     for item in manifest.get("files", []):
-        relative = PurePosixPath(str(item["path"]))
-        archive_name = (PurePosixPath(prefix) / relative).as_posix() if prefix else relative.as_posix()
+        if not isinstance(item, dict):
+            raise ValueError("Манифест содержит некорректную запись файла")
+        relative = _safe_archive_name(str(item["path"]))
+        archive_name = (
+            (safe_prefix / relative).as_posix()
+            if safe_prefix is not None
+            else relative.as_posix()
+        )
+        _safe_archive_name(archive_name)
+        if archive_name in expected:
+            raise ValueError(f"Манифест содержит точный дубль пути: {archive_name}")
+        folded_name = archive_name.casefold()
+        if folded_name in expected_folded:
+            raise ValueError(
+                f"Манифест содержит пути, различающиеся только регистром: {archive_name}"
+            )
         expected[archive_name] = item
+        expected_folded.add(folded_name)
 
     with zipfile.ZipFile(archive_path, "r") as archive:
-        infos = [info for info in archive.infolist() if not info.is_dir()]
-        names = [info.filename for info in infos]
-        for name in names:
-            _safe_archive_name(name)
-        if len(names) != len(set(names)):
-            raise ValueError("ZIP содержит точные дубли путей")
-        folded = [name.casefold() for name in names]
-        if len(folded) != len(set(folded)):
+        all_infos = archive.infolist()
+        normalized_names: list[str] = []
+        for info in all_infos:
+            normalized_names.append(_safe_archive_name(info.filename).as_posix())
+        if len(normalized_names) != len(set(normalized_names)):
+            raise ValueError("ZIP содержит точные дубли путей, включая каталоги")
+        normalized_folded = [name.casefold() for name in normalized_names]
+        if len(normalized_folded) != len(set(normalized_folded)):
             raise ValueError("ZIP содержит пути, различающиеся только регистром")
+
+        infos = [info for info in all_infos if not info.is_dir()]
+        names = [info.filename for info in infos]
         if set(names) != set(expected):
             missing = sorted(set(expected) - set(names))
             extra = sorted(set(names) - set(expected))
@@ -879,11 +900,15 @@ def rollback_deployment(target: str | Path) -> dict[str, Any]:
     }
 
 
-def _pid_is_running(pid: object) -> bool:
-    """Check process liveness without signalling it on Windows."""
+def _pid_state(pid: object) -> str:
+    """Return ``alive``, ``dead``, ``unknown`` or ``absent``.
+
+    Access denied is deliberately not treated as a dead process: cleanup must
+    preserve a possibly active deployment owned by another account/session.
+    """
 
     if not isinstance(pid, int) or pid <= 0:
-        return False
+        return "absent"
     if os.name == "nt":
         import ctypes
         from ctypes import wintypes
@@ -899,19 +924,30 @@ def _pid_is_running(pid: object) -> bool:
         kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
         if not handle:
-            return False
+            error = ctypes.get_last_error()
+            return "dead" if error == 87 else "unknown"
         try:
             exit_code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return False
-            return exit_code.value == still_active
+                return "unknown"
+            return "alive" if exit_code.value == still_active else "dead"
         finally:
             kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
-        return True
-    except (OSError, PermissionError):
-        return False
+        return "alive"
+    except ProcessLookupError:
+        return "dead"
+    except PermissionError:
+        return "unknown"
+    except OSError as exc:
+        return "dead" if exc.errno == errno.ESRCH else "unknown"
+
+
+def _pid_is_running(pid: object) -> bool:
+    """Backward-compatible boolean helper for callers that only need alive."""
+
+    return _pid_state(pid) == "alive"
 
 
 def cleanup_deployments(
@@ -928,13 +964,17 @@ def cleanup_deployments(
     for item in inspected["transactions"]:
         path = Path(item["path"])
         pid = item.get("pid")
-        pid_running = _pid_is_running(pid)
+        pid_state = _pid_state(pid)
         active_states = {"preparing", "staged", "previous-moved", "published", "verified"}
-        if pid_running and item.get("state") in active_states:
+        if pid_state in {"alive", "unknown"} and item.get("state") in active_states:
             refused.append(
                 {
                     "path": str(path),
-                    "reason": f"Транзакция принадлежит активному процессу PID {pid}",
+                    "reason": (
+                        f"Транзакция принадлежит активному процессу PID {pid}"
+                        if pid_state == "alive"
+                        else f"Нельзя доказать завершение процесса PID {pid}; транзакция сохранена"
+                    ),
                 }
             )
             continue

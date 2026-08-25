@@ -167,6 +167,32 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(matching[0].severity, "error")
             self.assertIn("Source\\Config\\CacheData.txt", matching[0].path or "")
 
+    def test_release_accepts_sources_config_spelling_for_script_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            script = root / "DATA" / "Script" / "Mod_AuditFixture.scr"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(struct.pack("<I", 8))
+            config = root / "Sources" / "Config"
+            config.mkdir(parents=True)
+            (config / "Main.txt").write_text(
+                "Data ^{\n Script ^{\n Mod_AuditFixture=1,Script.Mod_AuditFixture\n }\n}\n",
+                encoding="utf-8",
+            )
+            (config / "CacheData.txt").write_text(
+                "Script ^{\n"
+                " Mod_AuditFixture=Mods\\OtherMods\\AuditFixture\\DATA\\Script\\Mod_AuditFixture.scr\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            report = audit_mod(root, profile="release", install_subpath="OtherMods/AuditFixture")
+            codes = {item.code for item in report.issues}
+            self.assertNotIn("main-dat-missing", codes)
+            self.assertNotIn("scr-unregistered", codes)
+            self.assertNotIn("cache-script-missing", codes)
+
     def test_release_blocks_tgroup_without_planet_or_initial_state(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"

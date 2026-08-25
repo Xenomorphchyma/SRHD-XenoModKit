@@ -36,7 +36,7 @@ from .game_text import lint_blockpar_display_text, lint_game_text
 from .textio import read_text
 from .rsm import RsmProject, inspect_rsm_project
 from .hidden_process import HiddenControlAction, HiddenProcessTimeout, run_on_hidden_desktop
-from .legacy_manifest import ensure_legacy_codepage_executable
+from .legacy_manifest import ensure_legacy_codepage_executable, legacy_codepage_identity
 from .executable_version import ExecutableVersion, detect_executable_version
 from .safe_io import atomic_write_bytes, publish_files_transactionally
 
@@ -637,6 +637,34 @@ class Toolchain:
 
     def status(self) -> list[dict[str, Any]]:
         return [tool.as_dict() for tool in self.tools.values()]
+
+    def fingerprint(self, name: str) -> dict[str, Any]:
+        """Return the effective cache identity without materializing lazy tools."""
+
+        tool = self.tools[name]
+        if name == "blockpar" and self._blockpar_requires_legacy:
+            identity = legacy_codepage_identity(self._blockpar_original, self._blockpar_codec)
+            return {
+                "name": name,
+                "path": identity["path"],
+                "version": tool.version,
+                "compatibility": tool.compatibility,
+                "sha256": identity["sha256"],
+                "fingerprint_kind": "derived-legacy-codepage-v1",
+                "source_path": identity["source_path"],
+                "source_sha256": identity["source_sha256"],
+                "manifest_sha256": identity["manifest_sha256"],
+            }
+        if not tool.path.is_file():
+            raise FileNotFoundError(f"Инструмент не найден: {tool.path}")
+        return {
+            "name": name,
+            "path": str(tool.path),
+            "version": tool.version,
+            "compatibility": tool.compatibility,
+            "sha256": sha256_file(tool.path),
+            "fingerprint_kind": "executable-sha256",
+        }
 
     def require(self, name: str) -> Tool:
         if name == "blockpar" and self._blockpar_requires_legacy:
@@ -2334,7 +2362,8 @@ class Toolchain:
             )
             generated = staged_argument.with_suffix("") if split else staged_argument
             entry = generated / "main.rsm" if split else generated
-            if process.exit_code != 0 or not entry.is_file():
+            _require_external_success(process, "RScript export-rsm")
+            if not entry.is_file():
                 raise RuntimeError(
                     "RScript 4.15f не создал RSM "
                     f"(код {process.exit_code}; ожидался {entry})"
@@ -2377,6 +2406,7 @@ class Toolchain:
                 "cli_profile": self._rscript_cli_profile(),
                 "executable": str(tool.path),
                 "exit_code": process.exit_code,
+                "forced_after_outputs": process.forced_after_outputs,
             },
             "timeout": timeout_policy,
         }
@@ -2547,7 +2577,7 @@ class Toolchain:
                 "timeout": timeout_policy,
             }
             raise RsmBuildFailure(str(exc), report) from exc
-        if process.exit_code != 0 or not staged_scr.is_file():
+        if (process.exit_code != 0 and not process.forced_after_outputs) or not staged_scr.is_file():
             code = (
                 "rsmc-language-merge-failed"
                 if staged_scr.is_file() and (lang_txt is not None or lang_dat is not None)
@@ -2663,6 +2693,7 @@ class Toolchain:
                 "executable": str(rsmc.path),
                 "executable_sha256": sha256_file(rsmc.path),
                 "exit_code": process.exit_code,
+                "forced_after_outputs": process.forced_after_outputs,
                 "seconds": round(process.elapsed_seconds, 3),
             },
             "timeout": timeout_policy,

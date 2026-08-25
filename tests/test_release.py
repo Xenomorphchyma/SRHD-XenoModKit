@@ -305,6 +305,32 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 verify_release_archive(archive_path, manifest, prefix="")
 
+    def test_archive_verifier_checks_unsafe_directory_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            archive_path = Path(name) / "unsafe-directory.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("../outside/", b"")
+            with self.assertRaisesRegex(ValueError, "Небезопасный путь ZIP"):
+                verify_release_archive(archive_path, {"files": []}, prefix="")
+
+    def test_archive_verifier_rejects_duplicate_manifest_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            archive_path = Path(name) / "duplicate-manifest.zip"
+            payload = b"data"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("DATA/value.bin", payload)
+            row = {
+                "path": "DATA/value.bin",
+                "size": len(payload),
+                "sha256": __import__("hashlib").sha256(payload).hexdigest(),
+            }
+            with self.assertRaisesRegex(ValueError, "дубль"):
+                verify_release_archive(
+                    archive_path,
+                    {"files": [row, dict(row)]},
+                    prefix="",
+                )
+
     def test_cleanup_refuses_transaction_owned_by_live_deploy_process(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "Mods"
@@ -327,6 +353,32 @@ class ReleaseTests(unittest.TestCase):
             result = cleanup_deployments(root, apply=True, force=True)
             self.assertEqual(result["summary"]["removed"], 0)
             self.assertEqual(result["summary"]["refused"], 1)
+            self.assertTrue(transaction.is_dir())
+
+    def test_cleanup_refuses_active_transaction_when_pid_liveness_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "Mods"
+            target = root / "Example"
+            target.parent.mkdir(parents=True)
+            transaction = root / ".Example.srhd-deploy-unknown"
+            transaction.mkdir()
+            (transaction / "transaction.json").write_text(
+                __import__("json").dumps(
+                    {
+                        "schema": "srhd-modkit-deploy-transaction-v1",
+                        "id": "unknown",
+                        "state": "staged",
+                        "pid": 987654,
+                        "destination": str(target),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("srhd_modkit.release._pid_state", return_value="unknown"):
+                result = cleanup_deployments(root, apply=True, force=True)
+            self.assertEqual(result["summary"]["removed"], 0)
+            self.assertEqual(result["summary"]["refused"], 1)
+            self.assertIn("Нельзя доказать", result["refused"][0]["reason"])
             self.assertTrue(transaction.is_dir())
 
 

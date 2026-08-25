@@ -8,7 +8,7 @@ import tokenize
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .blockpar import BlockParDocument, load_blockpar
 from .discovery import discover_mods, load_mod
@@ -739,6 +739,18 @@ def _quest_card_nodes(document: BlockParDocument) -> dict[str, dict[str, str]]:
     }
 
 
+def _source_config_candidates(index: Mapping[str, Path], filename: str) -> tuple[Path, ...]:
+    """Find supported Source/Sources + CFG/Config spelling combinations."""
+
+    values = (
+        index.get(f"source/cfg/{filename}".casefold()),
+        index.get(f"source/config/{filename}".casefold()),
+        index.get(f"sources/cfg/{filename}".casefold()),
+        index.get(f"sources/config/{filename}".casefold()),
+    )
+    return tuple(dict.fromkeys(path for path in values if path is not None))
+
+
 def _quest_lang_documents(context: AuditContext) -> list[tuple[Path, BlockParDocument]]:
     return [
         (path, document)
@@ -1370,11 +1382,8 @@ def _script_check(context: AuditContext) -> AuditCheck:
             issues.append(_issue(context, name, "error", "scr-invalid", str(exc), path))
 
     index = _relative_index(context.root)
-    main_path = (
-        index.get("cfg/main.dat")
-        or index.get("source/cfg/main.txt")
-        or index.get("source/config/main.txt")
-    )
+    source_main = _source_config_candidates(index, "main.txt")
+    main_path = index.get("cfg/main.dat") or (source_main[0] if source_main else None)
     main_document: BlockParDocument | None = None
     registrations: dict[str, list[str]] = {}
     onstart = False
@@ -1477,8 +1486,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
     if module_info is not None and rson_projects:
         for language in module_info.languages:
             candidates = (
-                index.get(f"source/cfg/lang_{language}.txt".casefold()),
-                index.get(f"source/config/lang_{language}.txt".casefold()),
+                *_source_config_candidates(index, f"lang_{language}.txt"),
                 index.get(f"cfg/{language}/lang.dat".casefold()),
             )
             for language_path in dict.fromkeys(path for path in candidates if path is not None):
@@ -1527,15 +1535,12 @@ def _script_check(context: AuditContext) -> AuditCheck:
         )
 
     cache_documents: list[tuple[Path, BlockParDocument]] = []
-    for relative in (
-        "source/cfg/cachedata.txt",
-        "source/config/cachedata.txt",
-        "cfg/cachedata.txt",
-        "cfg/cachedata.dat",
-    ):
-        path = index.get(relative)
-        if path is None:
-            continue
+    cache_paths = (
+        *_source_config_candidates(index, "cachedata.txt"),
+        index.get("cfg/cachedata.txt"),
+        index.get("cfg/cachedata.dat"),
+    )
+    for path in dict.fromkeys(value for value in cache_paths if value is not None):
         try:
             document = load_blockpar(path) if path.suffix.casefold() == ".txt" else _load_dat(context, path)
             if document is not None:

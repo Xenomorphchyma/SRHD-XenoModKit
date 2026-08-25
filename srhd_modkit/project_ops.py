@@ -170,6 +170,20 @@ def _make_artifact_ids_unique(artifacts: list[dict[str, Any]]) -> None:
         used.add(candidate.casefold())
 
 
+def _solution_project_paths(solution: Path) -> set[Path]:
+    """Return C#/C++ project files referenced by an MSBuild solution."""
+
+    try:
+        text = solution.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return set()
+    result: set[Path] = set()
+    for raw in re.findall(r'Project\([^\r\n]*?=\s*"[^"]*",\s*"([^"]+\.(?:csproj|vcxproj))"', text, re.I):
+        candidate = (solution.parent / Path(raw.replace("\\", "/"))).resolve()
+        result.add(candidate)
+    return result
+
+
 def initialize_project(
     mod: str | Path,
     *,
@@ -203,20 +217,39 @@ def initialize_project(
     ambiguous_outputs: set[str] = set()
     files = iter_files(mod_root)
 
-    project_candidates = [
+    primary_projects = [
         path
         for path in files
         if path.suffix.casefold() in {".csproj", ".vcxproj"}
         or path.name.casefold() == "cmakelists.txt"
     ]
-    if not project_candidates:
-        project_candidates = [path for path in files if path.suffix.casefold() == ".sln"]
     runtime_binaries = [
         path
         for path in files
         if path.suffix.casefold() in {".dll", ".exe"}
         and path.relative_to(mod_root).parts[0].casefold() not in {"source", "sources"}
     ]
+    known_primary = {path.resolve() for path in primary_projects}
+    primary_runtime_stems = {
+        path.stem.casefold()
+        for path in primary_projects
+        if path.name.casefold() != "cmakelists.txt"
+    }
+    solutions: list[Path] = []
+    for solution in (path for path in files if path.suffix.casefold() == ".sln"):
+        references = _solution_project_paths(solution)
+        has_uncovered_project = bool(references - known_primary)
+        has_unique_runtime = any(
+            binary.stem.casefold() == solution.stem.casefold()
+            and binary.stem.casefold() not in primary_runtime_stems
+            for binary in runtime_binaries
+        )
+        # A solution that merely wraps projects already represented below is
+        # intentionally deduplicated.  Independent/unresolved solution graphs
+        # and a solution-owned runtime remain explicit build requirements.
+        if not primary_projects or has_uncovered_project or has_unique_runtime or not references:
+            solutions.append(solution)
+    project_candidates = [*primary_projects, *solutions]
     external_builds: list[dict[str, Any]] = []
     claimed_runtime: set[str] = set()
     for external_project in project_candidates:

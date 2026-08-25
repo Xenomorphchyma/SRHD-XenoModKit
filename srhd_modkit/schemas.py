@@ -82,6 +82,60 @@ def _branch_errors(value: Any, schema: Mapping[str, Any], path: str, root: Mappi
     return result
 
 
+def _unsupported_schema_keywords(
+    schema: Mapping[str, Any],
+    path: str = "$schema",
+    *,
+    visited: set[int] | None = None,
+) -> list[dict[str, str]]:
+    """Preflight every schema branch so unsupported semantics are never hidden."""
+
+    seen = visited if visited is not None else set()
+    identity = id(schema)
+    if identity in seen:
+        return []
+    seen.add(identity)
+    errors = [
+        {
+            "path": path,
+            "code": "schema-keyword-unsupported",
+            "message": f"ключевое слово JSON Schema не поддерживается: {keyword}",
+        }
+        for keyword in sorted(set(schema) - _SUPPORTED_KEYWORDS)
+    ]
+    for keyword in ("properties", "$defs"):
+        children = schema.get(keyword)
+        if isinstance(children, Mapping):
+            for name, child in children.items():
+                if isinstance(child, Mapping):
+                    errors.extend(
+                        _unsupported_schema_keywords(
+                            child,
+                            f"{path}/{keyword}/{name}",
+                            visited=seen,
+                        )
+                    )
+    for keyword in ("items", "additionalProperties", "not"):
+        child = schema.get(keyword)
+        if isinstance(child, Mapping):
+            errors.extend(
+                _unsupported_schema_keywords(child, f"{path}/{keyword}", visited=seen)
+            )
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        children = schema.get(keyword)
+        if isinstance(children, list):
+            for index, child in enumerate(children):
+                if isinstance(child, Mapping):
+                    errors.extend(
+                        _unsupported_schema_keywords(
+                            child,
+                            f"{path}/{keyword}/{index}",
+                            visited=seen,
+                        )
+                    )
+    return errors
+
+
 def _validate(
     value: Any,
     schema: Mapping[str, Any],
@@ -89,15 +143,6 @@ def _validate(
     errors: list[dict[str, str]],
     root: Mapping[str, Any],
 ) -> None:
-    unsupported = sorted(set(schema) - _SUPPORTED_KEYWORDS)
-    for keyword in unsupported:
-        errors.append(
-            {
-                "path": path,
-                "code": "schema-keyword-unsupported",
-                "message": f"ключевое слово JSON Schema не поддерживается: {keyword}",
-            }
-        )
     if "$ref" in schema:
         try:
             resolved = _resolve_local_ref(root, str(schema["$ref"]))
@@ -227,7 +272,7 @@ def validate_schema_document(
     if not selected:
         raise ValueError("Не указана схема и в документе отсутствует поле schema")
     schema = load_schema(str(selected))
-    errors: list[dict[str, str]] = []
+    errors = _unsupported_schema_keywords(schema)
     _validate(value, schema, "$", errors, schema)
     return {
         "schema": SCHEMA_VALIDATION_SCHEMA,

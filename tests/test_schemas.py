@@ -55,6 +55,25 @@ class SchemaTests(unittest.TestCase):
         self.assertFalse(unsupported["valid"])
         self.assertEqual(unsupported["errors"][0]["code"], "schema-keyword-unsupported")
 
+        with patch(
+            "srhd_modkit.schemas.load_schema",
+            return_value={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "anyOf": [
+                            {"type": "integer", "format": "hidden-in-branch"},
+                            {"type": "string"},
+                        ]
+                    }
+                },
+            },
+        ):
+            nested = validate_schema_document(document)
+        self.assertFalse(nested["valid"])
+        self.assertIn("schema-keyword-unsupported", {item["code"] for item in nested["errors"]})
+        self.assertNotIn("schema-anyof", {item["code"] for item in nested["errors"]})
+
 
 if __name__ == "__main__":
     unittest.main()

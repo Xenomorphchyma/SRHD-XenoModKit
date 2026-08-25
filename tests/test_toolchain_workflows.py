@@ -151,6 +151,72 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertIsNone(captured["control_actions"])
             self.assertEqual(policy["backend"], "modern-cli")
 
+    def test_export_rsm_accepts_verified_output_after_forced_tool_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            executable = root / "RScript" / "RScript.exe"
+            executable.parent.mkdir()
+            executable.write_bytes(b"fixture")
+            source = root / "source.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+            destination = root / "exported.rsm"
+            chain = Toolchain(root)
+            chain.rscript_version = ExecutableVersion(4, 15)
+
+            def fake_run(_application, _arguments, **kwargs):
+                Path(kwargs["expected_outputs"][0]).write_text(
+                    'scriptName("Workflow");\n', encoding="utf-8"
+                )
+                return SimpleNamespace(
+                    exit_code=1,
+                    forced_after_outputs=True,
+                    elapsed_seconds=0.01,
+                )
+
+            with patch("srhd_modkit.toolchain.run_on_hidden_desktop", side_effect=fake_run):
+                result = chain.export_rsm(source, destination)
+
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(destination.is_file())
+            self.assertTrue(result["compiler"]["forced_after_outputs"])
+
+    def test_build_rsm_accepts_forced_exit_only_after_full_scr_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            rsmc = root / "RSMCompiler" / "rsmc.exe"
+            rsmc.parent.mkdir()
+            rsmc.write_bytes(b"fixture")
+            entry = root / "main.rsm"
+            entry.write_text('scriptName("Workflow");\n', encoding="utf-8")
+            output = root / "Workflow.scr"
+            chain = Toolchain(root)
+
+            def fake_run(_application, _arguments, **kwargs):
+                Path(kwargs["expected_outputs"][0]).write_bytes((8).to_bytes(4, "little"))
+                return SimpleNamespace(
+                    exit_code=1,
+                    forced_after_outputs=True,
+                    elapsed_seconds=0.01,
+                )
+
+            def fake_decompile(_source, destination, **_kwargs):
+                Path(destination).write_text(json.dumps(PROJECT), encoding="utf-8")
+                return {
+                    "verified": True,
+                    "runtime_issues": [],
+                    "validation_issues": [],
+                    "error": None,
+                }
+
+            with patch("srhd_modkit.toolchain.run_on_hidden_desktop", side_effect=fake_run), patch.object(
+                chain, "decompile_scr", side_effect=fake_decompile
+            ):
+                result = chain.build_rsm(entry, output)
+
+            self.assertTrue(result["verified"])
+            self.assertTrue(result["published_outputs"])
+            self.assertTrue(result["compiler"]["forced_after_outputs"])
+
     def test_blockpar_21_uses_vendor_executable_without_legacy_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -203,6 +269,29 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertEqual(chain.tools["blockpar"].path, compatibility.resolve())
             self.assertEqual(chain.tools["blockpar"].version, "1.9")
             self.assertEqual(chain.tools["blockpar"].compatibility, "legacy-cp1251")
+
+    def test_blockpar_19_fingerprint_describes_effective_lazy_codec(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            executable = root / "BlockParEditor" / "BlockParEditor.exe"
+            executable.parent.mkdir()
+            executable.write_bytes(b"vendor-legacy-fixture")
+            compatibility = executable.with_name("BlockParEditor.Legacy.exe")
+            with patch(
+                "srhd_modkit.toolchain.detect_executable_version",
+                side_effect=lambda path: (
+                    ExecutableVersion(1, 9)
+                    if Path(path).name == "BlockParEditor.exe"
+                    else None
+                ),
+            ):
+                chain = Toolchain(root)
+                fingerprint = chain.fingerprint("blockpar")
+
+            self.assertEqual(fingerprint["path"], str(compatibility.resolve()))
+            self.assertEqual(fingerprint["source_path"], str(executable.resolve()))
+            self.assertEqual(fingerprint["fingerprint_kind"], "derived-legacy-codepage-v1")
+            self.assertFalse(compatibility.exists())
 
     def test_compile_rson_rejects_source_collision_and_wrong_output_extension(self) -> None:
         with tempfile.TemporaryDirectory() as name:

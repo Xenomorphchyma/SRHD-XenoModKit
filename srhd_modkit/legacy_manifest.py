@@ -30,6 +30,27 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def legacy_codepage_identity(original: str | Path, derived: str | Path) -> dict[str, str]:
+    """Describe the deterministic legacy codec without creating it."""
+
+    source = Path(original).resolve()
+    target = Path(derived).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    source_sha256 = _sha256(source)
+    manifest_sha256 = hashlib.sha256(_MANIFEST).hexdigest()
+    logical_sha256 = hashlib.sha256(
+        f"srhd-blockpar-legacy-v1\0{source_sha256}\0{manifest_sha256}".encode("ascii")
+    ).hexdigest()
+    return {
+        "path": str(target),
+        "source_path": str(source),
+        "source_sha256": source_sha256,
+        "manifest_sha256": manifest_sha256,
+        "sha256": logical_sha256,
+    }
+
+
 def ensure_legacy_codepage_executable(
     original: str | Path,
     derived: str | Path,
@@ -48,8 +69,9 @@ def ensure_legacy_codepage_executable(
     if not original.is_file():
         raise FileNotFoundError(original)
     marker = derived.with_suffix(derived.suffix + ".json")
-    source_sha256 = _sha256(original)
-    manifest_sha256 = hashlib.sha256(_MANIFEST).hexdigest()
+    identity = legacy_codepage_identity(original, derived)
+    source_sha256 = identity["source_sha256"]
+    manifest_sha256 = identity["manifest_sha256"]
     if derived.is_file() and marker.is_file():
         try:
             state = json.loads(marker.read_text(encoding="utf-8"))

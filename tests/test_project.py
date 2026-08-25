@@ -300,6 +300,56 @@ output = "DATA/effective.bin"
             )
             self.assertNotEqual(release_key, earth_key)
 
+    def test_project_and_variant_names_cannot_escape_output_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            _write_project(root)
+            config = root / "srhd-modkit.toml"
+            original = config.read_text(encoding="utf-8")
+            config.write_text(
+                original.replace('name = "ProjectFixture"', 'name = "../escape"', 1),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ProjectConfigError, "безопасным именем|недопустимый"):
+                load_project(root)
+
+            config.write_text(
+                original.replace("[variants.release]", "[variants.'../escape']", 1),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ProjectConfigError, "безопасным именем|недопустимый"):
+                load_project(root)
+
+    def test_copy_directory_cache_does_not_restore_old_baseline_files(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            mod, _game = _write_project(root)
+            bundle = root / "assets" / "bundle"
+            bundle.mkdir()
+            (bundle / "copied.cmap").write_bytes(b"copied")
+            config = root / "srhd-modkit.toml"
+            config.write_text(
+                config.read_text(encoding="utf-8")
+                + """
+
+[[artifacts]]
+id = "bundle"
+kind = "copy"
+source = "assets/bundle"
+output = "DATA"
+""",
+                encoding="utf-8",
+            )
+
+            first = build_project(root)
+            self.assertEqual(first.cache_misses, 2)
+            (mod / "DATA" / "base.cmap").write_bytes(b"new-baseline")
+            second = build_project(root)
+            bundle_result = next(item for item in second.artifacts if item["id"] == "bundle")
+            self.assertEqual(bundle_result["cache"], "hit")
+            self.assertEqual((second.output / "DATA" / "base.cmap").read_bytes(), b"new-baseline")
+            self.assertEqual((second.output / "DATA" / "copied.cmap").read_bytes(), b"copied")
+
     def test_cache_rejects_non_sha_key(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             cache = ArtifactCache(Path(name))

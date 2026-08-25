@@ -57,9 +57,35 @@ _VARIANT_CONTROL_KEYS = {
     "strip_sources",
 }
 
+_WINDOWS_RESERVED_COMPONENTS = {
+    "con", "prn", "aux", "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+
 
 class ProjectConfigError(ValueError):
     pass
+
+
+def _safe_output_component(value: str, field: str) -> str:
+    """Validate a project-controlled Windows file/directory name.
+
+    Project and variant names are reused as build directory and sidecar file
+    names.  Keeping them to one ordinary component prevents path traversal and
+    makes a shared project behave the same on every supported Windows host.
+    """
+
+    if value != value.strip() or not value or value in {".", ".."}:
+        raise ProjectConfigError(f"{field} должен быть безопасным именем одного компонента: {value!r}")
+    if any(ord(character) < 32 or character in '<>:"/\\|?*' for character in value):
+        raise ProjectConfigError(f"{field} содержит недопустимый символ Windows: {value!r}")
+    if value.endswith((".", " ")):
+        raise ProjectConfigError(f"{field} не должен оканчиваться точкой или пробелом: {value!r}")
+    stem = value.split(".", 1)[0].casefold()
+    if stem in _WINDOWS_RESERVED_COMPONENTS:
+        raise ProjectConfigError(f"{field} использует зарезервированное имя Windows: {value!r}")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,6 +413,7 @@ def _validate_project_config(path: Path, raw: Mapping[str, Any]) -> None:
     for key in ("name", "mod_root", "prefix"):
         if not isinstance(raw.get(key), str) or not str(raw[key]).strip():
             raise ProjectConfigError(f"{path}: обязательное строковое поле {key!r}")
+    _safe_output_component(str(raw["name"]), "name")
     _safe_relative(str(raw["prefix"]), "prefix")
     artifacts = raw.get("artifacts", [])
     if not isinstance(artifacts, list):
@@ -418,6 +445,7 @@ def _validate_project_config(path: Path, raw: Mapping[str, Any]) -> None:
         raise ProjectConfigError("variants должен быть таблицей")
     if isinstance(variants, Mapping):
         for name, variant in variants.items():
+            _safe_output_component(str(name), f"variants.{name}")
             if not isinstance(variant, Mapping):
                 raise ProjectConfigError(f"variants.{name} должен быть таблицей")
             if variant.get("inherits") is not None and not isinstance(variant.get("inherits"), str):
@@ -730,20 +758,7 @@ def _artifact_inputs(
 
 
 def _tool_fingerprints(toolchain: Toolchain, names: Iterable[str]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for name in sorted(set(names)):
-        tool = toolchain.tools[name]
-        if not tool.path.is_file():
-            raise FileNotFoundError(f"Инструмент не найден: {tool.path}")
-        result.append(
-            {
-                "name": name,
-                "path": str(tool.path),
-                "version": tool.version,
-                "sha256": sha256_file(tool.path),
-            }
-        )
-    return result
+    return [toolchain.fingerprint(name) for name in sorted(set(names))]
 
 
 def _artifact_tool_names(artifact: Mapping[str, Any]) -> tuple[str, ...]:
@@ -1287,7 +1302,10 @@ def _build_artifact(
     else:
         raise ProjectConfigError(f"Неизвестный kind {kind!r}")
 
-    outputs = _artifact_outputs(full_mod, artifact)
+    # A directory copy owns only the files copied from its source.  The output
+    # directory may already contain baseline mod files; caching those would
+    # resurrect an old baseline on the next otherwise valid cache hit.
+    outputs = copied if kind == "copy" else _artifact_outputs(full_mod, artifact)
     if not outputs:
         raise RuntimeError(f"Артефакт {identifier!r} не создал ни одного результата")
     if use_cache:

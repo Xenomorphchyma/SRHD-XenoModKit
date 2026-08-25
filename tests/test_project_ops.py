@@ -151,6 +151,39 @@ class ProjectOperationsTests(unittest.TestCase):
             self.assertEqual(external["outputs"], ["LauncherMod/Launcher.exe"])
             self.assertTrue(plan_project(root)["blocked"])
 
+    def test_init_keeps_independent_solution_but_deduplicates_simple_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            mod = root / "NativeMod"
+            source = mod / "SOURCE" / "Native"
+            source.mkdir(parents=True)
+            (mod / "DATA").mkdir()
+            (mod / "ModuleInfo.txt").write_text(
+                "Name=NativeMod\nSection=Test\nLanguages=Rus\n",
+                encoding="cp1251",
+            )
+            worker = source / "Worker.csproj"
+            worker.write_text('<Project Sdk="Microsoft.NET.Sdk" />', encoding="utf-8")
+            (source / "Worker.sln").write_text(
+                'Project("{A}") = "Worker", "Worker.csproj", "{B}"\nEndProject\n',
+                encoding="utf-8",
+            )
+            (source / "Suite.sln").write_text(
+                'Project("{A}") = "External", "External.vcxproj", "{B}"\nEndProject\n',
+                encoding="utf-8",
+            )
+            (mod / "DATA" / "Worker.dll").write_bytes(b"MZworker")
+            (mod / "DATA" / "Suite.dll").write_bytes(b"MZsuite")
+
+            initialized = initialize_project(mod)
+            projects = {
+                Path(item["project"]).name: item
+                for item in initialized["external_builds"]
+            }
+            self.assertEqual(set(projects), {"Worker.csproj", "Suite.sln"})
+            self.assertEqual(projects["Worker.csproj"]["outputs"], ["NativeMod/DATA/Worker.dll"])
+            self.assertEqual(projects["Suite.sln"]["outputs"], ["NativeMod/DATA/Suite.dll"])
+
     def test_plan_reports_cache_reason_and_leaves_no_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

@@ -31,7 +31,7 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 - В пакет включены JSON Schema для основных машинных отчётов и команды `schema list/show/validate`.
 - Новые команды переиспользуют существующие audit, BlockPar, compare и project API и не создают отдельную параллельную систему сборки.
 - `doctor processes` отличает краткий след уже завершившегося Windows desktop от реально работающего helper-процесса.
-- Публикация связанных SCR/Lang и ZIP/manifest/audit стала единой транзакцией; legacy ZIP, кэш, PKG, variant overlay и deploy cleanup получили дополнительные проверки путей и целостности.
+- Публикация связанных SCR/Lang и ZIP/manifest/audit стала единой транзакцией; ZIP/manifest, кэш, variant overlay, rollback и deploy cleanup проверяют обход путей, дубли, устаревшие outputs и неопределённый PID до удаления данных.
 - `project plan` остаётся полностью пассивным, а `project deploy --dry-run` честно помечает, что ради точного состава может обновить только служебные build/cache, но не папку игры.
 
 ## Поддержка форматов
