@@ -14,7 +14,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator, Sequence
 
 from .audit import AuditProfile, AuditReport, audit_mod
-from .files import build_manifest, pack_mod, sha256_file, stage_tree
+from .files import build_manifest, pack_mod, safe_archive_name, sha256_file, stage_tree
+from .safe_io import atomic_write_text, publish_files_transactionally
 
 
 RELEASE_SCHEMA = "srhd-modkit-release-v1"
@@ -184,14 +185,7 @@ class DeployPlan:
 
 
 def _safe_archive_name(name: str) -> PurePosixPath:
-    if not name or "\\" in name or "\0" in name:
-        raise ValueError(f"Небезопасный путь ZIP: {name!r}")
-    path = PurePosixPath(name)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise ValueError(f"Небезопасный путь ZIP: {name!r}")
-    if path.parts and ":" in path.parts[0]:
-        raise ValueError(f"Небезопасный путь ZIP: {name!r}")
-    return path
+    return safe_archive_name(name)
 
 
 def verify_release_archive(
@@ -243,7 +237,11 @@ def verify_release_archive(
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _sidecar_paths(output: Path) -> tuple[Path, Path]:
@@ -321,9 +319,11 @@ def _utc_now() -> str:
 
 def _write_transaction(path: Path, value: dict[str, Any]) -> None:
     value["updated_at"] = _utc_now()
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temp, path)
+    atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 @contextmanager
@@ -383,9 +383,23 @@ def _deployment_lock(destination: Path) -> Iterator[Path]:
             stream.close()
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
+def _assert_no_link_components(path: Path) -> None:
+    absolute = path.absolute()
+    for component in reversed((absolute, *absolute.parents)):
+        if _is_link_or_junction(component):
+            raise ValueError(f"Путь развёртывания проходит через ссылку или junction: {component}")
+
+
 def _deploy_destination(destination_root: Path, prefix: str) -> Path:
     safe_prefix = _safe_archive_name(prefix)
-    destination = destination_root.joinpath(*safe_prefix.parts).resolve()
+    raw_destination = destination_root.joinpath(*safe_prefix.parts)
+    _assert_no_link_components(raw_destination)
+    destination_root = destination_root.resolve()
+    destination = raw_destination.resolve()
     if destination == destination_root or destination_root not in destination.parents:
         raise ValueError(f"Путь развёртывания вышел за каталог назначения: {destination}")
     return destination
@@ -403,7 +417,8 @@ def plan_deploy(
     warnings_as_errors: bool = False,
 ) -> DeployPlan:
     mod_dir = Path(mod_dir).resolve()
-    destination_root = Path(destination_root).resolve()
+    destination_root = Path(destination_root).absolute()
+    _assert_no_link_components(destination_root)
     if not mod_dir.is_dir():
         raise NotADirectoryError(mod_dir)
     archive_prefix = prefix if prefix is not None else mod_dir.name
@@ -533,9 +548,20 @@ def build_release(
         _write_json(temp_manifest, manifest)
         _write_json(temp_audit, report.as_dict())
 
-        os.replace(temp_manifest, manifest_path)
-        os.replace(temp_audit, audit_path)
-        os.replace(temp_archive, output)
+        publish_files_transactionally(
+            (
+                (temp_manifest, manifest_path),
+                (temp_audit, audit_path),
+                (temp_archive, output),
+            )
+        )
+        published_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        published_audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        if published_manifest != manifest or published_audit != report.as_dict():
+            raise RuntimeError("Опубликованные sidecar-файлы не совпали с проверенным staging")
+        published_verification = verify_release_archive(output, manifest, prefix=archive_prefix)
+        if published_verification["sha256"] != verification["sha256"]:
+            raise RuntimeError("SHA-256 ZIP изменился во время публикации")
 
     return ReleaseResult(
         output,
@@ -598,7 +624,7 @@ def deploy_mod(
                 f"Папка назначения уже существует: {destination}. "
                 "Для полной проверенной замены используйте --overwrite"
             )
-        if destination.exists() and (not destination.is_dir() or destination.is_symlink()):
+        if destination.exists() and (not destination.is_dir() or _is_link_or_junction(destination)):
             raise ValueError(f"Нельзя заменить не-каталог или ссылку: {destination}")
 
         replaced_existing = destination.exists()
@@ -789,7 +815,9 @@ def _candidate_transactions_for_target(target: Path) -> list[Path]:
 
 
 def rollback_deployment(target: str | Path) -> dict[str, Any]:
-    target = Path(target).resolve()
+    raw_target = Path(target).absolute()
+    _assert_no_link_components(raw_target)
+    target = raw_target.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     candidates = _candidate_transactions_for_target(target)
     selected: Path | None = None
@@ -821,7 +849,7 @@ def rollback_deployment(target: str | Path) -> dict[str, Any]:
     with _deployment_lock(target):
         try:
             if target.exists():
-                if not target.is_dir() or target.is_symlink():
+                if not target.is_dir() or _is_link_or_junction(target):
                     raise ValueError(f"Нельзя отвести не-каталог или ссылку: {target}")
                 os.replace(target, displaced)
                 current_moved = True
@@ -851,6 +879,41 @@ def rollback_deployment(target: str | Path) -> dict[str, Any]:
     }
 
 
+def _pid_is_running(pid: object) -> bool:
+    """Check process liveness without signalling it on Windows."""
+
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
 def cleanup_deployments(
     root: str | Path,
     *,
@@ -864,6 +927,26 @@ def cleanup_deployments(
     planned: list[str] = []
     for item in inspected["transactions"]:
         path = Path(item["path"])
+        pid = item.get("pid")
+        pid_running = _pid_is_running(pid)
+        active_states = {"preparing", "staged", "previous-moved", "published", "verified"}
+        if pid_running and item.get("state") in active_states:
+            refused.append(
+                {
+                    "path": str(path),
+                    "reason": f"Транзакция принадлежит активному процессу PID {pid}",
+                }
+            )
+            continue
+        destination_text = item.get("destination")
+        if not destination_text and not force:
+            refused.append(
+                {
+                    "path": str(path),
+                    "reason": "Нельзя доказать цель транзакции; используйте --force только после ручной проверки",
+                }
+            )
+            continue
         if item["backup_exists"] and not force:
             refused.append(
                 {
@@ -874,7 +957,18 @@ def cleanup_deployments(
             continue
         planned.append(str(path))
         if apply:
-            shutil.rmtree(path)
+            if destination_text:
+                destination = Path(str(destination_text)).absolute()
+                _assert_no_link_components(destination)
+                try:
+                    with _deployment_lock(destination.resolve()):
+                        shutil.rmtree(path)
+                except RuntimeError as exc:
+                    refused.append({"path": str(path), "reason": str(exc)})
+                    planned.pop()
+                    continue
+            else:
+                shutil.rmtree(path)
             removed.append(str(path))
     return {
         "schema": "srhd-modkit-deployment-cleanup-v1",

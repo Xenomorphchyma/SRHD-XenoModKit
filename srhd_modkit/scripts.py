@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from .safe_io import atomic_write_text
+
 
 RSON_FILE_ID = 573785173
 RSON_FILE_VERSION = 8
@@ -801,8 +803,11 @@ class RsonProject:
 
     def save(self, path: str | Path) -> Path:
         path = Path(path).resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        atomic_write_text(
+            path,
+            json.dumps(self.data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         return path
 
 

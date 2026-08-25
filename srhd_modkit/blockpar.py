@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from .safe_io import atomic_write_bytes
 from .textio import DecodedText, read_text
 
 
@@ -198,7 +199,7 @@ class BlockParDocument:
             codec = "utf-8"
             if bom:
                 prefix = b"\xef\xbb\xbf"
-        path.write_bytes(prefix + text.encode(codec, errors=errors))
+        atomic_write_bytes(path, prefix + text.encode(codec, errors=errors))
         return path
 
     def as_dict(self, *, include_raw: bool = False) -> dict[str, Any]:

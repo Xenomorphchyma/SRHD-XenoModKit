@@ -5,6 +5,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import string
 import tempfile
@@ -24,6 +25,8 @@ from .release import (
     plan_deploy,
 )
 from .scripts import inspect_scr
+from .rsm import inspect_rsm_project
+from .safe_io import atomic_write_text, publish_files_transactionally
 from .toolchain import Toolchain
 
 
@@ -98,6 +101,11 @@ class ModProject:
         value = self.raw.get("targets", {})
         return value if isinstance(value, Mapping) else {}
 
+    @property
+    def external_builds(self) -> tuple[dict[str, Any], ...]:
+        value = self.raw.get("external_builds", [])
+        return tuple(item for item in value if isinstance(item, dict)) if isinstance(value, list) else ()
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "schema": PROJECT_SCHEMA,
@@ -114,6 +122,7 @@ class ModProject:
             "variants": sorted(self.variants),
             "artifacts": [str(item.get("id", "")) for item in self.artifacts],
             "targets": sorted(self.targets),
+            "external_builds": [str(item.get("id", "")) for item in self.external_builds],
         }
 
 
@@ -185,9 +194,29 @@ def find_project_file(start: str | Path = ".") -> Path:
     raise FileNotFoundError(f"Не найден {PROJECT_FILE_NAME} от {candidate}")
 
 
-def _project_path(root: Path, value: str | Path, field: str, *, allow_absolute: bool = True) -> Path:
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
+def _project_path(
+    root: Path,
+    value: str | Path,
+    field: str,
+    *,
+    allow_absolute: bool = True,
+    reject_links: bool = False,
+) -> Path:
     raw = Path(str(value))
-    candidate = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
+    unresolved = raw.absolute() if raw.is_absolute() else (root / raw).absolute()
+    if reject_links:
+        current = unresolved
+        while True:
+            if _is_link_or_junction(current):
+                raise ProjectConfigError(f"{field} проходит через ссылку или junction: {current}")
+            if current == root or root not in current.parents:
+                break
+            current = current.parent
+    candidate = unresolved.resolve()
     if not allow_absolute and root != candidate and root not in candidate.parents:
         raise ProjectConfigError(f"{field} вышел за корень проекта: {candidate}")
     return candidate
@@ -200,10 +229,155 @@ def _safe_relative(value: str, field: str) -> PurePosixPath:
         not normalized
         or path.is_absolute()
         or any(part in {"", ".", ".."} for part in path.parts)
-        or (path.parts and ":" in path.parts[0])
+        or any(":" in part for part in path.parts)
     ):
         raise ProjectConfigError(f"{field} должен быть безопасным относительным путём: {value!r}")
     return path
+
+
+def _effective_artifact_source(
+    project: ModProject,
+    artifact: Mapping[str, Any],
+    full_mod: Path,
+) -> Path:
+    identifier = str(artifact.get("id", ""))
+    source = _project_path(
+        project.root,
+        str(artifact["source"]),
+        f"artifact {identifier}.source",
+        allow_absolute=False,
+        reject_links=True,
+    )
+    try:
+        relative = source.relative_to(project.mod_root)
+    except ValueError:
+        return source
+    return full_mod / relative
+
+
+def _external_build_issues(project: ModProject) -> list[dict[str, Any]]:
+    """Validate explicit hand-off points without executing untrusted builds."""
+
+    issues: list[dict[str, Any]] = []
+    for item in project.external_builds:
+        identifier = str(item.get("id", ""))
+        source = _project_path(
+            project.root,
+            str(item.get("project", "")),
+            f"external_builds.{identifier}.project",
+            allow_absolute=False,
+            reject_links=True,
+        )
+        if not source.is_file():
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "project-external-project-missing",
+                    "message": f"Внешний проект {identifier!r} не найден: {source}",
+                    "path": str(source),
+                }
+            )
+        mode = str(item.get("mode", "unconfigured")).casefold()
+        outputs = [
+            _project_path(
+                project.root,
+                value,
+                f"external_builds.{identifier}.outputs",
+                allow_absolute=False,
+                reject_links=True,
+            )
+            for value in item.get("outputs", [])
+        ]
+        if mode == "unconfigured":
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "project-external-build-unconfigured",
+                    "message": (
+                        f"Внешняя {item.get('kind', 'native')} сборка {identifier!r} обнаружена, "
+                        "но не подтверждена. Соберите её отдельно, перечислите runtime outputs "
+                        "и задайте mode = \"prebuilt\""
+                    ),
+                    "path": str(source),
+                }
+            )
+        elif not outputs:
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "project-external-output-unlisted",
+                    "message": f"Для внешней сборки {identifier!r} не перечислены runtime outputs",
+                    "path": str(source),
+                }
+            )
+        for output in outputs:
+            if output != project.mod_root and project.mod_root not in output.parents:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "project-external-output-outside-mod",
+                        "message": (
+                            f"Runtime output {output} находится вне mod_root и не попадёт в публикацию"
+                        ),
+                        "path": str(output),
+                    }
+                )
+                continue
+            if (
+                not output.is_file()
+                or output.is_symlink()
+                or bool(getattr(output, "is_junction", lambda: False)())
+            ):
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "project-external-output-missing",
+                        "message": f"Runtime output внешней сборки отсутствует: {output}",
+                        "path": str(output),
+                    }
+                )
+    return issues
+
+
+def _external_build_report(project: ModProject) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for item in project.external_builds:
+        identifier = str(item.get("id", ""))
+        source = _project_path(
+            project.root,
+            str(item.get("project", "")),
+            f"external_builds.{identifier}.project",
+            allow_absolute=False,
+            reject_links=True,
+        )
+        outputs = [
+            _project_path(
+                project.root,
+                value,
+                f"external_builds.{identifier}.outputs",
+                allow_absolute=False,
+                reject_links=True,
+            )
+            for value in item.get("outputs", [])
+        ]
+        result.append(
+            {
+                "id": identifier,
+                "kind": str(item.get("kind", "native")),
+                "mode": str(item.get("mode", "unconfigured")),
+                "project": str(source),
+                "project_sha256": sha256_file(source) if source.is_file() else None,
+                "outputs": [
+                    {
+                        "path": str(output),
+                        "sha256": sha256_file(output) if output.is_file() else None,
+                        "size": output.stat().st_size if output.is_file() else None,
+                    }
+                    for output in outputs
+                ],
+            }
+        )
+    return result
 
 
 def _validate_project_config(path: Path, raw: Mapping[str, Any]) -> None:
@@ -265,6 +439,26 @@ def _validate_project_config(path: Path, raw: Mapping[str, Any]) -> None:
     allow = raw.get("allow", [])
     if not isinstance(allow, list) or not all(isinstance(item, str) for item in allow):
         raise ProjectConfigError("allow должен быть массивом строк")
+    external_builds = raw.get("external_builds", [])
+    if not isinstance(external_builds, list):
+        raise ProjectConfigError("external_builds должен быть массивом таблиц [[external_builds]]")
+    external_ids: set[str] = set()
+    for index, item in enumerate(external_builds):
+        if not isinstance(item, Mapping):
+            raise ProjectConfigError(f"external_builds[{index}] должен быть таблицей")
+        identifier = str(item.get("id", "")).strip()
+        if not identifier or identifier.casefold() in external_ids:
+            raise ProjectConfigError(f"external_builds[{index}].id отсутствует или повторяется")
+        if str(item.get("mode", "unconfigured")).casefold() not in {"unconfigured", "prebuilt"}:
+            raise ProjectConfigError(
+                f"external_builds[{index}].mode должен быть unconfigured или prebuilt"
+            )
+        if not isinstance(item.get("project"), str):
+            raise ProjectConfigError(f"external_builds[{index}].project должен быть строкой")
+        outputs = item.get("outputs", [])
+        if not isinstance(outputs, list) or not all(isinstance(value, str) for value in outputs):
+            raise ProjectConfigError(f"external_builds[{index}].outputs должен быть массивом строк")
+        external_ids.add(identifier.casefold())
 
 
 def load_project(path: str | Path = ".") -> ModProject:
@@ -278,11 +472,27 @@ def load_project(path: str | Path = ".") -> ModProject:
     else:
         selected_local = None
     _validate_project_config(project_path, raw)
-    mod_root = _project_path(root, str(raw["mod_root"]), "mod_root", allow_absolute=False)
+    mod_root = _project_path(
+        root,
+        str(raw["mod_root"]),
+        "mod_root",
+        allow_absolute=False,
+        reject_links=True,
+    )
     if not mod_root.is_dir():
         raise NotADirectoryError(mod_root)
-    build_root = _project_path(root, str(raw.get("build_root", ".srhd-build")), "build_root")
-    cache_root = _project_path(root, str(raw.get("cache_root", ".srhd-cache")), "cache_root")
+    build_root = _project_path(
+        root,
+        str(raw.get("build_root", ".srhd-build")),
+        "build_root",
+        reject_links=True,
+    )
+    cache_root = _project_path(
+        root,
+        str(raw.get("cache_root", ".srhd-cache")),
+        "cache_root",
+        reject_links=True,
+    )
     for field, candidate in (("build_root", build_root), ("cache_root", cache_root)):
         if candidate == mod_root or mod_root in candidate.parents:
             relative = candidate.relative_to(mod_root)
@@ -405,7 +615,13 @@ def _apply_variant_files(
     removed: list[str] = []
     for raw_overlay in _expand(list(variant.get("overlays", [])), variables, "variant.overlays"):
         overlay_rel = _safe_relative(str(raw_overlay), "variant.overlays")
-        overlay = project.root.joinpath(*overlay_rel.parts).resolve()
+        overlay = _project_path(
+            project.root,
+            Path(*overlay_rel.parts),
+            "variant.overlays",
+            allow_absolute=False,
+            reject_links=True,
+        )
         if project.root not in overlay.parents:
             raise ProjectConfigError(f"overlay вышел за проект: {overlay}")
         for target in _copy_overlay(overlay, full_mod):
@@ -415,10 +631,19 @@ def _apply_variant_files(
         pattern = str(_safe_relative(str(raw_pattern), "variant.include"))
         matches = sorted(glob.glob(str(project.root / pattern), recursive=True), key=str.casefold)
         for raw_match in matches:
-            source = Path(raw_match)
-            if not source.is_file() or source.is_symlink():
+            unresolved = Path(raw_match).absolute()
+            if not unresolved.is_file():
                 continue
-            relative = source.resolve().relative_to(project.root)
+            source = _project_path(
+                project.root,
+                unresolved,
+                "variant.include",
+                allow_absolute=False,
+                reject_links=True,
+            )
+            relative = source.relative_to(project.root)
+            if any(part.casefold().startswith(".srhd-") for part in relative.parts):
+                continue
             target = full_mod / relative
             _copy_file_verified(source, target)
             included.append(relative.as_posix())
@@ -463,11 +688,20 @@ def _artifact_inputs(
     else:
         raise FileNotFoundError(source)
     if str(artifact.get("kind", "")).casefold() == "rsm" and source.is_file():
-        inputs.extend(path for path in source.parent.rglob("*.rsm") if path.is_file())
+        rsm_project = inspect_rsm_project(source)
+        inputs.extend(module.path for module in rsm_project.modules)
     for field in ("lang_base",):
         value = artifact.get(field)
         if value:
-            inputs.append(_project_path(project.root, str(value), field, allow_absolute=False))
+            inputs.append(
+                _project_path(
+                    project.root,
+                    str(value),
+                    field,
+                    allow_absolute=False,
+                    reject_links=True,
+                )
+            )
     # rsmc merges language output into an already existing file.  Its original
     # bytes are therefore an input, even though the same path is also an output.
     for field in ("lang_txt", "lang_dat"):
@@ -478,7 +712,13 @@ def _artifact_inputs(
             if candidate.is_file():
                 inputs.append(candidate)
     for value in artifact.get("inputs", []) if isinstance(artifact.get("inputs", []), list) else []:
-        candidate = _project_path(project.root, str(value), "artifact.inputs", allow_absolute=False)
+        candidate = _project_path(
+            project.root,
+            str(value),
+            "artifact.inputs",
+            allow_absolute=False,
+            reject_links=True,
+        )
         if candidate.is_dir():
             inputs.extend(iter_files(candidate))
         elif candidate.is_file():
@@ -539,12 +779,14 @@ def _artifact_cache_key(
                 label = str(path)
         input_rows.append({"path": label, "size": path.stat().st_size, "sha256": sha256_file(path)})
     package_root = Path(__file__).resolve().parent
-    engine_files = (
-        package_root / "project.py",
-        package_root / "toolchain.py",
-        package_root / "scripts.py",
-        package_root / "rsm.py",
-        package_root / "blockpar.py",
+    engine_files = tuple(
+        path
+        for path in iter_files(package_root)
+        if path.suffix.casefold() == ".py"
+        or (
+            path.suffix.casefold() == ".json"
+            and "schemas" in {part.casefold() for part in path.relative_to(package_root).parts}
+        )
     )
     payload = {
         "schema": CACHE_SCHEMA,
@@ -553,7 +795,7 @@ def _artifact_cache_key(
         "inputs": input_rows,
         "tools": list(tools),
         "engine": [
-            {"path": item.name, "sha256": sha256_file(item)}
+            {"path": item.relative_to(package_root).as_posix(), "sha256": sha256_file(item)}
             for item in engine_files
         ],
     }
@@ -566,7 +808,12 @@ class ArtifactCache:
         self.root = Path(root).resolve() / "artifacts"
 
     def _entry(self, key: str) -> Path:
-        return self.root / key[:2] / key
+        if re.fullmatch(r"[0-9a-f]{64}", key) is None:
+            raise ProjectConfigError(f"Некорректный ключ кэша: {key!r}")
+        entry = self.root / key[:2] / key
+        if self.root != entry and self.root not in entry.parents:
+            raise ProjectConfigError(f"Ключ кэша вышел за корень: {key!r}")
+        return entry
 
     @staticmethod
     def _tree_usage(path: Path) -> tuple[int, int]:
@@ -682,7 +929,7 @@ class ArtifactCache:
             for entry in bucket.iterdir():
                 if not entry.is_dir() or entry.is_symlink():
                     continue
-                record = self._record(entry)
+                record = self._record(entry, verify_files=True)
                 if record is not None and record["identity"] == (variant, artifact_id):
                     matches.append(record)
         return max(matches, key=lambda item: item["modified"]) if matches else None
@@ -843,12 +1090,23 @@ class ArtifactCache:
         except (KeyError, TypeError, ValueError, OSError, ProjectConfigError):
             return None
         restored: list[Path] = []
-        for cached, target in verified:
-            try:
-                _copy_file_verified(cached, target)
-            except OSError:
-                return None
-            restored.append(target)
+        try:
+            destination_root.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix=".srhd-cache-restore-",
+                dir=destination_root.parent,
+            ) as temp_name:
+                temp = Path(temp_name)
+                publications: list[tuple[Path, Path]] = []
+                for cached, target in verified:
+                    relative = target.relative_to(destination_root)
+                    prepared = temp / relative
+                    _copy_file_verified(cached, prepared)
+                    publications.append((prepared, target))
+                    restored.append(target)
+                publish_files_transactionally(publications)
+        except OSError:
+            return None
         try:
             os.utime(entry, None)
         except OSError:
@@ -930,7 +1188,7 @@ def _build_artifact(
 ) -> dict[str, Any]:
     identifier = str(artifact["id"])
     kind = str(artifact["kind"]).casefold()
-    source = _project_path(project.root, str(artifact["source"]), f"artifact {identifier}.source", allow_absolute=False)
+    source = _effective_artifact_source(project, artifact, full_mod)
     output_rel = _safe_relative(str(artifact["output"]), f"artifact {identifier}.output")
     output = full_mod / Path(*output_rel.parts)
     inputs = _artifact_inputs(project, artifact, source, full_mod)
@@ -1076,6 +1334,44 @@ def _selected_artifacts(
     return tuple(selected)
 
 
+def _validate_effective_artifact_outputs(
+    project: ModProject,
+    artifacts: Sequence[Mapping[str, Any]],
+    full_mod: Path,
+) -> None:
+    """Reject exact, case-only and file/directory output overlaps."""
+
+    claimed: list[tuple[PurePosixPath, str]] = []
+    for artifact in artifacts:
+        identifier = str(artifact.get("id", ""))
+        output = _safe_relative(str(artifact["output"]), f"artifact {identifier}.output")
+        source = _effective_artifact_source(project, artifact, full_mod)
+        paths: list[PurePosixPath]
+        if str(artifact.get("kind", "")).casefold() == "copy" and source.is_dir():
+            paths = [
+                output / PurePosixPath(path.relative_to(source).as_posix())
+                for path in iter_files(source)
+            ]
+        else:
+            paths = [output]
+        for field in ("lang_dat", "lang_txt", "lang_fragment"):
+            if artifact.get(field):
+                paths.append(_safe_relative(str(artifact[field]), f"artifact {identifier}.{field}"))
+        for path in paths:
+            folded_parts = tuple(part.casefold() for part in path.parts)
+            for previous, owner in claimed:
+                previous_parts = tuple(part.casefold() for part in previous.parts)
+                common = min(len(folded_parts), len(previous_parts))
+                if folded_parts[:common] == previous_parts[:common] and (
+                    len(folded_parts) == common or len(previous_parts) == common
+                ):
+                    raise ProjectConfigError(
+                        f"Артефакты {owner!r} и {identifier!r} имеют пересекающиеся "
+                        f"выходы {previous} и {path}"
+                    )
+            claimed.append((path, identifier))
+
+
 def _stage_artifact_audit_source(
     project: ModProject,
     artifact: Mapping[str, Any],
@@ -1092,12 +1388,7 @@ def _stage_artifact_audit_source(
     if kind not in {"dat", "rson", "rsm"}:
         return []
     identifier = str(artifact["id"])
-    source = _project_path(
-        project.root,
-        str(artifact["source"]),
-        f"artifact {identifier}.source",
-        allow_absolute=False,
-    )
+    source = _effective_artifact_source(project, artifact, full_mod)
     targets: list[tuple[Path, Path]] = []
     if kind == "dat" and source.is_file():
         output = _safe_relative(str(artifact["output"]), f"artifact {identifier}.output")
@@ -1113,7 +1404,16 @@ def _stage_artifact_audit_source(
         )
     elif kind == "rsm":
         rsm_root = source.parent if source.is_file() else source
-        for item in sorted(rsm_root.rglob("*.rsm"), key=lambda value: str(value).casefold()):
+        rsm_files = (
+            [module.path for module in inspect_rsm_project(source).modules]
+            if source.is_file()
+            else [item for item in iter_files(rsm_root) if item.suffix.casefold() == ".rsm"]
+        )
+        for item in sorted(rsm_files, key=lambda value: str(value).casefold()):
+            try:
+                relative_item = item.relative_to(rsm_root)
+            except ValueError:
+                relative_item = Path("_external") / f"{sha256_file(item)[:12]}-{item.name}"
             targets.append(
                 (
                     item,
@@ -1121,7 +1421,7 @@ def _stage_artifact_audit_source(
                     / "SOURCE"
                     / "ProjectBuild"
                     / identifier
-                    / item.relative_to(rsm_root),
+                    / relative_item,
                 )
             )
 
@@ -1139,10 +1439,11 @@ def _stage_artifact_audit_source(
 
 
 def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temp, path)
+    atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _audit_allow(
@@ -1177,6 +1478,10 @@ def build_project(
     toolchain: Toolchain | None = None,
 ) -> ProjectBuildResult:
     project = load_project(path)
+    external_issues = _external_build_issues(project)
+    external_errors = [item for item in external_issues if item["severity"] == "error"]
+    if external_errors:
+        raise ProjectConfigError(external_errors[0]["message"])
     variant_name, variant_config, variables = _resolve_variant(project, variant)
     prefix = str(_expand(variant_config.get("prefix", project.prefix), variables, "variant.prefix"))
     _safe_relative(prefix, "prefix")
@@ -1193,6 +1498,7 @@ def build_project(
         full_mod = workspace / "full" / project.mod_root.name
         stage_tree(project.mod_root, full_mod)
         variant_files = _apply_variant_files(project, full_mod, variant_config, variables)
+        _validate_effective_artifact_outputs(project, artifacts, full_mod)
         generated = workspace / ".srhd-generated"
         generated.mkdir()
         artifact_results: list[dict[str, Any]] = []
@@ -1268,6 +1574,7 @@ def build_project(
             "maintenance": cache_maintenance,
         },
         "tools": _project_tools_report(chain),
+        "external_builds": _external_build_report(project),
         "source_manifest": build_manifest(project.mod_root),
         "output_manifest": build_manifest(deployment.destination),
         "audit": deployment.report.as_dict(),
@@ -1374,6 +1681,15 @@ def deploy_project(
         "variant": build.variant,
         "target": selected_target.as_dict(),
         "dry_run": dry_run,
+        "operation_semantics": {
+            "game_target_modified": not dry_run,
+            "build_performed": True,
+            "service_outputs_may_change": [
+                str(build.project.build_root),
+                str(build.project.cache_root),
+            ],
+            "passive_preview_command": "project plan",
+        },
         "build": build.as_dict(),
         "plan": plan.as_dict(),
         "deploy": deployment.as_dict() if deployment is not None else None,

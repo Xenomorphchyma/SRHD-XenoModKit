@@ -10,14 +10,26 @@ from .module_info import INFO_FILE_NAME, find_module_info, parse_module_info
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache"}
 
 
+def _keep_directory(parent: Path, name: str) -> bool:
+    path = parent / name
+    return (
+        name.casefold() not in SKIP_DIRS
+        and not name.casefold().startswith(".srhd-")
+        and not path.is_symlink()
+        and not bool(getattr(path, "is_junction", lambda: False)())
+    )
+
+
 def _measure_tree(root: Path) -> tuple[int, int]:
     count = 0
     size = 0
     for current, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = [d for d in dirs if d.casefold() not in SKIP_DIRS]
         current_path = Path(current)
+        dirs[:] = [d for d in dirs if _keep_directory(current_path, d)]
         for name in files:
             path = current_path / name
+            if name.casefold().startswith(".srhd-") or path.is_symlink():
+                continue
             try:
                 stat = path.stat()
             except OSError:
@@ -57,11 +69,11 @@ def discover_mods(root: str | Path, *, max_depth: int | None = None) -> list[Mod
 
     found: list[ModRecord] = []
     for current, dirs, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
         dirs[:] = sorted(
-            [d for d in dirs if d.casefold() not in SKIP_DIRS and not d.startswith(".")],
+            [d for d in dirs if _keep_directory(current_path, d) and not d.startswith(".")],
             key=str.casefold,
         )
-        current_path = Path(current)
         depth = len(current_path.relative_to(root).parts)
         if max_depth is not None and depth >= max_depth:
             dirs[:] = []
@@ -69,4 +81,3 @@ def discover_mods(root: str | Path, *, max_depth: int | None = None) -> list[Mod
             found.append(load_mod(current_path, collection_root=root))
 
     return sorted(found, key=lambda mod: mod.relative_path.as_posix().casefold())
-

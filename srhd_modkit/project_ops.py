@@ -22,10 +22,14 @@ from .project import (
     _artifact_inputs,
     _artifact_tool_names,
     _expand,
+    _effective_artifact_source,
+    _external_build_issues,
+    _external_build_report,
     _project_path,
     _resolve_variant,
     _safe_relative,
     _selected_artifacts,
+    _validate_effective_artifact_outputs,
     _tool_fingerprints,
     load_project,
     resolve_project_target,
@@ -109,6 +113,7 @@ def _render_project_toml(
     mod_root: str,
     prefix: str,
     artifacts: Sequence[Mapping[str, Any]],
+    external_builds: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     lines = [
         'schema = "srhd-modkit-project-v1"',
@@ -138,6 +143,16 @@ def _render_project_toml(
             value = artifact.get(field)
             if value:
                 lines.append(f"{field} = {_toml_string(str(value))}")
+        lines.append("")
+    for external in external_builds:
+        lines.append("[[external_builds]]")
+        for field in ("id", "kind", "project", "mode"):
+            value = external.get(field)
+            if value:
+                lines.append(f"{field} = {_toml_string(str(value))}")
+        outputs = [str(value) for value in external.get("outputs", [])]
+        rendered_outputs = ", ".join(_toml_string(value) for value in outputs)
+        lines.append(f"outputs = [{rendered_outputs}]")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -187,6 +202,89 @@ def initialize_project(
     claimed_outputs: set[str] = set()
     ambiguous_outputs: set[str] = set()
     files = iter_files(mod_root)
+
+    project_candidates = [
+        path
+        for path in files
+        if path.suffix.casefold() in {".csproj", ".vcxproj"}
+        or path.name.casefold() == "cmakelists.txt"
+    ]
+    if not project_candidates:
+        project_candidates = [path for path in files if path.suffix.casefold() == ".sln"]
+    runtime_binaries = [
+        path
+        for path in files
+        if path.suffix.casefold() in {".dll", ".exe"}
+        and path.relative_to(mod_root).parts[0].casefold() not in {"source", "sources"}
+    ]
+    external_builds: list[dict[str, Any]] = []
+    claimed_runtime: set[str] = set()
+    for external_project in project_candidates:
+        kind = (
+            "dotnet"
+            if external_project.suffix.casefold() == ".csproj"
+            else "msbuild-cpp"
+            if external_project.suffix.casefold() == ".vcxproj"
+            else "cmake"
+            if external_project.name.casefold() == "cmakelists.txt"
+            else "msbuild-solution"
+        )
+        matching_outputs = [
+            binary
+            for binary in runtime_binaries
+            if binary.stem.casefold() == external_project.stem.casefold()
+        ]
+        for binary in matching_outputs:
+            claimed_runtime.add(str(binary).casefold())
+        external_builds.append(
+            {
+                "id": _identifier(external_project.stem, f"external-{len(external_builds) + 1}"),
+                "kind": kind,
+                "project": external_project.relative_to(destination.parent).as_posix(),
+                "mode": "unconfigured",
+                "outputs": [
+                    binary.relative_to(destination.parent).as_posix()
+                    for binary in matching_outputs
+                ],
+            }
+        )
+        issues.append(
+            {
+                "severity": "warning",
+                "code": "project-init-external-build-unconfigured",
+                "message": (
+                    f"Обнаружен внешний проект {external_project.name}. ModKit не запускает "
+                    "непроверенные C++/C# build-команды автоматически; подтвердите outputs "
+                    "и переключите mode на prebuilt после отдельной сборки"
+                ),
+                "path": str(external_project),
+            }
+        )
+    for binary in runtime_binaries:
+        if str(binary).casefold() in claimed_runtime:
+            continue
+        relative_binary = binary.relative_to(destination.parent).as_posix()
+        external_builds.append(
+            {
+                "id": _identifier(binary.stem, f"runtime-{len(external_builds) + 1}"),
+                "kind": "prebuilt-binary",
+                "project": relative_binary,
+                "mode": "unconfigured",
+                "outputs": [relative_binary],
+            }
+        )
+        issues.append(
+            {
+                "severity": "warning",
+                "code": "project-init-runtime-binary-unconfirmed",
+                "message": (
+                    f"Поставляемый runtime-бинарник {binary.name} не связан с найденным "
+                    "проектом сборки. Подтвердите его как prebuilt output либо укажите "
+                    "реальный C++/C# project вручную"
+                ),
+                "path": str(binary),
+            }
+        )
 
     for source in files:
         if source.suffix.casefold() != ".txt":
@@ -342,6 +440,7 @@ def initialize_project(
         )
 
     _make_artifact_ids_unique(artifacts)
+    _make_artifact_ids_unique(external_builds)
     selected_name = name or module.name or mod_root.name
     selected_prefix = prefix or _default_prefix(mod_root)
     rendered = _render_project_toml(
@@ -349,9 +448,16 @@ def initialize_project(
         mod_root=relative_mod,
         prefix=selected_prefix,
         artifacts=artifacts,
+        external_builds=external_builds,
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".srhd-project-init-",
+        suffix=".toml",
+        dir=destination.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
     try:
         temporary.write_text(rendered, encoding="utf-8")
         # Prove that the generated draft is loadable before replacing a prior
@@ -367,9 +473,11 @@ def initialize_project(
         "name": selected_name,
         "prefix": selected_prefix,
         "artifacts": artifacts,
+        "external_builds": external_builds,
         "issues": issues,
         "summary": {
             "artifacts": len(artifacts),
+            "external_builds": len(external_builds),
             "warnings": sum(item["severity"] == "warning" for item in issues),
         },
     }
@@ -394,9 +502,13 @@ def _fingerprint_changes(previous: Mapping[str, Any] | None, current: Mapping[st
     return changes or ["cache-entry-invalid-or-missing"]
 
 
-def _expected_artifact_outputs(project: ModProject, artifact: Mapping[str, Any]) -> list[str]:
+def _expected_artifact_outputs(
+    project: ModProject,
+    artifact: Mapping[str, Any],
+    full_mod: Path,
+) -> list[str]:
     output = _safe_relative(str(artifact["output"]), "artifact.output")
-    source = _project_path(project.root, str(artifact["source"]), "artifact.source", allow_absolute=False)
+    source = _effective_artifact_source(project, artifact, full_mod)
     if str(artifact["kind"]).casefold() == "copy" and source.is_dir():
         values = [
             (Path(*output.parts) / path.relative_to(source)).as_posix()
@@ -428,26 +540,32 @@ def plan_project(
     toolchain = Toolchain(selected_tools_root) if required_tools else None
     cache = ArtifactCache(project.cache_root)
     issues: list[dict[str, Any]] = []
+    issues.extend(_external_build_issues(project))
     artifact_rows: list[dict[str, Any]] = []
 
     with tempfile.TemporaryDirectory(prefix=".srhd-project-plan-", dir=project.root) as temp_name:
         full_mod = Path(temp_name) / project.mod_root.name
         stage_tree(project.mod_root, full_mod)
         _apply_variant_files(project, full_mod, variant_config, variables)
+        try:
+            _validate_effective_artifact_outputs(project, artifacts, full_mod)
+        except ProjectConfigError as exc:
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "project-plan-output-overlap",
+                    "message": str(exc),
+                }
+            )
         for artifact in artifacts:
             identifier = str(artifact["id"])
             row: dict[str, Any] = {
                 "id": identifier,
                 "kind": str(artifact["kind"]),
-                "outputs": _expected_artifact_outputs(project, artifact),
+                "outputs": _expected_artifact_outputs(project, artifact, full_mod),
             }
             try:
-                source = _project_path(
-                    project.root,
-                    str(artifact["source"]),
-                    f"artifact {identifier}.source",
-                    allow_absolute=False,
-                )
+                source = _effective_artifact_source(project, artifact, full_mod)
                 inputs = _artifact_inputs(project, artifact, source, full_mod)
                 artifact_tools = _artifact_tool_names(artifact)
                 if artifact_tools and toolchain is None:
@@ -548,6 +666,7 @@ def plan_project(
             "targets": targets,
         },
         "artifacts": artifact_rows,
+        "external_builds": _external_build_report(project),
         "files": {
             "game": outputs,
             "release": [f"{prefix.rstrip('/')}/{item}" for item in outputs],

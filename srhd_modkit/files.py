@@ -5,9 +5,10 @@ import hashlib
 import os
 import shutil
 import tempfile
+import uuid
 import zipfile
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from .models import ModRecord
@@ -33,25 +34,46 @@ def iter_files(root: str | Path, *, exclude: Iterable[str] = ()) -> list[Path]:
     patterns = tuple(pattern.casefold() for pattern in exclude)
     result: list[Path] = []
     for current, dirs, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
         dirs[:] = sorted(
             [
                 d
                 for d in dirs
                 if d.casefold() not in DEFAULT_EXCLUDE_DIRS
                 and not d.casefold().startswith(".srhd-")
+                and not (current_path / d).is_symlink()
+                and not bool(getattr(current_path / d, "is_junction", lambda: False)())
             ],
             key=str.casefold,
         )
-        current_path = Path(current)
         for name in sorted(files, key=str.casefold):
             path = current_path / name
-            if path.is_symlink() or name.casefold() in DEFAULT_EXCLUDE_NAMES:
+            if (
+                path.is_symlink()
+                or name.casefold() in DEFAULT_EXCLUDE_NAMES
+                or name.casefold().startswith(".srhd-")
+            ):
                 continue
             rel = path.relative_to(root).as_posix()
             if any(fnmatch.fnmatch(rel.casefold(), pattern) for pattern in patterns):
                 continue
             result.append(path)
     return result
+
+
+def safe_archive_name(name: str) -> PurePosixPath:
+    """Validate one portable, extraction-safe ZIP member name."""
+
+    if not name or "\\" in name or "\0" in name:
+        raise ValueError(f"Небезопасный путь ZIP: {name!r}")
+    path = PurePosixPath(name)
+    if (
+        path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or any(":" in part for part in path.parts)
+    ):
+        raise ValueError(f"Небезопасный путь ZIP: {name!r}")
+    return path
 
 
 def build_manifest(root: str | Path, *, exclude: Iterable[str] = ()) -> dict[str, Any]:
@@ -77,7 +99,18 @@ def build_manifest(root: str | Path, *, exclude: Iterable[str] = ()) -> dict[str
 
 
 def _tree_map(root: Path) -> dict[str, Path]:
-    return {path.relative_to(root).as_posix().casefold(): path for path in iter_files(root)}
+    result: dict[str, Path] = {}
+    for path in iter_files(root):
+        relative = path.relative_to(root).as_posix()
+        key = relative.casefold()
+        previous = result.get(key)
+        if previous is not None:
+            raise ValueError(
+                "Дерево содержит пути, различающиеся только регистром: "
+                f"{previous.relative_to(root).as_posix()}, {relative}"
+            )
+        result[key] = path
+    return result
 
 
 def compare_trees(left: str | Path, right: str | Path) -> dict[str, Any]:
@@ -193,22 +226,37 @@ def pack_mod(
         raise FileNotFoundError(f"ModuleInfo.txt not found in {mod_dir}")
     output.parent.mkdir(parents=True, exist_ok=True)
     prefix = prefix or mod_dir.name
-    temp = output.with_name(output.name + ".tmp")
+    safe_prefix = safe_archive_name(prefix).as_posix()
+    temp = output.with_name(f".srhd-pack-{uuid.uuid4().hex}-{output.name}")
     if temp.exists():
         temp.unlink()
 
     files = [path for path in iter_files(mod_dir, exclude=exclude) if path not in {output, temp}]
     try:
+        archive_names: list[str] = []
+        exact_names: set[str] = set()
+        folded_names: set[str] = set()
         with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             for path in files:
                 rel = path.relative_to(mod_dir).as_posix()
-                archive_name = f"{prefix}/{rel}" if prefix else rel
+                archive_name = safe_archive_name(f"{safe_prefix}/{rel}").as_posix()
+                if archive_name in exact_names or archive_name.casefold() in folded_names:
+                    raise ValueError(f"ZIP содержит повторяющийся путь: {archive_name}")
+                archive_names.append(archive_name)
+                exact_names.add(archive_name)
+                folded_names.add(archive_name.casefold())
                 info = zipfile.ZipInfo(archive_name, date_time=(1980, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o100644 << 16
                 with path.open("rb") as source, archive.open(info, "w") as target:
                     while chunk := source.read(1024 * 1024):
                         target.write(chunk)
+        with zipfile.ZipFile(temp, "r") as archive:
+            verified_names = [safe_archive_name(item.filename).as_posix() for item in archive.infolist()]
+            if verified_names != archive_names:
+                raise RuntimeError("Повторная проверка ZIP не совпала с опубликованным составом")
+            if archive.testzip() is not None:
+                raise RuntimeError("Повторная проверка ZIP обнаружила повреждённую запись")
         os.replace(temp, output)
     except Exception:
         if temp.exists():
@@ -219,7 +267,7 @@ def pack_mod(
         "sha256": sha256_file(output),
         "file_count": len(files),
         "archive_size": output.stat().st_size,
-        "prefix": prefix,
+        "prefix": safe_prefix,
     }
 
 
@@ -244,7 +292,7 @@ def stage_tree(
         raise FileExistsError(f"Папка назначения уже существует: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     files = iter_files(source, exclude=exclude)
-    with tempfile.TemporaryDirectory(prefix=f".{destination.name}.stage-", dir=destination.parent) as temp_name:
+    with tempfile.TemporaryDirectory(prefix=f".srhd-stage-{destination.name}-", dir=destination.parent) as temp_name:
         temp = Path(temp_name)
         total_size = 0
         for path in files:

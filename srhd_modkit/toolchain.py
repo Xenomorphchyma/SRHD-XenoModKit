@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .files import sha256_file
+from .files import iter_files, sha256_file
 from .formats import inspect_file
 from .image_codec import read_gi, read_png, write_gi, write_png
 from .blockpar import (
@@ -38,6 +38,7 @@ from .rsm import RsmProject, inspect_rsm_project
 from .hidden_process import HiddenControlAction, HiddenProcessTimeout, run_on_hidden_desktop
 from .legacy_manifest import ensure_legacy_codepage_executable
 from .executable_version import ExecutableVersion, detect_executable_version
+from .safe_io import atomic_write_bytes, publish_files_transactionally
 
 
 EMPTY_RSCRIPT_LANG_DAT = b"\xff\xfe"
@@ -221,6 +222,15 @@ class ScriptBuildFailure(ValueError):
         return self.report
 
 
+class ExternalProcessExitFailure(RuntimeError):
+    """External tool failed without an approved post-output forced exit."""
+
+    def __init__(self, operation: str, exit_code: int):
+        self.operation = operation
+        self.exit_code = exit_code
+        super().__init__(f"{operation} завершился с кодом {exit_code}")
+
+
 class RsmBuildFailure(ValueError):
     """Machine-readable failure from the standalone rsmc workflow."""
 
@@ -290,6 +300,15 @@ def _replace_cross_device_safe(staged: Path, destination: Path) -> None:
         staged.unlink()
     finally:
         local_stage.unlink(missing_ok=True)
+
+
+def _require_external_success(result: Any, operation: str) -> None:
+    """Reject unsolicited tool failures while allowing verified forced exits."""
+
+    exit_code = int(getattr(result, "exit_code", -1))
+    forced = bool(getattr(result, "forced_after_outputs", False))
+    if exit_code != 0 and not forced:
+        raise ExternalProcessExitFailure(operation, exit_code)
 
 
 @dataclass(frozen=True)
@@ -531,16 +550,16 @@ class Toolchain:
         blockpar_root = self.tools_root / "BlockParEditor"
         blockpar_original = blockpar_root / "BlockParEditor.exe"
         blockpar_codec = blockpar_root / "BlockParEditor.Legacy.exe"
+        self._blockpar_original = blockpar_original
+        self._blockpar_codec = blockpar_codec
         self.blockpar_version = detect_executable_version(blockpar_original)
-        if blockpar_original.is_file() and not (
+        self._blockpar_requires_legacy = blockpar_original.is_file() and not (
             self.blockpar_version is not None
             and self.blockpar_version.at_least(2, 0)
-        ):
-            ensure_legacy_codepage_executable(blockpar_original, blockpar_codec)
+        )
         blockpar_path = (
             blockpar_original
-            if self.blockpar_version is not None
-            and self.blockpar_version.at_least(2, 0)
+            if blockpar_original.is_file()
             else blockpar_codec
         )
         rscript_path = self.tools_root / "RScript" / "RScript.exe"
@@ -620,6 +639,17 @@ class Toolchain:
         return [tool.as_dict() for tool in self.tools.values()]
 
     def require(self, name: str) -> Tool:
+        if name == "blockpar" and self._blockpar_requires_legacy:
+            ensure_legacy_codepage_executable(self._blockpar_original, self._blockpar_codec)
+            current = self.tools[name]
+            self.tools[name] = Tool(
+                current.name,
+                self._blockpar_codec,
+                current.purpose,
+                current.automatic,
+                current.version,
+                current.compatibility,
+            )
         tool = self.tools[name]
         if not tool.path.is_file():
             raise FileNotFoundError(f"Инструмент не найден: {tool.path}")
@@ -629,14 +659,17 @@ class Toolchain:
     def _collect(inputs: Iterable[str | Path], extension: str) -> list[tuple[Path, Path]]:
         result: list[tuple[Path, Path]] = []
         for raw in inputs:
-            path = Path(raw).resolve()
+            raw_path = Path(raw).absolute()
+            if raw_path.is_symlink() or bool(getattr(raw_path, "is_junction", lambda: False)()):
+                raise ValueError(f"Входной ресурс не должен быть ссылкой или junction: {raw_path}")
+            path = raw_path.resolve()
             if path.is_file():
                 if path.suffix.casefold() != extension:
                     raise ValueError(f"Ожидался файл {extension}: {path}")
                 result.append((path, Path(path.name)))
             elif path.is_dir():
                 matches = sorted(
-                    (item for item in path.rglob("*") if item.is_file() and item.suffix.casefold() == extension),
+                    (item for item in iter_files(path) if item.suffix.casefold() == extension),
                     key=lambda item: item.relative_to(path).as_posix().casefold(),
                 )
                 result.extend((item, item.relative_to(path)) for item in matches)
@@ -703,9 +736,11 @@ class Toolchain:
                 staged.append((source, destination, stage_file))
 
             # Commit only after the entire batch has converted and validated.
+            publish_files_transactionally(
+                (stage_file, destination)
+                for _source, destination, stage_file in staged
+            )
             for source, destination, stage_file in staged:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(stage_file, destination)
                 recommendations: tuple[ConversionRecommendation, ...] = ()
                 if (
                     direction == "png-gi"
@@ -780,7 +815,7 @@ class Toolchain:
         destination.parent.mkdir(parents=True, exist_ok=True)
 
         if source.suffix.casefold() == ".dat" and is_empty_rscript_lang_dat(source):
-            destination.write_bytes(b"")
+            atomic_write_bytes(destination, b"")
             return {
                 "source": str(source),
                 "destination": str(destination),
@@ -853,6 +888,7 @@ class Toolchain:
                 settle_seconds=0.5,
                 abort_window_patterns=("Run-time error", "Runtime error", "Overflow"),
             )
+            _require_external_success(completed, "BlockParEditor convert")
             if not staged_destination.is_file():
                 raise RuntimeError(f"BlockParEditor CLI не создал результат (код {completed.exit_code})")
 
@@ -871,6 +907,7 @@ class Toolchain:
                     settle_seconds=0.5,
                     abort_window_patterns=("Run-time error", "Runtime error", "Overflow"),
                 )
+                _require_external_success(check, "BlockParEditor round-trip")
                 if not check_txt.is_file():
                     raise RuntimeError("Не удалось проверить собранный DAT обратной конвертацией")
                 if load_blockpar(check_txt).canonical_semantic() != source_document.canonical_semantic():
@@ -938,6 +975,7 @@ class Toolchain:
                     progress_timeout=timeout_policy["progress_seconds"],
                     abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
                 )
+                _require_external_success(process_result, "RScript compile")
                 if not staged_scr.is_file():
                     raise RuntimeError(
                         f"RScript CLI не создал SCR (код {process_result.exit_code})"
@@ -958,7 +996,15 @@ class Toolchain:
                 _replace_cross_device_safe(staged_scr, scr_output)
                 _replace_cross_device_safe(staged_lang, lang_output)
             except Exception as exc:
-                diagnostic = _rscript_failure_diagnostic(exc, operation="compile")
+                if isinstance(exc, ExternalProcessExitFailure):
+                    diagnostic = {
+                        "code": "rscript-build-exit-code",
+                        "message": str(exc),
+                        "exit_code": exc.exit_code,
+                        "forced_after_outputs": False,
+                    }
+                else:
+                    diagnostic = _rscript_failure_diagnostic(exc, operation="compile")
                 if diagnostic is None:
                     if isinstance(exc, TimeoutError):
                         code = "rscript-build-timeout"
@@ -983,6 +1029,8 @@ class Toolchain:
                         time.monotonic() - compiler_started,
                     )
                 )
+                if elapsed is None:
+                    elapsed = time.monotonic() - compiler_started
                 report = {
                     "schema": "srhd-modkit-script-build-v1",
                     "status": "failed",
@@ -1017,12 +1065,13 @@ class Toolchain:
                                         "last_progress_seconds",
                                         0.0,
                                     )
+                                    or 0.0
                                 ),
                                 3,
                             )
                             if process_result is not None
                             else round(
-                                float(getattr(exc, "last_progress_seconds", 0.0)),
+                                float(getattr(exc, "last_progress_seconds", 0.0) or 0.0),
                                 3,
                             )
                         ),
@@ -1290,6 +1339,8 @@ class Toolchain:
             raise ValueError("--lang-base используется только вместе с игровым --lang-dat")
         if source.suffix.casefold() != ".rson":
             raise ValueError("Компилятор принимает проект .rson")
+        if scr_output.suffix.casefold() != ".scr":
+            raise ValueError("Результат компиляции RSON должен иметь расширение .scr")
         project = load_rson(source)
         issues = project.validate()
         errors = [issue for issue in issues if issue.severity == "error"]
@@ -1313,6 +1364,11 @@ class Toolchain:
         folded_destinations = [str(path).casefold() for path in destinations]
         if len(set(folded_destinations)) != len(folded_destinations):
             raise ValueError("SCR, языковой фрагмент и Lang.dat должны иметь разные пути")
+        protected_inputs = {str(source).casefold()}
+        if lang_base_path is not None:
+            protected_inputs.add(str(lang_base_path).casefold())
+        if any(path in protected_inputs for path in folded_destinations):
+            raise ValueError("Результаты компиляции не могут перезаписывать RSON или языковую базу")
         existing = [path for path in destinations if path.exists()]
         if existing and not overwrite:
             raise FileExistsError(f"Результат уже существует: {existing[0]}")
@@ -1347,13 +1403,14 @@ class Toolchain:
 
             # Nothing reaches caller-visible paths until every requested
             # language artifact has been parsed and, for DAT, round-tripped.
-            _replace_cross_device_safe(staged_scr, scr_output)
+            publications: list[tuple[Path, Path]] = [(staged_scr, scr_output)]
             if fragment_output is not None:
                 fragment_output.parent.mkdir(parents=True, exist_ok=True)
-                _replace_cross_device_safe(staged_fragment, fragment_output)
+                publications.append((staged_fragment, fragment_output))
             if requested_lang_dat is not None and staged_lang_dat is not None:
                 requested_lang_dat.parent.mkdir(parents=True, exist_ok=True)
-                _replace_cross_device_safe(staged_lang_dat, requested_lang_dat)
+                publications.append((staged_lang_dat, requested_lang_dat))
+            publish_files_transactionally(publications)
 
         fragment_result = fragment.as_dict()
         fragment_result["path"] = str(fragment_output) if fragment_output is not None else None
@@ -1471,6 +1528,7 @@ class Toolchain:
                     "Ошибка",
                 ),
             )
+            _require_external_success(process_result, "RScript decompile")
             if not recovered.is_file():
                 raise RuntimeError(
                     "RScript modern CLI не создал восстановленный RSON "
@@ -1543,6 +1601,7 @@ class Toolchain:
                 ),
                 control_actions=control_actions,
             )
+            _require_external_success(process_result, "RScript legacy decompile")
             if not recovered.is_file():
                 raise RuntimeError("RScript не создал восстановленный RSON")
             return process_result, timeout_policy
@@ -2735,13 +2794,14 @@ class Toolchain:
             if not result["verified"]:
                 raise RsmBuildFailure("RSM-сборка не прошла обязательный аудит", result)
             staged_scr = Path(result["scr"])
-            _replace_cross_device_safe(staged_scr, scr_output)
+            publications: list[tuple[Path, Path]] = [(staged_scr, scr_output)]
             if staged_txt is not None and lang_txt_target is not None:
                 lang_txt_target.parent.mkdir(parents=True, exist_ok=True)
-                _replace_cross_device_safe(staged_txt, lang_txt_target)
+                publications.append((staged_txt, lang_txt_target))
             if staged_dat is not None and lang_dat_target is not None:
                 lang_dat_target.parent.mkdir(parents=True, exist_ok=True)
-                _replace_cross_device_safe(staged_dat, lang_dat_target)
+                publications.append((staged_dat, lang_dat_target))
+            publish_files_transactionally(publications)
         result["scr"] = str(scr_output)
         result["scr_sha256"] = sha256_file(scr_output)
         result["scr_info"] = inspect_scr(scr_output)
@@ -2809,6 +2869,7 @@ class Toolchain:
                 progress_timeout=timeout_policy["progress_seconds"],
                 abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
             )
+            _require_external_success(process_result, "RScript convert")
             if not generated.is_file():
                 raise RuntimeError("RScript CLI не создал результат конвертации")
             if generated.suffix.casefold() == ".rson":

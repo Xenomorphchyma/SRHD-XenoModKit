@@ -123,11 +123,11 @@ def _indexes(mods: Iterable[ModRecord]) -> tuple[dict[str, ModRecord], dict[str,
     for mod in mods:
         path_ref = mod.relative_path.as_posix().replace("/", "\\")
         by_path[normalize_ref(path_ref)] = mod
-        for ref in {mod.name, mod.root.name, path_ref}:
+        for ref in dict.fromkeys((mod.name, mod.root.name, path_ref)):
             key = normalize_ref(ref)
             if not key:
                 continue
-            for candidate in {key, key.split("\\")[-1]}:
+            for candidate in dict.fromkeys((key, key.split("\\")[-1])):
                 values = by_ref.setdefault(candidate, [])
                 if mod not in values:
                     values.append(mod)
@@ -186,12 +186,24 @@ def _effective_enabled(
 def _dependency_edges(
     enabled: list[ModRecord],
     all_mods: list[ModRecord],
-) -> tuple[list[dict[str, Any]], dict[str, set[str]]]:
+) -> tuple[list[dict[str, Any]], dict[str, set[str]], dict[str, str]]:
     _, by_ref = _indexes(all_mods)
     enabled_ids = {normalize_ref(mod.relative_path.as_posix().replace("/", "\\")) for mod in enabled}
-    edges: list[dict[str, Any]] = []
-    graph: dict[str, set[str]] = {mod.name: set() for mod in enabled}
+    name_counts: dict[str, int] = {}
     for mod in enabled:
+        name_counts[mod.name.casefold()] = name_counts.get(mod.name.casefold(), 0) + 1
+    labels = {
+        normalize_ref(mod.relative_path.as_posix().replace("/", "\\")): (
+            mod.name
+            if name_counts[mod.name.casefold()] == 1
+            else f"{mod.name} [{mod.relative_path.as_posix()}]"
+        )
+        for mod in enabled
+    }
+    edges: list[dict[str, Any]] = []
+    graph: dict[str, set[str]] = {identifier: set() for identifier in enabled_ids}
+    for mod in enabled:
+        mod_id = normalize_ref(mod.relative_path.as_posix().replace("/", "\\"))
         for dependency in mod.module.dependencies:
             matches = by_ref.get(normalize_ref(dependency), [])
             active = [
@@ -204,14 +216,17 @@ def _dependency_edges(
             edges.append(
                 {
                     "from": mod.name,
+                    "from_path": mod.relative_path.as_posix(),
                     "reference": dependency,
                     "to": [item.name for item in targets],
+                    "to_paths": [item.relative_path.as_posix() for item in targets],
                     "status": status,
                 }
             )
             for target in active:
-                graph[mod.name].add(target.name)
-    return edges, graph
+                target_id = normalize_ref(target.relative_path.as_posix().replace("/", "\\"))
+                graph[mod_id].add(target_id)
+    return edges, graph, labels
 
 
 def _conflict_edges(enabled: list[ModRecord], all_mods: list[ModRecord]) -> list[dict[str, Any]]:
@@ -230,8 +245,10 @@ def _conflict_edges(enabled: list[ModRecord], all_mods: list[ModRecord]) -> list
             edges.append(
                 {
                     "from": mod.name,
+                    "from_path": mod.relative_path.as_posix(),
                     "reference": conflict,
                     "to": [item.name for item in (active or matches)],
+                    "to_paths": [item.relative_path.as_posix() for item in (active or matches)],
                     "status": status,
                 }
             )
@@ -462,9 +479,13 @@ def analyze_modset(
                 + ",".join(str(value) for value in effective_configured_orders),
             )
         )
-    edges, graph = _dependency_edges(enabled, mods)
+    edges, graph, graph_labels = _dependency_edges(enabled, mods)
     conflicts = _conflict_edges(enabled, mods)
-    found_cycles = _cycles(graph)
+    cycle_ids = _cycles(graph)
+    found_cycles = tuple(
+        tuple(graph_labels.get(identifier, identifier) for identifier in cycle)
+        for cycle in cycle_ids
+    )
     for cycle in found_cycles:
         issues.append(
             AuditIssue(

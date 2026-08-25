@@ -10,6 +10,21 @@
     "mod_root": {"type": "string"},
     "prefix": {"type": "string"},
     "artifacts": {"type": "array", "items": {"type": "object"}},
+    "external_builds": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "project", "mode", "outputs"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "kind": {"type": "string"},
+          "project": {"type": "string", "minLength": 1},
+          "mode": {"enum": ["unconfigured", "prebuilt"]},
+          "outputs": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        },
+        "additionalProperties": true
+      }
+    },
     "variants": {"type": "object"},
     "targets": {"type": "object"}
   },

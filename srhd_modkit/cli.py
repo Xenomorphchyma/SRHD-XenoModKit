@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .discovery import discover_mods, load_mod
-from .files import build_manifest, compare_trees, find_collisions, find_duplicates, pack_mod, sha256_file, stage_tree
+from .files import build_manifest, compare_trees, find_collisions, find_duplicates, iter_files, pack_mod, sha256_file, stage_tree
 from .formats import format_catalog, inspect_file, scan_formats
 from .modcfg import parse_modcfg, validate_modcfg
 from .module_info import find_module_info, parse_module_info
@@ -1448,6 +1448,26 @@ def cmd_script_set_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def _source_config_files(root: Path, filename: str) -> list[Path]:
+    """Find Source/Sources + CFG/Config inputs without casing/layout assumptions."""
+
+    result: list[Path] = []
+    expected = filename.casefold()
+    for path in iter_files(root):
+        if path.name.casefold() != expected:
+            continue
+        parts = [part.casefold() for part in path.relative_to(root).parts[:-1]]
+        try:
+            source_index = next(
+                index for index, part in enumerate(parts) if part in {"source", "sources"}
+            )
+        except StopIteration:
+            continue
+        if any(part in {"cfg", "config"} for part in parts[source_index + 1 :]):
+            result.append(path)
+    return sorted(result, key=lambda path: path.relative_to(root).as_posix().casefold())
+
+
 def _runtime_lint_target(
     target: str | Path,
     *,
@@ -1472,12 +1492,9 @@ def _runtime_lint_target(
         root = target.parent
     elif target.is_dir():
         root = target
-        source_root = root / "SOURCE"
-        search_root = source_root if source_root.is_dir() else root
         rson_files = sorted(
-            path
-            for path in search_root.rglob("*.rson")
-            if not any(part.casefold().startswith(".srhd-") for part in path.parts)
+            (path for path in iter_files(root) if path.suffix.casefold() == ".rson"),
+            key=lambda path: str(path).casefold(),
         )
     else:
         raise FileNotFoundError(target)
@@ -1507,11 +1524,7 @@ def _runtime_lint_target(
     if main_path:
         main_candidates.append(Path(main_path).resolve())
     elif target.is_dir():
-        for candidate in (
-            root / "CFG" / "Main.dat",
-            root / "SOURCE" / "CFG" / "Main.txt",
-            root / "Source" / "Config" / "Main.txt",
-        ):
+        for candidate in [root / "CFG" / "Main.dat", *_source_config_files(root, "Main.txt")]:
             if candidate.is_file():
                 main_candidates.append(candidate.resolve())
 
@@ -1563,11 +1576,10 @@ def _runtime_lint_target(
         with tempfile.TemporaryDirectory(prefix="srhd-runtime-lang-") as name:
             temp = Path(name)
             for language in module_info.languages:
-                candidates = (
-                    root / "SOURCE" / "CFG" / f"Lang_{language}.txt",
-                    root / "Source" / "Config" / f"Lang_{language}.txt",
+                candidates = [
+                    *_source_config_files(root, f"Lang_{language}.txt"),
                     root / "CFG" / language / "Lang.dat",
-                )
+                ]
                 for index, language_path in enumerate(candidates):
                     if not language_path.is_file():
                         continue
@@ -1594,12 +1606,11 @@ def _runtime_lint_target(
     if target.is_dir() and rson_projects:
         with tempfile.TemporaryDirectory(prefix="srhd-runtime-cache-") as name:
             temp = Path(name)
-            candidates = (
-                root / "SOURCE" / "CFG" / "CacheData.txt",
-                root / "Source" / "Config" / "CacheData.txt",
+            candidates = [
+                *_source_config_files(root, "CacheData.txt"),
                 root / "CFG" / "CacheData.txt",
                 root / "CFG" / "CacheData.dat",
-            )
+            ]
             for index, cache_path in enumerate(candidates):
                 if not cache_path.is_file():
                     continue
@@ -1887,11 +1898,10 @@ def _script_artifact_lint_target(
         temp = Path(name)
         if registrations is None:
             registrations = {}
-            main_candidates = (
+            main_candidates = [
                 root / "CFG" / "Main.dat",
-                root / "SOURCE" / "CFG" / "Main.txt",
-                root / "Source" / "Config" / "Main.txt",
-            )
+                *_source_config_files(root, "Main.txt"),
+            ]
             for index, path in enumerate(main_candidates):
                 if not path.is_file():
                     continue
@@ -1907,12 +1917,11 @@ def _script_artifact_lint_target(
                     )
 
         cache_documents: list[tuple[Path, BlockParDocument]] = []
-        cache_candidates = (
-            root / "SOURCE" / "CFG" / "CacheData.txt",
-            root / "Source" / "Config" / "CacheData.txt",
+        cache_candidates = [
+            *_source_config_files(root, "CacheData.txt"),
             root / "CFG" / "CacheData.txt",
             root / "CFG" / "CacheData.dat",
-        )
+        ]
         for index, path in enumerate(cache_candidates):
             if not path.is_file():
                 continue
@@ -1930,7 +1939,10 @@ def _script_artifact_lint_target(
 
         if check_dialog_language:
             rson_projects = []
-            for path in sorted(root.rglob("*.rson")):
+            for path in sorted(
+                (item for item in iter_files(root) if item.suffix.casefold() == ".rson"),
+                key=lambda item: str(item).casefold(),
+            ):
                 try:
                     project = load_rson(path)
                     if not any(issue.severity == "error" for issue in project.validate()):
@@ -2041,9 +2053,20 @@ def _game_text_lint_target(
         except Exception as exc:
             issues.append(GameTextIssue("error", "game-text-load", str(exc), str(module_info.resolve())))
 
-    source_cfg = root / "SOURCE" / "CFG"
-    if source_cfg.is_dir():
-        for path in sorted(source_cfg.rglob("*.txt")):
+    source_cfg_roots = tuple(
+        dict.fromkeys(
+            root.joinpath(*path.relative_to(root).parts[:2])
+            for path in iter_files(root)
+            if len(path.relative_to(root).parts) >= 3
+            and path.relative_to(root).parts[0].casefold() in {"source", "sources"}
+            and path.relative_to(root).parts[1].casefold() in {"cfg", "config"}
+        )
+    )
+    for source_cfg in source_cfg_roots:
+        for path in sorted(
+            (item for item in iter_files(source_cfg) if item.suffix.casefold() == ".txt"),
+            key=lambda item: str(item).casefold(),
+        ):
             try:
                 decoded = read_text(path)
                 russian_target = "rus" in {part.casefold() for part in path.relative_to(source_cfg).parts[:-1]}
@@ -2063,7 +2086,10 @@ def _game_text_lint_target(
             except Exception as exc:
                 issues.append(GameTextIssue("error", "game-text-load", str(exc), str(path.resolve())))
 
-    for path in sorted(root.rglob("*.rson")):
+    for path in sorted(
+        (item for item in iter_files(root) if item.suffix.casefold() == ".rson"),
+        key=lambda item: str(item).casefold(),
+    ):
         try:
             issues.extend(
                 lint_game_text(
@@ -2081,8 +2107,8 @@ def _game_text_lint_target(
     if rus_cfg.is_dir():
         with tempfile.TemporaryDirectory(prefix="srhd-game-text-") as name:
             temp = Path(name)
-            for index, path in enumerate(sorted(rus_cfg.rglob("*"))):
-                if not path.is_file() or path.suffix.casefold() not in {".txt", ".dat"}:
+            for index, path in enumerate(iter_files(rus_cfg)):
+                if path.suffix.casefold() not in {".txt", ".dat"}:
                     continue
                 try:
                     if path.suffix.casefold() == ".dat":
@@ -2509,11 +2535,22 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
     for path in scripts:
         values = registrations.get(path.stem.casefold(), [])
         expected = f"script.{path.stem}".casefold()
-        if main_dat.is_file() and not any(expected in value.casefold() for value in values):
+        if main_dat.is_file() and not any(
+            re.search(
+                rf"(?<![A-Za-z0-9_.]){re.escape(expected)}(?![A-Za-z0-9_.])",
+                value.casefold(),
+            )
+            is not None
+            for value in values
+        ):
             issues.append({"severity": "error", "code": "scr-unregistered", "message": f"{path.name} не зарегистрирован как {path.stem}=...,Script.{path.stem}"})
 
-    rson_files = sorted(root.rglob("*.rson"))
+    rson_files = sorted(
+        (item for item in iter_files(root) if item.suffix.casefold() == ".rson"),
+        key=lambda item: str(item).casefold(),
+    )
     valid_rsons: list[str] = []
+    valid_script_names: set[str] = set()
     for path in rson_files:
         try:
             project = load_rson(path)
@@ -2522,10 +2559,22 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
                 issues.append({"severity": "error", "code": "rson-invalid", "message": f"{path.relative_to(root)}: {project_issues[0].message}"})
             else:
                 valid_rsons.append(str(path))
+                if project.name.strip():
+                    valid_script_names.add(project.name.casefold())
         except Exception as exc:
             issues.append({"severity": "error", "code": "rson-json", "message": f"{path.relative_to(root)}: {exc}"})
-    if scripts and not valid_rsons:
-        issues.append({"severity": "warning", "code": "rson-source-missing", "message": "Для SCR не найдено исходного RSON; восстановите его отдельной командой script decompile"})
+    for script in scripts:
+        if script.stem.casefold() not in valid_script_names:
+            issues.append(
+                {
+                    "severity": "warning",
+                    "code": "rson-source-missing",
+                    "message": (
+                        f"Для {script.name} не найден валидный RSON с тем же ScriptName; "
+                        "восстановите его отдельной командой script decompile"
+                    ),
+                }
+            )
     misplaced = root / "DATA" / "Main.dat"
     if misplaced.is_file():
         issues.append({"severity": "error", "code": "main-dat-misplaced", "message": "DATA/Main.dat расположен неверно; конфигурационный Main.dat должен находиться в CFG/Main.dat"})
@@ -3412,8 +3461,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Операция прервана.", file=sys.stderr)
         return 130
     except Exception as exc:
-        if getattr(args, "json", False) and callable(getattr(exc, "as_dict", None)):
-            print_json(exc.as_dict())
+        if getattr(args, "json", False):
+            if callable(getattr(exc, "as_dict", None)):
+                print_json(exc.as_dict())
+            else:
+                print_json(
+                    {
+                        "schema": "srhd-modkit-error-v1",
+                        "status": "failed",
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                            "path": str(getattr(exc, "filename", "") or "") or None,
+                        },
+                    }
+                )
             return 1
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1

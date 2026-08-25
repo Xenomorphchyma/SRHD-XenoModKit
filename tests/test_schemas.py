@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from srhd_modkit.schemas import list_schemas, validate_schema_document
 
@@ -32,6 +33,27 @@ class SchemaTests(unittest.TestCase):
                 "srhd-modkit-modset-v1",
             }.issubset(names)
         )
+
+    def test_combinators_and_unsupported_keywords_are_not_ignored(self) -> None:
+        document = {"schema": "fixture", "value": 2}
+        schema = {
+            "type": "object",
+            "properties": {
+                "value": {"oneOf": [{"const": 1}, {"minimum": 3}]},
+            },
+        }
+        with patch("srhd_modkit.schemas.load_schema", return_value=schema):
+            result = validate_schema_document(document)
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["errors"][0]["code"], "schema-oneof")
+
+        with patch(
+            "srhd_modkit.schemas.load_schema",
+            return_value={"type": "object", "format": "unknown"},
+        ):
+            unsupported = validate_schema_document(document)
+        self.assertFalse(unsupported["valid"])
+        self.assertEqual(unsupported["errors"][0]["code"], "schema-keyword-unsupported")
 
 
 if __name__ == "__main__":

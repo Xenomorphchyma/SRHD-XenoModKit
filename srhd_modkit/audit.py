@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import tempfile
 import tokenize
 from dataclasses import dataclass, field, replace
@@ -335,7 +336,7 @@ def _structure_check(context: AuditContext) -> AuditCheck:
     for path in entries:
         relative = path.relative_to(context.root).as_posix()
         folded.setdefault(relative.casefold(), []).append(path)
-        if path.is_symlink():
+        if path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)()):
             issues.append(
                 _issue(
                     context,
@@ -484,10 +485,21 @@ def _dat_check(context: AuditContext) -> AuditCheck:
             issues.append(_issue(context, name, "error", "dat-invalid", str(exc), path))
 
     if context.profile is AuditProfile.RELEASE:
-        source_cfg = context.root / "SOURCE" / "CFG"
         cfg = context.root / "CFG"
-        if source_cfg.is_dir():
-            for source in sorted(source_cfg.rglob("*.txt")):
+        source_directories = tuple(
+            dict.fromkeys(
+                context.root.joinpath(*path.relative_to(context.root).parts[:2])
+                for path in iter_files(context.root)
+                if len(path.relative_to(context.root).parts) >= 3
+                and path.relative_to(context.root).parts[0].casefold() in {"source", "sources"}
+                and path.relative_to(context.root).parts[1].casefold() in {"cfg", "config"}
+            )
+        )
+        for source_cfg in source_directories:
+            for source in sorted(
+                (path for path in iter_files(source_cfg) if path.suffix.casefold() == ".txt"),
+                key=lambda path: path.relative_to(source_cfg).as_posix().casefold(),
+            ):
                 relative = source.relative_to(source_cfg)
                 binary = cfg / relative.with_suffix(".dat")
                 if not binary.is_file():
@@ -1373,7 +1385,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
                 name,
                 "error",
                 "main-dat-missing",
-                "Есть SCR, но отсутствует CFG/Main.dat или SOURCE/CFG/Main.txt",
+                "Есть SCR, но отсутствует CFG/Main.dat или Source/Sources + CFG/Config/Main.txt",
                 context.root,
             )
         )
@@ -1395,7 +1407,15 @@ def _script_check(context: AuditContext) -> AuditCheck:
     for path in scripts:
         expected = f"script.{path.stem}".casefold()
         values = registrations.get(path.stem.casefold(), [])
-        if main_path is not None and not any(expected in value.casefold() for value in values):
+        registered = any(
+            re.search(
+                rf"(?<![A-Za-z0-9_.]){re.escape(expected)}(?![A-Za-z0-9_.])",
+                value.casefold(),
+            )
+            is not None
+            for value in values
+        )
+        if main_path is not None and not registered:
             issues.append(
                 _issue(
                     context,
@@ -1617,16 +1637,25 @@ def _script_check(context: AuditContext) -> AuditCheck:
         )
     )
 
-    semantic_complete = not scripts or valid_rsons > 0
-    if scripts and not semantic_complete:
+    valid_script_names = {
+        project.name.casefold()
+        for project in rson_projects
+        if project.name.strip()
+    }
+    uncovered_scripts = [path for path in scripts if path.stem.casefold() not in valid_script_names]
+    semantic_complete = not uncovered_scripts
+    for path in uncovered_scripts:
         issues.append(
             _issue(
                 context,
                 name,
                 "info",
                 "scr-semantic-analysis-unavailable",
-                "SCR проверен бинарно; для смыслового анализа явно восстановите RSON командой script decompile",
-                context.root,
+                (
+                    f"{path.name} проверен только бинарно; соответствующий валидный RSON "
+                    "с тем же ScriptName не найден"
+                ),
+                path,
             )
         )
     return AuditCheck(
@@ -1634,7 +1663,12 @@ def _script_check(context: AuditContext) -> AuditCheck:
         _status(issues),
         tuple(issues),
         tuple(dict.fromkeys(checked)),
-        details={"scr": len(scripts), "rson": len(rsons), "valid_rson": valid_rsons},
+        details={
+            "scr": len(scripts),
+            "rson": len(rsons),
+            "valid_rson": valid_rsons,
+            "semantic_uncovered_scr": [path.name for path in uncovered_scripts],
+        },
         complete=semantic_complete,
     )
 

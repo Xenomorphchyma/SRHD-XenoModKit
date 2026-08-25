@@ -6,6 +6,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
 
 from .blockpar import BlockParDocument, BlockParNode
+from .files import iter_files
 from .module_info import find_module_info, parse_module_info
 from .models import ModuleInfo
 from .resources import verify_resource
@@ -5900,8 +5901,8 @@ def _local_useless_item_image_names(root: Path) -> set[str]:
     result: set[str] = set()
     if not root.is_dir():
         return result
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.casefold() not in {".gi", ".gai"}:
+    for path in iter_files(root):
+        if path.suffix.casefold() not in {".gi", ".gai"}:
             continue
         parts = tuple(part.casefold() for part in path.relative_to(root).parts[:-1])
         if len(parts) < 2 or parts[-2:] != ("data", "itemsuseless"):

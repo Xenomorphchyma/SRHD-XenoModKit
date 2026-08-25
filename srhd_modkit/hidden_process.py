@@ -651,7 +651,11 @@ def run_on_hidden_desktop(
         if job:
             kernel32.CloseHandle(job)
         if desktop:
-            user32.CloseDesktop(desktop)
+            deadline = time.monotonic() + 1.0
+            while not user32.CloseDesktop(desktop):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
         if mutex_acquired:
             kernel32.ReleaseMutex(mutex)
         if mutex:

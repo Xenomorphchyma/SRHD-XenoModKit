@@ -4,6 +4,6 @@
   "title": "SRHD ModKit project initialization result",
   "type": "object",
   "required": ["schema", "mod", "output", "artifacts", "issues", "summary"],
-  "properties": {"schema": {"const": "srhd-modkit-project-init-v1"}, "mod": {"type": "string"}, "output": {"type": "string"}, "artifacts": {"type": "array"}, "issues": {"type": "array"}, "summary": {"type": "object"}},
+  "properties": {"schema": {"const": "srhd-modkit-project-init-v1"}, "mod": {"type": "string"}, "output": {"type": "string"}, "artifacts": {"type": "array"}, "external_builds": {"type": "array"}, "issues": {"type": "array"}, "summary": {"type": "object"}},
   "additionalProperties": true
 }

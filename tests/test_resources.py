@@ -211,6 +211,19 @@ class ResourceTests(unittest.TestCase):
                 _gi(4, 5),
             )
 
+    def test_pkg_output_inside_source_is_never_packed_into_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            source = Path(name) / "source"
+            source.mkdir()
+            (source / "payload.bin").write_bytes(b"payload")
+            output = source / "output.pkg"
+            build_pkg(source, output)
+            first_size = output.stat().st_size
+            build_pkg(source, output, overwrite=True)
+            self.assertEqual(output.stat().st_size, first_size)
+            paths = {entry.relative_path.name for entry in inspect_pkg(output).entries}
+            self.assertEqual(paths, {"payload.bin"})
+
 
 if __name__ == "__main__":
     unittest.main()

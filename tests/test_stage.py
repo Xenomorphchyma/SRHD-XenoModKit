@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
-from srhd_modkit.files import compare_trees, iter_files, stage_tree
+from srhd_modkit.files import compare_trees, iter_files, pack_mod, stage_tree
 
 
 class StageTests(unittest.TestCase):
@@ -47,6 +48,18 @@ class StageTests(unittest.TestCase):
             internal.mkdir()
             (internal / "leaked.txt").write_text("temporary", encoding="utf-8")
             self.assertEqual([path.name for path in iter_files(root)], ["ModuleInfo.txt"])
+
+    def test_pack_rejects_unsafe_prefix_and_internal_service_file(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "ModuleInfo.txt").write_text("Name=Example", encoding="utf-8")
+            (root / ".srhd-interrupted.tmp").write_bytes(b"temporary")
+            with self.assertRaises(ValueError):
+                pack_mod(root, root.parent / "unsafe.zip", prefix="../escape")
+            archive = root.parent / "safe.zip"
+            pack_mod(root, archive, prefix="OtherMods/Example")
+            with zipfile.ZipFile(archive) as value:
+                self.assertEqual(value.namelist(), ["OtherMods/Example/ModuleInfo.txt"])
 
 
 if __name__ == "__main__":

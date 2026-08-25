@@ -68,8 +68,12 @@ python -B srhd.py project clean --json
 `--no-cache` отключает его для одного запуска. Подробная схема:
 `<MODKIT_ROOT>/PROJECTS_RU.md`.
 
-`project init` не угадывает неоднозначные связи. `project plan` не компилирует
-и показывает причины cache miss и итоговые файлы. `project clean` без
+`project init` не угадывает неоднозначные связи. Найденные `.csproj`,
+`.vcxproj`, CMake/SLN, DLL и EXE оформляются как `external_builds`; режим
+`unconfigured` блокирует сборку до явного подтверждения prebuilt outputs.
+`project plan` не компилирует и показывает причины cache miss и итоговые файлы.
+`project deploy --dry-run` не меняет целевую папку, но выполняет проектную
+сборку и может обновить `.srhd-build`/`.srhd-cache`. `project clean` без
 `--apply` является только dry-run; `--build` и `--cache` включаются явно.
 
 ## Языки и машинные схемы

@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .files import sha256_file
+from .files import iter_files, sha256_file
 from .image_codec import (
     ImageFormatError,
     UnsupportedImageFormat,
@@ -798,7 +798,10 @@ def build_pkg(
     chunk_size: int = 1024 * 1024,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    source_dir = Path(source_dir).resolve()
+    raw_source = Path(source_dir).absolute()
+    if raw_source.is_symlink() or bool(getattr(raw_source, "is_junction", lambda: False)()):
+        raise ValueError(f"PKG source не должен быть ссылкой или junction: {raw_source}")
+    source_dir = raw_source.resolve()
     output = Path(output).resolve()
     if not source_dir.is_dir():
         raise NotADirectoryError(source_dir)
@@ -818,8 +821,30 @@ def build_pkg(
     for folder_name in folders:
         _pkg_name_bytes(folder_name, "PKG folder")
 
+    unsafe_links: list[Path] = []
+    for current, directories, names in os.walk(source_dir, followlinks=False):
+        parent = Path(current)
+        kept: list[str] = []
+        for name in directories:
+            candidate = parent / name
+            if name.casefold().startswith(".srhd-"):
+                continue
+            if candidate.is_symlink() or bool(getattr(candidate, "is_junction", lambda: False)()):
+                unsafe_links.append(candidate)
+                continue
+            kept.append(name)
+        directories[:] = kept
+        unsafe_links.extend(
+            candidate
+            for name in names
+            if not name.casefold().startswith(".srhd-")
+            for candidate in (parent / name,)
+            if candidate.is_symlink()
+        )
+    if unsafe_links:
+        raise ValueError(f"PKG source содержит ссылку или junction: {unsafe_links[0]}")
     source_files = sorted(
-        (path for path in source_dir.rglob("*") if path.is_file()),
+        (path for path in iter_files(source_dir) if path.resolve() != output),
         key=lambda path: (path.relative_to(source_dir).as_posix().casefold(), path.relative_to(source_dir).as_posix()),
     )
     if not source_files:

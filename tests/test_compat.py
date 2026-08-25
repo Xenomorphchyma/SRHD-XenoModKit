@@ -180,6 +180,24 @@ class CompatibilityTests(unittest.TestCase):
                 any(issue.code == "modcfg-priority-order-mismatch" for issue in report.issues)
             )
 
+    def test_duplicate_display_names_do_not_collapse_dependency_graph_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            mods = base / "Mods"
+            first = mods / "Group" / "First"
+            second = mods / "Group" / "Second"
+            _make_mod(first, "Same", dependence="Group\\Second", priority=1)
+            _make_mod(second, "Same", dependence="Group\\First", priority=2)
+            config = mods / "ModCFG.txt"
+            config.write_text("CurrentMod=Group\\First,Group\\Second\n", encoding="cp1251")
+
+            report = analyze_modset(config, mods)
+            self.assertEqual(len(report.cycles), 1)
+            self.assertIn("Same [Group/First]", report.cycles[0])
+            self.assertIn("Same [Group/Second]", report.cycles[0])
+            self.assertEqual(report.dependency_edges[0]["from_path"], "Group/First")
+            self.assertEqual(report.dependency_edges[0]["to_paths"], ["Group/Second"])
+
 
 if __name__ == "__main__":
     unittest.main()

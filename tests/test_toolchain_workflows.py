@@ -91,6 +91,35 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertEqual(modern[0:2], ["--cli", "-b"])
             self.assertEqual(modern[-1], "--full")
 
+    def test_rscript_nonzero_exit_is_not_hidden_by_created_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            executable = root / "RScript" / "RScript.exe"
+            executable.parent.mkdir()
+            executable.write_bytes(b"fixture")
+            source = root / "source.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+            chain = Toolchain(root)
+            chain.rscript_version = ExecutableVersion(4, 15)
+
+            def failed_run(_application, _arguments, **kwargs):
+                outputs = [Path(value) for value in kwargs["expected_outputs"]]
+                outputs[0].write_bytes((8).to_bytes(4, "little") + b"compiled")
+                outputs[1].write_bytes(b"\xff\xfe")
+                return SimpleNamespace(exit_code=2, forced_after_outputs=False)
+
+            with patch("srhd_modkit.toolchain.run_on_hidden_desktop", side_effect=failed_run):
+                with self.assertRaises(ScriptBuildFailure) as caught:
+                    chain._compile_rson_with_rscript(
+                        source,
+                        root / "output.scr",
+                        root / "output.lang.txt",
+                    )
+            report = caught.exception.as_dict()
+            self.assertEqual(report["failure"]["code"], "rscript-build-exit-code")
+            self.assertEqual(report["failure"]["exit_code"], 2)
+            self.assertFalse(report["published_outputs"])
+
     def test_rscript_415_decompile_uses_true_cli_without_gui_controls(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -142,7 +171,7 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertEqual(chain.tools["blockpar"].version, "2.1")
             legacy.assert_not_called()
 
-    def test_blockpar_19_uses_cp1251_compatibility_executable(self) -> None:
+    def test_blockpar_19_prepares_cp1251_executable_only_when_required(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             executable = root / "BlockParEditor" / "BlockParEditor.exe"
@@ -165,11 +194,26 @@ class ToolchainWorkflowTests(unittest.TestCase):
                 side_effect=fake_legacy,
             ) as legacy:
                 chain = Toolchain(root)
+                legacy.assert_not_called()
+                self.assertEqual(chain.tools["blockpar"].path, executable.resolve())
+                selected = chain.require("blockpar")
 
             legacy.assert_called_once_with(executable.resolve(), compatibility.resolve())
+            self.assertEqual(selected.path, compatibility.resolve())
             self.assertEqual(chain.tools["blockpar"].path, compatibility.resolve())
             self.assertEqual(chain.tools["blockpar"].version, "1.9")
             self.assertEqual(chain.tools["blockpar"].compatibility, "legacy-cp1251")
+
+    def test_compile_rson_rejects_source_collision_and_wrong_output_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "source.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+            chain = Toolchain(root / "tools")
+            with self.assertRaisesRegex(ValueError, "расширение .scr"):
+                chain.compile_rson(source, root / "output.bin", root / "lang.txt")
+            with self.assertRaisesRegex(ValueError, "перезаписывать RSON"):
+                chain.compile_rson(source, source.with_suffix(".scr"), source, overwrite=True)
 
     def test_compile_blocks_incomplete_tgroup_before_rscript(self) -> None:
         with tempfile.TemporaryDirectory() as name:

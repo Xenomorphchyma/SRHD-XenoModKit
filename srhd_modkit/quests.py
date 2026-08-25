@@ -1516,7 +1516,7 @@ def _atomic_write(path: Path, payload: bytes, *, overwrite: bool) -> None:
     if path.exists() and not overwrite:
         raise FileExistsError(f"Файл уже существует: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.srhd-", dir=path.parent)
+    fd, temp_name = tempfile.mkstemp(prefix=f".srhd-quest-{path.name}-", dir=path.parent)
     os.close(fd)
     temp = Path(temp_name)
     try:

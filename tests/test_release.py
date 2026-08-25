@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import zipfile
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -303,6 +304,30 @@ class ReleaseTests(unittest.TestCase):
             }
             with self.assertRaises(ValueError):
                 verify_release_archive(archive_path, manifest, prefix="")
+
+    def test_cleanup_refuses_transaction_owned_by_live_deploy_process(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "Mods"
+            target = root / "Example"
+            target.parent.mkdir(parents=True)
+            transaction = root / ".Example.srhd-deploy-live"
+            transaction.mkdir()
+            (transaction / "transaction.json").write_text(
+                __import__("json").dumps(
+                    {
+                        "schema": "srhd-modkit-deploy-transaction-v1",
+                        "id": "live",
+                        "state": "preparing",
+                        "pid": os.getpid(),
+                        "destination": str(target),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = cleanup_deployments(root, apply=True, force=True)
+            self.assertEqual(result["summary"]["removed"], 0)
+            self.assertEqual(result["summary"]["refused"], 1)
+            self.assertTrue(transaction.is_dir())
 
 
 if __name__ == "__main__":

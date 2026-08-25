@@ -2093,6 +2093,22 @@ class RuntimeLintTests(unittest.TestCase):
             codes = {issue["code"] for issue in result["issues"] if issue["severity"] == "error"}
             self.assertIn("runtime-onstart-unguarded-world", codes)
 
+    def test_runtime_target_supports_sources_config_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "SOURCES"
+            cfg = source / "Config"
+            cfg.mkdir(parents=True)
+            data = deepcopy(SAFE_RSON)
+            (source / "safe.rson").write_text(json.dumps(data), encoding="utf-8")
+            main = cfg / "Main.txt"
+            main.write_text("Data ^{\n  Script ^{\n  }\n}\n", encoding="utf-8")
+
+            result = _runtime_lint_target(root)
+
+            self.assertIn(str(main.resolve()), result["main"])
+            self.assertIn(str((source / "safe.rson").resolve()), result["rson"])
+
     def test_runtime_target_checks_literal_ct_keys_in_declared_languages(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

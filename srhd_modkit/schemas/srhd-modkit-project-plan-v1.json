@@ -4,6 +4,6 @@
   "title": "SRHD ModKit project plan",
   "type": "object",
   "required": ["schema", "project", "variant", "blocked", "destinations", "artifacts", "files", "issues", "summary"],
-  "properties": {"schema": {"const": "srhd-modkit-project-plan-v1"}, "project": {"type": "string"}, "variant": {"type": "string"}, "blocked": {"type": "boolean"}, "destinations": {"type": "object"}, "artifacts": {"type": "array"}, "files": {"type": "object"}, "issues": {"type": "array"}, "summary": {"type": "object"}},
+  "properties": {"schema": {"const": "srhd-modkit-project-plan-v1"}, "project": {"type": "string"}, "variant": {"type": "string"}, "blocked": {"type": "boolean"}, "destinations": {"type": "object"}, "artifacts": {"type": "array"}, "external_builds": {"type": "array"}, "files": {"type": "object"}, "issues": {"type": "array"}, "summary": {"type": "object"}},
   "additionalProperties": true
 }

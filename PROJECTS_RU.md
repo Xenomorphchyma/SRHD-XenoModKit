@@ -25,6 +25,15 @@ python -B srhd.py project clean --json
 оставляет в предупреждениях. Такой черновик загружается ModKit, но спорные
 правила сборки следует один раз уточнить вручную в TOML.
 
+`project init` также ищет `.csproj`, `.vcxproj`, `CMakeLists.txt`, `.sln` и
+поставляемые модом DLL/EXE. Внешний проект добавляется как неподтверждённый
+`[[external_builds]]`: пока автор явно не перечислит runtime-файлы и не выберет
+`mode = "prebuilt"`, `plan`, `build`, `deploy` и `publish` блокируются. ModKit
+намеренно не запускает найденные C++/C# build-команды — произвольный проект не
+является доверенным. Подтверждённые бинарники входят в provenance с SHA-256 и
+проходят обычный аудит сигнатур, поэтому формально успешный выпуск без DLL или
+launcher невозможен.
+
 ## Минимальный проект
 
 Публикуемый `srhd-modkit.toml`:
@@ -65,6 +74,13 @@ lang_fragment = "SOURCE/Script/${script_name}.lang.txt"
 lang_dat = "CFG/Rus/Lang.dat"
 lang_base = "Source/Lang/Rus.base.dat"
 inputs = ["Source/Script/shared"]
+
+[[external_builds]]
+id = "launcher"
+kind = "dotnet"
+project = "RuntimeMod/Source/Launcher/Launcher.csproj"
+mode = "prebuilt"
+outputs = ["RuntimeMod/DATA/Launcher.dll", "RuntimeMod/Launcher.exe"]
 
 [targets.game]
 prefix = "OtherMods/ExampleMod"
@@ -189,6 +205,12 @@ python -B srhd.py project deploy --target game --dry-run --json
 `excluded` и полный `audit_report`. Низкоуровневый эквивалент для уже готового
 дерева:
 
+`project deploy --dry-run` гарантирует только отсутствие изменений в целевой
+папке игры. Чтобы показать точный deploy-состав, команда выполняет реальную
+проектную сборку и поэтому может обновить `.srhd-cache` и `.srhd-build`.
+Полностью пассивный просмотр до компиляции — `project plan`; поле
+`operation_semantics` в JSON явно сообщает эти различия.
+
 ```powershell
 python -B srhd.py release plan "D:/Work/MyMod" "D:/Game/Mods" --prefix OtherMods/MyMod --json
 python -B srhd.py release deploy "D:/Work/MyMod" "D:/Game/Mods" --prefix OtherMods/MyMod --dry-run --json
@@ -211,7 +233,8 @@ python -B srhd.py release cleanup-transactions "D:/Game/Mods" --apply --json
 `doctor` ничего не меняет. `cleanup-transactions` без `--apply` только строит
 план и никогда не удаляет данные. Транзакция с доступной резервной копией
 сохраняется даже с `--apply`; её можно удалить лишь после rollback либо явно с
-`--apply --force`.
+`--apply --force`. Транзакция активного PID не удаляется даже с `--force`, а
+перед удалением ModKit получает lock той же целевой папки.
 
 Служебную очистку проекта сначала просматривают:
 

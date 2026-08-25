@@ -79,6 +79,56 @@ def _quest() -> QuestDocument:
 
 
 class AuditTests(unittest.TestCase):
+    def test_each_scr_requires_its_own_matching_rson_for_semantic_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            script_root = root / "DATA" / "Script"
+            script_root.mkdir(parents=True)
+            for script_name in ("Mod_A", "Mod_B"):
+                (script_root / f"{script_name}.scr").write_bytes(struct.pack("<I", 8))
+            source = root / "SOURCE"
+            source.mkdir()
+            (source / "Mod_A.rson").write_text(
+                json.dumps(
+                    {
+                        "FileID": 573785173,
+                        "FileVersion": 8,
+                        "ScriptName": "Mod_A",
+                        "Visual.Objects": [],
+                        "Visual.Links": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = root / "SOURCE" / "CFG"
+            cfg.mkdir()
+            (cfg / "Main.txt").write_text(
+                "Data ^{\n Script ^{\n Mod_A=1,Script.Mod_A\n Mod_B=1,Script.Mod_B\n }\n}\n",
+                encoding="cp1251",
+            )
+            report = audit_mod(root, profile="release")
+            uncovered = [
+                item for item in report.issues if item.code == "scr-semantic-analysis-unavailable"
+            ]
+            self.assertEqual([Path(item.path).name for item in uncovered], ["Mod_B.scr"])
+            self.assertFalse(report.coverage_complete)
+
+    def test_script_registration_requires_exact_runtime_token(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            script = root / "DATA" / "Script" / "Mod_Foo.scr"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(struct.pack("<I", 8))
+            cfg = root / "SOURCE" / "CFG"
+            cfg.mkdir(parents=True)
+            (cfg / "Main.txt").write_text(
+                "Data ^{\n Script ^{\n Mod_Foo=1,Script.Mod_FooExtra\n }\n}\n",
+                encoding="cp1251",
+            )
+            report = audit_mod(root, profile="release")
+            self.assertTrue(any(item.code == "scr-unregistered" for item in report.issues))
     def test_release_checks_source_config_cache_against_install_subpath(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"

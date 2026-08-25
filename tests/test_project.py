@@ -6,6 +6,7 @@ import zipfile
 from pathlib import Path
 
 from srhd_modkit.project import (
+    ArtifactCache,
     ProjectConfigError,
     build_project,
     deploy_project,
@@ -191,6 +192,12 @@ class ProjectTests(unittest.TestCase):
             preview = deploy_project(root, dry_run=True)
             self.assertTrue(preview["dry_run"])
             self.assertIsNone(preview["deploy"])
+            self.assertTrue(preview["operation_semantics"]["build_performed"])
+            self.assertFalse(preview["operation_semantics"]["game_target_modified"])
+            self.assertEqual(
+                preview["operation_semantics"]["passive_preview_command"],
+                "project plan",
+            )
             self.assertIn("stale.bin", preview["plan"]["removed"])
             self.assertTrue((destination / "stale.bin").is_file())
 
@@ -257,6 +264,47 @@ output = "DATA/Script/${script_name}.bin"
             project = load_project(root)
             with self.assertRaisesRegex(ProjectConfigError, "пересекается"):
                 resolve_project_target(project, "game")
+
+    def test_variant_overlay_changes_effective_compiler_input_and_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            mod, _game = _write_project(root)
+            source = mod / "SOURCE" / "variant.bin"
+            source.write_bytes(b"release")
+            overlay = root / "overlays" / "earth-test" / "SOURCE"
+            overlay.mkdir(parents=True)
+            (overlay / "variant.bin").write_bytes(b"earth")
+            config = root / "srhd-modkit.toml"
+            config.write_text(
+                config.read_text(encoding="utf-8")
+                + """
+
+[[artifacts]]
+id = "effective-variant-input"
+kind = "copy"
+source = "RuntimeMod/SOURCE/variant.bin"
+output = "DATA/effective.bin"
+""",
+                encoding="utf-8",
+            )
+
+            release = build_project(root, variant="release")
+            earth = build_project(root, variant="earth-test")
+            self.assertEqual((release.output / "DATA" / "effective.bin").read_bytes(), b"release")
+            self.assertEqual((earth.output / "DATA" / "effective.bin").read_bytes(), b"earth")
+            release_key = next(
+                item["cache_key"] for item in release.artifacts if item["id"] == "effective-variant-input"
+            )
+            earth_key = next(
+                item["cache_key"] for item in earth.artifacts if item["id"] == "effective-variant-input"
+            )
+            self.assertNotEqual(release_key, earth_key)
+
+    def test_cache_rejects_non_sha_key(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            cache = ArtifactCache(Path(name))
+            with self.assertRaises(ProjectConfigError):
+                cache.probe("../escape")
 
 
 if __name__ == "__main__":
