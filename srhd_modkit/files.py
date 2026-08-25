@@ -28,7 +28,9 @@ def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
 
 def iter_files(root: str | Path, *, exclude: Iterable[str] = ()) -> list[Path]:
     root = Path(root).resolve()
-    patterns = tuple(exclude)
+    # SRHD runs on Windows and treats game paths case-insensitively.  Exclusion
+    # rules must therefore also catch SOURCE/source and .RSON/.rson equally.
+    patterns = tuple(pattern.casefold() for pattern in exclude)
     result: list[Path] = []
     for current, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = sorted(
@@ -46,7 +48,7 @@ def iter_files(root: str | Path, *, exclude: Iterable[str] = ()) -> list[Path]:
             if path.is_symlink() or name.casefold() in DEFAULT_EXCLUDE_NAMES:
                 continue
             rel = path.relative_to(root).as_posix()
-            if any(fnmatch.fnmatch(rel, pattern) for pattern in patterns):
+            if any(fnmatch.fnmatch(rel.casefold(), pattern) for pattern in patterns):
                 continue
             result.append(path)
     return result
@@ -221,12 +223,18 @@ def pack_mod(
     }
 
 
-def stage_tree(source: str | Path, destination: str | Path) -> dict[str, Any]:
+def stage_tree(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    exclude: Iterable[str] = (),
+) -> dict[str, Any]:
     """Create a verified, byte-for-byte working copy of an arbitrary mod tree.
 
-    Unknown and proprietary formats are copied without reinterpretation.  The
-    destination must not exist, which makes a partial or accidental merge
-    impossible.
+    Unknown and proprietary formats are copied without reinterpretation.  Any
+    explicit exclusion patterns are applied case-insensitively, like SRHD paths
+    on Windows.  The destination must not exist, which makes a partial or
+    accidental merge impossible.
     """
     source = Path(source).resolve()
     destination = Path(destination).resolve()
@@ -235,7 +243,7 @@ def stage_tree(source: str | Path, destination: str | Path) -> dict[str, Any]:
     if destination.exists():
         raise FileExistsError(f"Папка назначения уже существует: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    files = iter_files(source)
+    files = iter_files(source, exclude=exclude)
     with tempfile.TemporaryDirectory(prefix=f".{destination.name}.stage-", dir=destination.parent) as temp_name:
         temp = Path(temp_name)
         total_size = 0
@@ -254,4 +262,5 @@ def stage_tree(source: str | Path, destination: str | Path) -> dict[str, Any]:
         "file_count": len(files),
         "total_size": total_size,
         "verified": True,
+        "exclude": list(exclude),
     }

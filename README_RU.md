@@ -1,4 +1,4 @@
-# SRHD ModKit 0.9.8
+# SRHD ModKit 0.9.9
 
 Публичная GitHub-версия называется **SRHD XenoModKit**. Внутренние имена
 каталога, Python-пакета и CLI не переименованы. Автор и сопровождающий:
@@ -7,25 +7,22 @@
 Локальная Python-библиотека и командная строка для безопасной работы с модами
 Space Rangers HD. Запускается на Python 3.12+ и не требует установки пакетов.
 
-Библиотека не устанавливает моды в игру и не меняет `ModCFG.txt`. Она работает
-в указанном пользователем каталоге, сохраняет неизвестные бинарные файлы без изменений и
-никогда не объявляет закрытый формат «преобразованным», если штатный инструмент
-не подтвердил результат.
+Библиотека меняет папку игры только по явной команде `release deploy` и никогда
+не меняет `ModCFG.txt`. Она работает в указанном пользователем каталоге,
+сохраняет неизвестные бинарные файлы без изменений и никогда не объявляет
+закрытый формат «преобразованным», если штатный инструмент не подтвердил результат.
 
 Для первого запуска, автоматической установки проверенных DAT/script-кодеков и
 описания внешних зависимостей начните с [основного README](README.md) и
 [THIRD_PARTY_TOOLS_RU.md](THIRD_PARTY_TOOLS_RU.md).
 
-## Новое в 0.9.8
+## Новое в 0.9.9
 
-- GAI теперь понимает штатные пустые кадры `(offset=0, size=0)`, прозрачные вложенные GI `0×0` и сжатые кадры `ZL01(GI)`. Эти варианты подтверждены на установленном корпусе и больше не объявляются повреждением.
-- Полностью пустая, но структурно корректная GAI выдаёт неблокирующее `resource-empty-animation-placeholder`: это допустимый способ намеренно скрыть изображение, однако автору полезно подтвердить такое назначение.
-- Извлечение GAI распаковывает `ZL01` в обычные GI и сохраняет пустые позиции нулевыми `.gi`; обратная сборка с шаблоном сохраняет порядок кадров и auxiliary-блок.
-- `Code.Type=Init` больше не смешивается с pre-`GRun` Global-фазой. Доступ к `Player()` в Init не считается ошибкой запуска, официальный read-only bootstrap в Global не создаёт шум, а другое обращение к миру из Global остаётся предупреждением вместо недоказанного блокера.
-- `compat` рассчитывает фактический порядок движка стабильной сортировкой по возрастанию `Priority`, сохраняет исходную позицию `CurrentMod` и предупреждает о рассинхроне, ничего не записывая в конфигурацию. Отсутствующий Priority равен нулю, одинаковые значения сохраняют порядок списка, некорректное значение явно отмечается как допущение.
-- Runtime-lint предупреждает о пакетном `Buy*` в фоновом Turn, если незавершённая партия публикуется в общий `TVar`/`TGroup` и может быть повторно обойдена с мутациями без раннего re-entry barrier. Одиночная и обычная последовательная настройка свежего корабля не запрещается.
-- Runtime-lint обнаруживает `GetData` у восстановленного через `IdToShip` корабля до доказательства завершённого взлёта/гиперперехода и стабильного размещения. Доказательство переносится через строго проверенный пользовательский predicate; обычные стабильные обращения не блокируются.
-- Новое межходовое правило не принимает spatial-guards за доказательство сохранности внутреннего script-data: оно предупреждает только при полном цикле `Buy*`/`TransferShip → persistent ID → IdToShip → переход → GetData` и рекомендует вынести метаданные во внешние persistent-массивы.
+- Добавлена headless-команда `release deploy`: она проводит полный релизный аудит и разворачивает готовый мод прямо в указанный корень `Mods` либо `Builds`.
+- При deploy исходники по умолчанию исключаются: верхнеуровневые `SOURCE`/`SOURCES`, RSON/RSM/SVR и служебные `*.source.txt`/`*.lang.txt` не попадают в игровую папку. Для отладочной копии доступен явный `--include-sources`.
+- Повторный deploy с `--overwrite` не сливает каталоги. Новое дерево сначала собирается рядом, сверяется по SHA-256, прежнее дерево целиком отводится в резерв и только затем заменяется. Поэтому удалённые из проекта файлы не остаются в `Builds` или игре; при ошибке прежняя папка восстанавливается.
+- `release build --strip-sources` создаёт ZIP без исходников по тем же правилам. Обычный `release build` сохраняет прежнее поведение для открытых исходных релизов.
+- `release deploy` не запускает игру, не включает мод и не изменяет `ModCFG.txt`.
 
 ## Поддержка форматов
 
@@ -115,6 +112,8 @@ python srhd.py formats D:\path\file.dat --hash
 python srhd.py audit D:\work\MyMod --profile dev
 python srhd.py release check D:\work\MyMod
 python srhd.py release build D:\work\MyMod D:\Releases\MyMod.zip
+python srhd.py release deploy D:\work\MyMod "D:\Game\Mods" `
+  --prefix OtherMods/MyMod --overwrite
 python srhd.py compat "D:\Game\Mods\ModCFG.txt" --mods-root "D:\Game\Mods"
 ```
 
@@ -129,6 +128,13 @@ python srhd.py compat "D:\Game\Mods\ModCFG.txt" --mods-root "D:\Game\Mods"
 Безопасный `release build` работает через проверенную staging-копию, повторно
 читает ZIP и сверяет путь, размер и SHA-256 каждого файла. Рядом создаются
 `*.manifest.json` и `*.audit.json`; внутрь игрового ZIP они не попадают.
+
+`release deploy` принимает корень назначения вторым аргументом, а `--prefix`
+задаёт точный путь мода внутри него. Без `--prefix` используется имя исходной
+папки. По умолчанию deploy исключает исходники. Существующая папка заменяется
+только с `--overwrite`, причём это полная проверенная замена, а не копирование
+поверх старых файлов. Для сохранения исходников используйте `--include-sources`.
+Команда не читает и не записывает `ModCFG.txt`.
 
 `compat` читает ModCFG без изменений, строит зависимости и циклы, различает
 идентичные, бинарные, языковые, скриптовые и BlockPar-пересечения. Порядок
@@ -499,7 +505,7 @@ python srhd.py release build D:\path\Mod D:\SRHD_Modding\Releases\Mod.zip
 
 ```python
 from srhd_modkit import (
-    RgbaImage, Toolchain, analyze_modset, audit_mod, build_release,
+    RgbaImage, Toolchain, analyze_modset, audit_mod, build_release, deploy_mod,
     build_quest_from_json, discover_mods,
     inspect_file, inspect_gi, inspect_quest, inspect_rscript_lang_fragment,
     load_blockpar, read_gi,
@@ -528,6 +534,12 @@ print(inspect_pkg(r"D:\path\resources.pkg").listing())
 extract_resource(r"D:\path\resources.pkg", r"D:\work\unpacked")
 report = audit_mod(r"D:\work\MyMod", profile="release")
 release = build_release(r"D:\work\MyMod", r"D:\Releases\MyMod.zip")
+deployed = deploy_mod(
+    r"D:\work\MyMod",
+    r"D:\Game\Mods",
+    prefix="OtherMods/MyMod",
+    overwrite=True,
+)
 modset = analyze_modset(r"D:\Game\Mods\ModCFG.txt", r"D:\Game\Mods")
 quest = inspect_quest(r"D:\work\Quest.qmm")
 verified = verify_quest(r"D:\work\Quest.qmm")

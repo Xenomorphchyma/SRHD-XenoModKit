@@ -81,9 +81,11 @@ from .audit import (
     audit_mod,
 )
 from .release import (
+    DeployResult,
     ReleaseBlockedError,
     ReleaseResult,
     build_release,
+    deploy_mod,
     verify_release_archive,
 )
 from .compat import ModSetReport, OverlayCollision, OverlayOwner, analyze_modset
@@ -211,8 +213,10 @@ __all__ = [
     "audit_collection",
     "audit_mod",
     "ReleaseBlockedError",
+    "DeployResult",
     "ReleaseResult",
     "build_release",
+    "deploy_mod",
     "verify_release_archive",
     "ModSetReport",
     "OverlayCollision",
@@ -262,4 +266,4 @@ __all__ = [
     "build_quest_from_json",
 ]
 
-__version__ = "0.9.8"
+__version__ = "0.9.9"

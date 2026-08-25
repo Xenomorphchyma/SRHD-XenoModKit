@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.9.5
+# Команды SRHD ModKit 0.9.9
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -9,12 +9,21 @@ python -B srhd.py audit "<MOD>" --profile dev --json
 python -B srhd.py audit "<MOD>" --profile release --json
 python -B srhd.py release check "<MOD>" --prefix OtherMods/MyMod --json
 python -B srhd.py release build "<MOD>" "<RELEASES>/MyMod.zip" --prefix OtherMods/MyMod --json
+python -B srhd.py release build "<MOD>" "<RELEASES>/MyMod-bin.zip" --prefix OtherMods/MyMod --strip-sources --json
+python -B srhd.py release deploy "<MOD>" "<GAME>/Mods" --prefix OtherMods/MyMod --overwrite --json
 ```
 
 `--prefix` задаёт точный путь относительно `Mods` и корень ZIP; без него
 используется имя папки мода. Дополнения: `--warnings-as-errors`, `--allow CODE`,
 `--allow CODE:GLOB`, `--exclude GLOB`, `--overwrite`. Служебные JSON создаются
-рядом с ZIP.
+рядом с ZIP. `release build --strip-sources` исключает верхнеуровневые
+`SOURCE`/`SOURCES`, RSON/RSM/SVR и известные служебные текстовые исходники.
+
+`release deploy` публикует точную игровую папку под корнем второго аргумента.
+Исходники исключаются по умолчанию; `--include-sources` оставляет их для
+отладочной копии. При повторном вызове требуется `--overwrite`: новая папка
+сначала собирается и проверяется по SHA-256, затем целиком заменяет старую без
+слияния. При ошибке прежняя папка восстанавливается. `ModCFG.txt` не меняется.
 
 ## DAT / BlockPar
 
@@ -198,4 +207,4 @@ python -B srhd.py doctor processes --terminate --json
 
 ## Python API
 
-Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `compare_storage_schemas`, `dialog_semantic_map`, `RgbaImage`, `inspect_gi`, `read_gi`, `write_gi`, `read_png`, `write_png`, `verify_gi`, `inspect_gai`, `inspect_hai`, `inspect_pkg`, `inspect_quest`, `verify_quest`, `export_quest_json`, `build_quest_from_json`, `inspect_hidden_processes`, `terminate_hidden_processes`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1`, `srhd-modkit-storage-compat-v1`, `srhd-modkit-quest-v1`, `srhd-modkit-quest-report-v1`, `srhd-modkit-process-audit-v1`, `srhd-modkit-process-cleanup-v1`.
+Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `deploy_mod`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `compare_storage_schemas`, `dialog_semantic_map`, `RgbaImage`, `inspect_gi`, `read_gi`, `write_gi`, `read_png`, `write_png`, `verify_gi`, `inspect_gai`, `inspect_hai`, `inspect_pkg`, `inspect_quest`, `verify_quest`, `export_quest_json`, `build_quest_from_json`, `inspect_hidden_processes`, `terminate_hidden_processes`. JSON-схемы: `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`, `srhd-modkit-deploy-v1`, `srhd-modkit-modset-v1`, `srhd-modkit-decompile-v1`, `srhd-modkit-scr-compare-v1`, `srhd-modkit-storage-compat-v1`, `srhd-modkit-quest-v1`, `srhd-modkit-quest-report-v1`, `srhd-modkit-process-audit-v1`, `srhd-modkit-process-cleanup-v1`.

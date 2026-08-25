@@ -54,7 +54,7 @@ from .runtime_lint import (
 )
 from .validation import validate_collection
 from .audit import AuditProfile, AuditReport, audit_collection, audit_mod
-from .release import ReleaseBlockedError, build_release
+from .release import ReleaseBlockedError, build_release, deploy_mod
 from .compat import analyze_modset
 from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
 
@@ -214,6 +214,7 @@ def cmd_release_build(args: argparse.Namespace) -> int:
             allow=args.allow,
             warnings_as_errors=args.warnings_as_errors,
             overwrite=args.overwrite,
+            strip_sources=args.strip_sources,
         )
     except ReleaseBlockedError as exc:
         if args.json:
@@ -231,6 +232,38 @@ def cmd_release_build(args: argparse.Namespace) -> int:
         print(f"Манифест: {result.manifest_path}")
         print(f"Аудит: {result.audit_path}")
         print(f"Архив повторно проверен: {'да' if result.verified else 'НЕТ'}")
+    return 0
+
+
+def cmd_release_deploy(args: argparse.Namespace) -> int:
+    try:
+        result = deploy_mod(
+            args.mod,
+            args.destination_root,
+            prefix=args.prefix,
+            exclude=args.exclude,
+            strip_sources=not args.include_sources,
+            tools_root=args.tools_root,
+            allow=args.allow,
+            warnings_as_errors=args.warnings_as_errors,
+            overwrite=args.overwrite,
+        )
+    except ReleaseBlockedError as exc:
+        if args.json:
+            print_json({"schema": "srhd-modkit-deploy-v1", "blocked": True, "audit": exc.report.as_dict()})
+        else:
+            print(str(exc))
+            _print_audit_report(exc.report)
+        return 2
+    if args.json:
+        print_json(result.as_dict())
+    else:
+        print(f"Развёрнутый мод: {result.destination}")
+        print(f"Файлов: {result.file_count}; размер: {human_size(result.total_size)}")
+        print(f"Исходники исключены: {'да' if result.strip_sources else 'нет'}")
+        print(f"Устаревших файлов удалено: {result.stale_files_removed}")
+        print(f"Папка повторно проверена: {'да' if result.verified else 'НЕТ'}")
+        print("ModCFG.txt не изменялся")
     return 0
 
 
@@ -2176,7 +2209,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.8")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.9")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -2230,9 +2263,41 @@ def build_parser() -> argparse.ArgumentParser:
     release_build.add_argument("--allow", action="append", default=[])
     release_build.add_argument("--warnings-as-errors", action="store_true")
     release_build.add_argument("--overwrite", action="store_true")
+    release_build.add_argument(
+        "--strip-sources",
+        action="store_true",
+        help="Не включать SOURCE/SOURCES и известные RScript-исходники",
+    )
     release_build.add_argument("--tools-root")
     release_build.add_argument("--json", action="store_true")
     release_build.set_defaults(func=cmd_release_build)
+
+    release_deploy = release_sub.add_parser(
+        "deploy",
+        help="Проверить и развернуть игровую папку мода без слияния со старой",
+    )
+    release_deploy.add_argument("mod", help="Корень готового мода с ModuleInfo.txt")
+    release_deploy.add_argument("destination_root", help="Папка Mods игры либо корень Builds")
+    release_deploy.add_argument(
+        "--prefix",
+        help="Точный путь внутри destination_root, например OtherMods/MyMod",
+    )
+    release_deploy.add_argument("--exclude", action="append", default=[])
+    release_deploy.add_argument("--allow", action="append", default=[])
+    release_deploy.add_argument("--warnings-as-errors", action="store_true")
+    release_deploy.add_argument(
+        "--include-sources",
+        action="store_true",
+        help="Сохранить SOURCE/SOURCES и известные RScript-исходники (по умолчанию исключаются)",
+    )
+    release_deploy.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Полностью заменить существующую целевую папку после staging-проверки",
+    )
+    release_deploy.add_argument("--tools-root")
+    release_deploy.add_argument("--json", action="store_true")
+    release_deploy.set_defaults(func=cmd_release_deploy)
 
     compare = sub.add_parser("compare", help="Точно сравнить две папки")
     compare.add_argument("left")

@@ -6,10 +6,12 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+import srhd_modkit.release as release_module
 from srhd_modkit.audit import AuditProfile, AuditReport
 from srhd_modkit.release import (
     ReleaseBlockedError,
     build_release,
+    deploy_mod,
     verify_release_archive,
 )
 
@@ -77,6 +79,142 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(ReleaseBlockedError):
                 build_release(root, output)
             self.assertFalse(output.exists())
+
+    def test_release_can_strip_sources_without_changing_default(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "ReleaseFixture"
+            _mod(root)
+            source = root / "Source"
+            source.mkdir()
+            (source / "project.source.txt").write_text("source", encoding="utf-8")
+            (root / "LOOSE.RSM").write_text("source", encoding="utf-8")
+
+            normal = build_release(root, base / "normal.zip")
+            stripped = build_release(root, base / "stripped.zip", strip_sources=True)
+
+            with zipfile.ZipFile(normal.output) as archive:
+                self.assertIn("ReleaseFixture/Source/project.source.txt", archive.namelist())
+            with zipfile.ZipFile(stripped.output) as archive:
+                self.assertNotIn("ReleaseFixture/Source/project.source.txt", archive.namelist())
+                self.assertNotIn("ReleaseFixture/LOOSE.RSM", archive.namelist())
+                self.assertIn("ReleaseFixture/DATA/opaque.cmap", archive.namelist())
+            self.assertTrue(stripped.strip_sources)
+
+    def test_deploy_replaces_tree_and_removes_sources_and_stale_files(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "ReleaseFixture"
+            _mod(root)
+            source = root / "SOURCE"
+            source.mkdir()
+            (source / "project.source.txt").write_text("source", encoding="utf-8")
+            mods_root = base / "Game" / "Mods"
+            destination = mods_root / "OtherMods" / "ReleaseFixture"
+            destination.mkdir(parents=True)
+            (destination / "ModuleInfo.txt").write_text("old", encoding="cp1251")
+            (destination / "stale.bin").write_bytes(b"stale")
+            modcfg = mods_root / "ModCFG.txt"
+            modcfg.write_bytes(b"unchanged")
+
+            result = deploy_mod(
+                root,
+                mods_root,
+                prefix="OtherMods/ReleaseFixture",
+                overwrite=True,
+            )
+
+            self.assertTrue(result.verified)
+            self.assertTrue(result.replaced_existing)
+            self.assertEqual(result.stale_files_removed, 1)
+            self.assertFalse((destination / "stale.bin").exists())
+            self.assertFalse((destination / "SOURCE").exists())
+            self.assertEqual((destination / "DATA" / "opaque.cmap").read_bytes(), bytes(range(256)))
+            self.assertEqual(modcfg.read_bytes(), b"unchanged")
+            self.assertFalse(result.modcfg_modified)
+
+    def test_deploy_refuses_existing_destination_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "ReleaseFixture"
+            _mod(root)
+            mods_root = base / "Mods"
+            (mods_root / "ReleaseFixture").mkdir(parents=True)
+            with self.assertRaises(FileExistsError):
+                deploy_mod(root, mods_root)
+
+    def test_deploy_restores_previous_tree_when_post_publish_verification_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "ReleaseFixture"
+            _mod(root)
+            mods_root = base / "Mods"
+            destination = mods_root / "ReleaseFixture"
+            destination.mkdir(parents=True)
+            (destination / "ModuleInfo.txt").write_text("old", encoding="cp1251")
+            old_payload = destination / "old-only.bin"
+            old_payload.write_bytes(b"old")
+            original_build_manifest = release_module.build_manifest
+            destination_reads = 0
+
+            def corrupt_published_manifest(path, *args, **kwargs):
+                nonlocal destination_reads
+                manifest = original_build_manifest(path, *args, **kwargs)
+                if Path(path).resolve() == destination.resolve():
+                    destination_reads += 1
+                    if destination_reads == 2:
+                        manifest = {**manifest, "files": []}
+                return manifest
+
+            with patch("srhd_modkit.release.build_manifest", side_effect=corrupt_published_manifest):
+                with self.assertRaises(OSError):
+                    deploy_mod(root, mods_root, overwrite=True)
+
+            self.assertEqual(old_payload.read_bytes(), b"old")
+            self.assertFalse((destination / "DATA" / "opaque.cmap").exists())
+            self.assertEqual(
+                list(destination.parent.glob(".ReleaseFixture.srhd-deploy-*")),
+                [],
+            )
+
+    def test_deploy_preserves_backup_when_windows_blocks_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "ReleaseFixture"
+            _mod(root)
+            mods_root = base / "Mods"
+            destination = mods_root / "ReleaseFixture"
+            destination.mkdir(parents=True)
+            (destination / "ModuleInfo.txt").write_text("old", encoding="cp1251")
+            (destination / "old-only.bin").write_bytes(b"old")
+            original_build_manifest = release_module.build_manifest
+            original_replace = release_module.os.replace
+            destination_reads = 0
+
+            def corrupt_published_manifest(path, *args, **kwargs):
+                nonlocal destination_reads
+                manifest = original_build_manifest(path, *args, **kwargs)
+                if Path(path).resolve() == destination.resolve():
+                    destination_reads += 1
+                    if destination_reads == 2:
+                        manifest = {**manifest, "files": []}
+                return manifest
+
+            def block_backup_restore(source, target):
+                if Path(source).name == "previous" and Path(target).resolve() == destination.resolve():
+                    raise PermissionError("simulated Windows lock")
+                return original_replace(source, target)
+
+            with (
+                patch("srhd_modkit.release.build_manifest", side_effect=corrupt_published_manifest),
+                patch("srhd_modkit.release.os.replace", side_effect=block_backup_restore),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "резервная копия сохранена"):
+                    deploy_mod(root, mods_root, overwrite=True)
+
+            transactions = list(destination.parent.glob(".ReleaseFixture.srhd-deploy-*"))
+            self.assertEqual(len(transactions), 1)
+            self.assertEqual((transactions[0] / "previous" / "old-only.bin").read_bytes(), b"old")
 
     def test_archive_verifier_rejects_parent_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as name:
