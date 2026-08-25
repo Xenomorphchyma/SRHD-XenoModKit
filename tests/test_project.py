@@ -110,6 +110,9 @@ class ProjectTests(unittest.TestCase):
                 (recovered.output / "DATA" / "Script" / "Mod_ProjectFixture.bin").read_bytes(),
                 b"release-artifact",
             )
+            verified_cache = build_project(root)
+            self.assertEqual(verified_cache.cache_hits, 1)
+            self.assertEqual(verified_cache.cache_misses, 0)
 
             asset = root / "assets" / "Mod_ProjectFixture.bin"
             asset.write_bytes(b"release-artifact-v2")
@@ -130,6 +133,51 @@ class ProjectTests(unittest.TestCase):
                 b"test-artifact",
             )
             self.assertFalse((earth.output / "DATA" / "Script" / "Mod_ProjectFixture.bin").exists())
+
+    def test_cache_history_is_bounded_and_workspaces_do_not_accumulate(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            _write_project(root)
+            asset = root / "assets" / "Mod_ProjectFixture.bin"
+            last = None
+            for revision in range(7):
+                asset.write_bytes(f"release-artifact-{revision}".encode("ascii"))
+                last = build_project(root)
+
+            self.assertIsNotNone(last)
+            cache_entries = list((root / ".srhd-cache" / "artifacts").rglob("manifest.json"))
+            self.assertLessEqual(len(cache_entries), 3)
+            self.assertGreaterEqual(
+                last.provenance["cache"]["maintenance"]["removed_entries"],
+                1,
+            )
+            self.assertEqual(list(root.glob(".srhd-project-build-*")), [])
+            self.assertEqual(
+                list((root / ".srhd-cache" / "artifacts").rglob(".*.cache-*")),
+                [],
+            )
+            release_root = root / ".srhd-build" / "release"
+            self.assertEqual(
+                sorted(path.name for path in release_root.iterdir()),
+                ["OtherMods", "ProjectFixture.build.json"],
+            )
+
+    def test_failed_project_build_removes_temporary_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            _write_project(root)
+            config = root / "srhd-modkit.toml"
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    'source = "assets/${script_name}.bin"',
+                    'source = "assets/missing.bin"',
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(FileNotFoundError):
+                build_project(root)
+            self.assertEqual(list(root.glob(".srhd-project-build-*")), [])
 
     def test_deploy_dry_run_is_read_only_and_publish_reuses_one_build(self) -> None:
         with tempfile.TemporaryDirectory() as name:

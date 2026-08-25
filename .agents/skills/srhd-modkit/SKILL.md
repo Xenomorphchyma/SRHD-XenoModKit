@@ -18,7 +18,7 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 
 ## Выбирать workflow по задаче
 
-- Если найден `srhd-modkit.toml`, для обычной сборки предпочитать `project build`, перед выкладкой `project deploy --dry-run`, а для единого выпуска папки/ZIP/manifest/audit/provenance — `project publish`. Машинные пути брать только из непубликуемого `srhd-modkit.local.toml`. Подробности и синтаксис читать в [references/commands.md](references/commands.md) и `<MODKIT_ROOT>/PROJECTS_RU.md`; не пересобирать этот workflow вручную отдельными командами без причины.
+- Если найден `srhd-modkit.toml`, для обычной сборки предпочитать `project build`, перед выкладкой `project deploy --dry-run`, а для единого выпуска папки/ZIP/manifest/audit/provenance — `project publish`. Машинные пути брать только из непубликуемого `srhd-modkit.local.toml`. Project workflow точно заменяет одну папку варианта и автоматически ограничивает кэш; `.srhd-build`/`.srhd-cache` не копировать в релиз и не чистить вручную во время активной сборки. Подробности и синтаксис читать в [references/commands.md](references/commands.md) и `<MODKIT_ROOT>/PROJECTS_RU.md`; не пересобирать этот workflow вручную отдельными командами без причины.
 - Для первичного анализа запускать `audit --profile dev --json`.
 - Для проверки коллекции передавать корень коллекции той же команде; ModKit сам обнаружит моды.
 - Для DAT использовать только `dat`-команды. Сначала читать дерево или значение, затем писать в новый DAT и повторно запускать `dat validate` или релизный аудит.

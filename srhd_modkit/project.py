@@ -8,6 +8,7 @@ import os
 import shutil
 import string
 import tempfile
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -31,6 +32,15 @@ PROJECT_BUILD_SCHEMA = "srhd-modkit-project-build-v1"
 PROJECT_DEPLOY_SCHEMA = "srhd-modkit-project-deploy-v1"
 PROJECT_PUBLISH_SCHEMA = "srhd-modkit-project-publish-v1"
 CACHE_SCHEMA = "srhd-modkit-build-cache-v1"
+
+# The cache is disposable derived data. Keep enough recent revisions for
+# normal branch/variant switching, but never let abandoned fingerprints grow
+# without a bound. Entries used by the current build are always protected,
+# even when a very large project exceeds these soft limits by itself.
+CACHE_KEEP_PER_ARTIFACT = 3
+CACHE_MAX_ENTRIES = 256
+CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+CACHE_STALE_TEMP_SECONDS = 24 * 60 * 60
 
 PROJECT_FILE_NAME = "srhd-modkit.toml"
 LOCAL_PROJECT_FILE_NAME = "srhd-modkit.local.toml"
@@ -132,7 +142,11 @@ class ProjectBuildResult:
             "allow": list(self.audit_allow),
             "verified": self.deploy.verified,
             "artifacts": list(self.artifacts),
-            "cache": {"hits": self.cache_hits, "misses": self.cache_misses},
+            "cache": {
+                "hits": self.cache_hits,
+                "misses": self.cache_misses,
+                "maintenance": self.provenance.get("cache", {}).get("maintenance", {}),
+            },
             "provenance": str(self.provenance_path),
             "deploy": self.deploy.as_dict(include_audit=include_audit),
         }
@@ -554,10 +568,227 @@ class ArtifactCache:
     def _entry(self, key: str) -> Path:
         return self.root / key[:2] / key
 
+    @staticmethod
+    def _tree_usage(path: Path) -> tuple[int, int]:
+        files = 0
+        size = 0
+        try:
+            for current, directories, names in os.walk(path, followlinks=False):
+                current_path = Path(current)
+                directories[:] = [
+                    name
+                    for name in directories
+                    if not (current_path / name).is_symlink()
+                ]
+                for name in names:
+                    candidate = current_path / name
+                    if candidate.is_symlink():
+                        continue
+                    try:
+                        size += candidate.stat().st_size
+                        files += 1
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return files, size
+
+    @staticmethod
+    def _remove_cache_path(path: Path) -> bool:
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                shutil.rmtree(path)
+            return not path.exists()
+        except OSError:
+            return False
+
+    def _record(self, entry: Path, *, verify_files: bool = False) -> dict[str, Any] | None:
+        manifest_path = entry / "manifest.json"
+        try:
+            if entry.is_symlink():
+                return None
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            key = str(manifest["key"])
+            fingerprint = manifest["fingerprint"]
+            artifact = fingerprint["artifact"]
+            variant = str(fingerprint["variant"])
+            identifier = str(artifact["id"])
+            outputs = manifest["outputs"]
+            if (
+                manifest.get("schema") != CACHE_SCHEMA
+                or entry.name != key
+                or entry.parent.name != key[:2]
+                or len(key) != 64
+                or any(character not in "0123456789abcdef" for character in key)
+                or not isinstance(outputs, list)
+                or not outputs
+            ):
+                return None
+            expected_names: set[str] = set()
+            expected_size = manifest_path.stat().st_size
+            expected_files = 1
+            for item in outputs:
+                if not isinstance(item, Mapping):
+                    return None
+                relative = _safe_relative(str(item["path"]), "cache.outputs.path")
+                folded = relative.as_posix().casefold()
+                if folded in expected_names:
+                    return None
+                expected_names.add(folded)
+                cached = entry / "files" / Path(*relative.parts)
+                item_size = int(item["size"])
+                if verify_files:
+                    if (
+                        not cached.is_file()
+                        or cached.is_symlink()
+                        or cached.stat().st_size != item_size
+                        or sha256_file(cached) != str(item["sha256"])
+                    ):
+                        return None
+                expected_size += item_size
+                expected_files += 1
+            if verify_files:
+                actual_files, actual_size = self._tree_usage(entry)
+                if actual_files != expected_files or actual_size != expected_size:
+                    return None
+            return {
+                "path": entry,
+                "key": key,
+                "identity": (variant, identifier),
+                "files": expected_files,
+                "bytes": expected_size,
+                "modified": entry.stat().st_mtime,
+            }
+        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, ProjectConfigError):
+            return None
+
+    def maintain(self, *, protected_keys: Sequence[str] = ()) -> dict[str, Any]:
+        """Remove stale/invalid derived cache data and bound retained history."""
+
+        protected = set(protected_keys)
+        removed_entries = 0
+        removed_files = 0
+        removed_bytes = 0
+        stale_temporaries = 0
+        invalid_entries = 0
+        records: list[dict[str, Any]] = []
+        now = time.time()
+        limits = {
+            "keep_per_artifact": CACHE_KEEP_PER_ARTIFACT,
+            "max_entries": CACHE_MAX_ENTRIES,
+            "max_bytes": CACHE_MAX_BYTES,
+        }
+        if not self.root.is_dir() or self.root.is_symlink():
+            return {
+                "removed_entries": 0,
+                "removed_files": 0,
+                "removed_bytes": 0,
+                "stale_temporaries": 0,
+                "invalid_entries": 0,
+                "retained_entries": 0,
+                "retained_bytes": 0,
+                "limits": limits,
+            }
+
+        buckets = [
+            item
+            for item in self.root.iterdir()
+            if item.is_dir() and not item.is_symlink() and len(item.name) == 2
+        ]
+        for bucket in buckets:
+            for entry in list(bucket.iterdir()):
+                if not entry.is_dir() or entry.is_symlink():
+                    continue
+                if entry.name.startswith(".") and (".cache-" in entry.name or ".invalid-" in entry.name):
+                    try:
+                        old_enough = now - entry.stat().st_mtime >= CACHE_STALE_TEMP_SECONDS
+                    except OSError:
+                        old_enough = False
+                    if old_enough:
+                        files, size = self._tree_usage(entry)
+                        if self._remove_cache_path(entry):
+                            stale_temporaries += 1
+                            removed_files += files
+                            removed_bytes += size
+                    continue
+                record = self._record(entry)
+                if record is None:
+                    if entry.name in protected:
+                        continue
+                    files, size = self._tree_usage(entry)
+                    if self._remove_cache_path(entry):
+                        invalid_entries += 1
+                        removed_entries += 1
+                        removed_files += files
+                        removed_bytes += size
+                    continue
+                records.append(record)
+
+        to_remove: set[Path] = set()
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for record in records:
+            groups.setdefault(record["identity"], []).append(record)
+        for values in groups.values():
+            values.sort(
+                key=lambda item: (item["key"] in protected, item["modified"]),
+                reverse=True,
+            )
+            retained_in_group = 0
+            for item in values:
+                if item["key"] in protected:
+                    retained_in_group += 1
+                    continue
+                if retained_in_group < CACHE_KEEP_PER_ARTIFACT:
+                    retained_in_group += 1
+                else:
+                    to_remove.add(item["path"])
+
+        retained = [record for record in records if record["path"] not in to_remove]
+        while (
+            len(retained) > CACHE_MAX_ENTRIES
+            or sum(int(item["bytes"]) for item in retained) > CACHE_MAX_BYTES
+        ):
+            candidates = [item for item in retained if item["key"] not in protected]
+            if not candidates:
+                break
+            oldest = min(candidates, key=lambda item: item["modified"])
+            to_remove.add(oldest["path"])
+            retained.remove(oldest)
+
+        for record in records:
+            if record["path"] not in to_remove:
+                continue
+            if self._remove_cache_path(record["path"]):
+                removed_entries += 1
+                removed_files += int(record["files"])
+                removed_bytes += int(record["bytes"])
+
+        for bucket in buckets:
+            try:
+                if bucket.is_dir() and not any(bucket.iterdir()):
+                    bucket.rmdir()
+            except OSError:
+                pass
+        retained_records = [record for record in records if record["path"].exists()]
+        return {
+            "removed_entries": removed_entries,
+            "removed_files": removed_files,
+            "removed_bytes": removed_bytes,
+            "stale_temporaries": stale_temporaries,
+            "invalid_entries": invalid_entries,
+            "retained_entries": len(retained_records),
+            "retained_bytes": sum(int(item["bytes"]) for item in retained_records),
+            "limits": limits,
+        }
+
     def restore(self, key: str, destination_root: Path) -> tuple[Path, ...] | None:
         entry = self._entry(key)
         manifest_path = entry / "manifest.json"
         try:
+            if entry.is_symlink():
+                return None
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
@@ -595,6 +826,10 @@ class ArtifactCache:
             except OSError:
                 return None
             restored.append(target)
+        try:
+            os.utime(entry, None)
+        except OSError:
+            pass
         return tuple(restored)
 
     def store(
@@ -605,7 +840,11 @@ class ArtifactCache:
         fingerprint: Mapping[str, Any],
     ) -> None:
         entry = self._entry(key)
-        if entry.is_dir() and (entry / "manifest.json").is_file():
+        if entry.is_dir() and not entry.is_symlink() and self._record(entry, verify_files=True) is not None:
+            return
+        if entry.exists() and not self._remove_cache_path(entry):
+            # A cache problem must never block a valid build. A later run can
+            # retry maintenance after antivirus/indexers release the path.
             return
         entry.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=f".{key}.cache-", dir=entry.parent) as temp_name:
@@ -952,6 +1191,27 @@ def build_project(
             )
             artifact_results.append(artifact_result)
 
+        cache_maintenance = (
+            cache.maintain(
+                protected_keys=[
+                    str(item["cache_key"])
+                    for item in artifact_results
+                    if item.get("cache") != "disabled"
+                ]
+            )
+            if use_cache
+            else {
+                "removed_entries": 0,
+                "removed_files": 0,
+                "removed_bytes": 0,
+                "stale_temporaries": 0,
+                "invalid_entries": 0,
+                "retained_entries": 0,
+                "retained_bytes": 0,
+                "disabled": True,
+            }
+        )
+
         build_destination_root = project.build_root / variant_name
         deployment = deploy_mod(
             full_mod,
@@ -977,7 +1237,13 @@ def build_project(
         "allow": list(audit_allow),
         "variant_files": variant_files,
         "artifacts": artifact_results,
-        "cache": {"enabled": use_cache, "root": str(project.cache_root), "hits": cache_hits, "misses": cache_misses},
+        "cache": {
+            "enabled": use_cache,
+            "root": str(project.cache_root),
+            "hits": cache_hits,
+            "misses": cache_misses,
+            "maintenance": cache_maintenance,
+        },
         "tools": _project_tools_report(chain),
         "source_manifest": build_manifest(project.mod_root),
         "output_manifest": build_manifest(deployment.destination),

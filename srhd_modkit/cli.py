@@ -387,6 +387,13 @@ def cmd_project_build(args: argparse.Namespace) -> int:
         print(f"Собрано: {result.output}")
         print(f"Вариант: {result.variant}; артефактов: {len(result.artifacts)}")
         print(f"Кэш: {result.cache_hits} попаданий, {result.cache_misses} новых сборок")
+        maintenance = result.provenance.get("cache", {}).get("maintenance", {})
+        if maintenance.get("removed_entries") or maintenance.get("stale_temporaries"):
+            print(
+                "Очистка кэша: "
+                f"{maintenance.get('removed_entries', 0)} устаревших записей, "
+                f"{human_size(int(maintenance.get('removed_bytes', 0)))} освобождено"
+            )
         print(f"Provenance: {result.provenance_path}")
     return 0
 
