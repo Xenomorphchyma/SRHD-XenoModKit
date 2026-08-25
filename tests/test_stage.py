@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import zipfile
+import os
 from pathlib import Path
 
 from srhd_modkit.files import compare_trees, iter_files, pack_mod, stage_tree
@@ -60,6 +61,39 @@ class StageTests(unittest.TestCase):
             pack_mod(root, archive, prefix="OtherMods/Example")
             with zipfile.ZipFile(archive) as value:
                 self.assertEqual(value.namelist(), ["OtherMods/Example/ModuleInfo.txt"])
+
+    def test_stage_rejects_links_instead_of_silently_dropping_them(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "source"
+            source.mkdir()
+            external = root / "external.bin"
+            external.write_bytes(b"external")
+            link = source / "linked.bin"
+            try:
+                os.symlink(external, link)
+            except OSError as exc:
+                self.skipTest(f"Символические ссылки недоступны: {exc}")
+            with self.assertRaisesRegex(ValueError, "ссылку|junction"):
+                stage_tree(source, root / "destination")
+
+    def test_archive_verifier_rejects_windows_alias_and_device_name(self) -> None:
+        from srhd_modkit.release import verify_release_archive
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            trailing = root / "trailing.zip"
+            with zipfile.ZipFile(trailing, "w") as archive:
+                archive.writestr("DATA/a", b"one")
+                archive.writestr("DATA/a.", b"two")
+            with self.assertRaises(ValueError):
+                verify_release_archive(trailing, {"files": []}, prefix="")
+
+            device = root / "device.zip"
+            with zipfile.ZipFile(device, "w") as archive:
+                archive.writestr("DATA/CON.txt", b"unsafe")
+            with self.assertRaises(ValueError):
+                verify_release_archive(device, {"files": []}, prefix="")
 
 
 if __name__ == "__main__":

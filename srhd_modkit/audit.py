@@ -156,6 +156,13 @@ class AuditReport:
             child.coverage_complete for child in self.children
         )
 
+    @property
+    def operational_failure(self) -> bool:
+        """Whether an audit check failed to execute, rather than finding a mod issue."""
+        return any(check.status == "failed" for check in self.checks) or any(
+            child.operational_failure for child in self.children
+        )
+
     def blocking_issues(self, *, warnings_as_errors: bool = False) -> tuple[AuditIssue, ...]:
         blocking = {"error", "warning"} if warnings_as_errors else {"error"}
         return tuple(
@@ -175,6 +182,7 @@ class AuditReport:
             "target": self.target,
             "profile": self.profile.value,
             "coverage_complete": self.coverage_complete,
+            "operational_failure": self.operational_failure,
             "allowed": list(self.allowed),
             "summary": summary,
             "checks": [check.as_dict() for check in self.checks],
@@ -1383,22 +1391,31 @@ def _script_check(context: AuditContext) -> AuditCheck:
 
     index = _relative_index(context.root)
     source_main = _source_config_candidates(index, "main.txt")
-    main_path = index.get("cfg/main.dat") or (source_main[0] if source_main else None)
+    packaged_main = index.get("cfg/main.dat")
+    main_path = packaged_main or (source_main[0] if source_main else None)
     main_document: BlockParDocument | None = None
     registrations: dict[str, list[str]] = {}
     onstart = False
-    if scripts and main_path is None:
+    if scripts and (
+        main_path is None
+        or (context.profile is AuditProfile.RELEASE and packaged_main is None)
+    ):
         issues.append(
             _issue(
                 context,
                 name,
                 "error",
                 "main-dat-missing",
-                "Есть SCR, но отсутствует CFG/Main.dat или Source/Sources + CFG/Config/Main.txt",
+                (
+                    "Есть SCR, но релиз не содержит игровой CFG/Main.dat; "
+                    "исходный Source/Sources + CFG/Config/Main.txt сам по себе игрой не загружается"
+                    if context.profile is AuditProfile.RELEASE and packaged_main is None
+                    else "Есть SCR, но отсутствует CFG/Main.dat или Source/Sources + CFG/Config/Main.txt"
+                ),
                 context.root,
             )
         )
-    elif main_path is not None:
+    if main_path is not None:
         try:
             main_document = load_blockpar(main_path) if main_path.suffix.casefold() == ".txt" else _load_dat(context, main_path)
             if main_document is not None:

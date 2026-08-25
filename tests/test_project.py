@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import zipfile
+import json
 from pathlib import Path
 
 from srhd_modkit.project import (
@@ -14,6 +15,7 @@ from srhd_modkit.project import (
     publish_project,
     resolve_project_target,
 )
+from srhd_modkit.schemas import validate_schema_document
 
 
 def _write_project(root: Path) -> tuple[Path, Path]:
@@ -96,6 +98,9 @@ class ProjectTests(unittest.TestCase):
                 b"release-artifact",
             )
             self.assertTrue(first.provenance_path.is_file())
+            self.assertTrue(validate_schema_document(first.as_dict(include_audit=False))["valid"])
+            provenance = json.loads(first.provenance_path.read_text(encoding="utf-8"))
+            self.assertTrue(validate_schema_document(provenance)["valid"])
 
             second = build_project(root)
             self.assertEqual(second.cache_hits, 1)
@@ -200,6 +205,7 @@ class ProjectTests(unittest.TestCase):
             )
             self.assertIn("stale.bin", preview["plan"]["removed"])
             self.assertTrue((destination / "stale.bin").is_file())
+            self.assertTrue(validate_schema_document(preview)["valid"])
 
             published = publish_project(root)
             archive = Path(published["release"]["output"])
@@ -207,6 +213,7 @@ class ProjectTests(unittest.TestCase):
             self.assertTrue(Path(published["release"]["manifest"]).is_file())
             self.assertTrue(Path(published["release"]["audit"]).is_file())
             self.assertTrue(Path(published["report"]).is_file())
+            self.assertTrue(validate_schema_document(published)["valid"])
             self.assertFalse((destination / "stale.bin").exists())
             self.assertTrue((destination / "DATA" / "base.cmap").is_file())
             with zipfile.ZipFile(archive) as value:
@@ -318,6 +325,19 @@ output = "DATA/effective.bin"
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ProjectConfigError, "безопасным именем|недопустимый"):
+                load_project(root)
+
+    def test_variant_names_cannot_differ_only_by_windows_case(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            _write_project(root)
+            config = root / "srhd-modkit.toml"
+            config.write_text(
+                config.read_text(encoding="utf-8")
+                + "\n[variants.Release]\nscript_name = \"CaseAlias\"\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ProjectConfigError, "регистром"):
                 load_project(root)
 
     def test_copy_directory_cache_does_not_restore_old_baseline_files(self) -> None:

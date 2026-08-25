@@ -17,6 +17,11 @@ from .module_info import find_module_info
 
 DEFAULT_EXCLUDE_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 DEFAULT_EXCLUDE_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache"}
+_WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
 
 
 def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -73,7 +78,36 @@ def safe_archive_name(name: str) -> PurePosixPath:
         or any(":" in part for part in path.parts)
     ):
         raise ValueError(f"Небезопасный путь ZIP: {name!r}")
+    for part in path.parts:
+        if (
+            part.endswith((".", " "))
+            or any(ord(character) < 32 or character in '<>:"|?*' for character in part)
+            or part.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_NAMES
+        ):
+            raise ValueError(f"Небезопасный Windows-путь ZIP: {name!r}")
     return path
+
+
+def windows_archive_key(name: str | PurePosixPath) -> tuple[str, ...]:
+    """Return the Windows extraction identity of a validated archive path."""
+
+    path = safe_archive_name(str(name))
+    return tuple(part.casefold() for part in path.parts)
+
+
+def find_unsafe_tree_entry(root: str | Path) -> Path | None:
+    """Find the first reparse/symlink entry without following it."""
+
+    root = Path(root)
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in [*directories, *files]:
+            candidate = current_path / name
+            if candidate.is_symlink() or bool(
+                getattr(candidate, "is_junction", lambda: False)()
+            ):
+                return candidate
+    return None
 
 
 def build_manifest(root: str | Path, *, exclude: Iterable[str] = ()) -> dict[str, Any]:
@@ -224,6 +258,9 @@ def pack_mod(
     output = Path(output).resolve()
     if find_module_info(mod_dir) is None:
         raise FileNotFoundError(f"ModuleInfo.txt not found in {mod_dir}")
+    unsafe = find_unsafe_tree_entry(mod_dir)
+    if unsafe is not None:
+        raise ValueError(f"Нельзя упаковать ссылку или junction: {unsafe}")
     output.parent.mkdir(parents=True, exist_ok=True)
     prefix = prefix or mod_dir.name
     safe_prefix = safe_archive_name(prefix).as_posix()
@@ -235,16 +272,17 @@ def pack_mod(
     try:
         archive_names: list[str] = []
         exact_names: set[str] = set()
-        folded_names: set[str] = set()
+        folded_names: set[tuple[str, ...]] = set()
         with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             for path in files:
                 rel = path.relative_to(mod_dir).as_posix()
                 archive_name = safe_archive_name(f"{safe_prefix}/{rel}").as_posix()
-                if archive_name in exact_names or archive_name.casefold() in folded_names:
+                windows_key = windows_archive_key(archive_name)
+                if archive_name in exact_names or windows_key in folded_names:
                     raise ValueError(f"ZIP содержит повторяющийся путь: {archive_name}")
                 archive_names.append(archive_name)
                 exact_names.add(archive_name)
-                folded_names.add(archive_name.casefold())
+                folded_names.add(windows_key)
                 info = zipfile.ZipInfo(archive_name, date_time=(1980, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o100644 << 16
@@ -288,6 +326,12 @@ def stage_tree(
     destination = Path(destination).resolve()
     if not source.is_dir():
         raise NotADirectoryError(source)
+    unsafe = find_unsafe_tree_entry(source)
+    if unsafe is not None:
+        raise ValueError(
+            "Нельзя доказать побайтовый состав staging: дерево содержит "
+            f"ссылку или junction {unsafe}"
+        )
     if destination.exists():
         raise FileExistsError(f"Папка назначения уже существует: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-deployment-audit-v1",
+  "title": "SRHD ModKit deployment recovery audit",
+  "type": "object",
+  "required": ["schema", "root", "transactions", "locks", "summary"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-deployment-audit-v1"},
+    "root": {"type": "string"},
+    "transactions": {"type": "array"},
+    "locks": {"type": "array"},
+    "summary": {"type": "object"}
+  }
+}

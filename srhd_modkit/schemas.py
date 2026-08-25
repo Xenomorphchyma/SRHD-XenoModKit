@@ -62,6 +62,29 @@ def _matches_type(value: Any, expected: str) -> bool:
     return isinstance(value, _TYPE_MAP[expected])
 
 
+def _json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values without Python's ``True == 1`` coercion."""
+
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _json_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _json_equal(left[key], right[key]) for key in left
+        )
+    return left == right
+
+
 def _resolve_local_ref(root: Mapping[str, Any], reference: str) -> Mapping[str, Any]:
     if not reference.startswith("#/"):
         raise ValueError(f"Поддерживаются только локальные JSON Schema $ref: {reference}")
@@ -185,11 +208,11 @@ def _validate(
                 }
             )
             return
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not _json_equal(value, schema["const"]):
         errors.append(
             {"path": path, "code": "schema-const", "message": f"ожидалось {schema['const']!r}"}
         )
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(_json_equal(value, item) for item in schema["enum"]):
         errors.append(
             {"path": path, "code": "schema-enum", "message": "значение не входит в enum"}
         )

@@ -13,6 +13,7 @@ class SchemaTests(unittest.TestCase):
             "target": "fixture",
             "profile": "dev",
             "coverage_complete": True,
+            "operational_failure": False,
             "summary": {},
             "checks": [],
             "issues": [],
@@ -31,7 +32,33 @@ class SchemaTests(unittest.TestCase):
                 "srhd-modkit-release-v1",
                 "srhd-modkit-project-v1",
                 "srhd-modkit-modset-v1",
+                "srhd-modkit-deploy-v1",
+                "srhd-modkit-deploy-plan-v1",
+                "srhd-modkit-project-build-v1",
+                "srhd-modkit-project-deploy-v1",
+                "srhd-modkit-project-publish-v1",
+                "srhd-modkit-deployment-audit-v1",
+                "srhd-modkit-deployment-rollback-v1",
+                "srhd-modkit-deployment-cleanup-v1",
+                "srhd-modkit-manifest-v1",
+                "srhd-modkit-project-provenance-v1",
             }.issubset(names)
+        )
+
+    def test_const_and_enum_do_not_treat_boolean_as_number(self) -> None:
+        document = {"schema": "fixture", "value": True}
+        with patch(
+            "srhd_modkit.schemas.load_schema",
+            return_value={
+                "type": "object",
+                "properties": {"value": {"const": 1, "enum": [1]}},
+            },
+        ):
+            result = validate_schema_document(document)
+        self.assertFalse(result["valid"])
+        self.assertEqual(
+            {item["code"] for item in result["errors"]},
+            {"schema-const", "schema-enum"},
         )
 
     def test_combinators_and_unsupported_keywords_are_not_ignored(self) -> None:

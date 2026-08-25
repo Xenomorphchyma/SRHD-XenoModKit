@@ -197,7 +197,13 @@ def cmd_audit(args: argparse.Namespace) -> int:
         print_json(report.as_dict())
     else:
         _print_audit_report(report)
-    return 2 if report.blocking_issues(warnings_as_errors=args.warnings_as_errors) else 0
+    if report.operational_failure:
+        return 3
+    if report.blocking_issues(warnings_as_errors=args.warnings_as_errors) or (
+        args.require_complete and not report.coverage_complete
+    ):
+        return 2
+    return 0
 
 
 def cmd_release_check(args: argparse.Namespace) -> int:
@@ -213,7 +219,13 @@ def cmd_release_check(args: argparse.Namespace) -> int:
         print_json(report.as_dict())
     else:
         _print_audit_report(report)
-    return 2 if report.blocking_issues(warnings_as_errors=args.warnings_as_errors) else 0
+    if report.operational_failure:
+        return 3
+    if report.blocking_issues(warnings_as_errors=args.warnings_as_errors) or (
+        args.require_complete and not report.coverage_complete
+    ):
+        return 2
+    return 0
 
 
 def cmd_release_build(args: argparse.Namespace) -> int:
@@ -228,6 +240,7 @@ def cmd_release_build(args: argparse.Namespace) -> int:
             warnings_as_errors=args.warnings_as_errors,
             overwrite=args.overwrite,
             strip_sources=args.strip_sources,
+            require_complete=args.require_complete,
         )
     except ReleaseBlockedError as exc:
         if args.json:
@@ -235,7 +248,7 @@ def cmd_release_build(args: argparse.Namespace) -> int:
         else:
             print(str(exc))
             _print_audit_report(exc.report)
-        return 2
+        return 3 if exc.report.operational_failure else 2
     if args.json:
         print_json(result.as_dict())
     else:
@@ -277,11 +290,14 @@ def cmd_release_plan(args: argparse.Namespace) -> int:
         tools_root=args.tools_root,
         allow=args.allow,
         warnings_as_errors=args.warnings_as_errors,
+        require_complete=args.require_complete,
     )
     if args.json:
         print_json(plan.as_dict())
     else:
         _print_deploy_plan(plan)
+    if plan.report.operational_failure:
+        return 3
     return 2 if plan.blocked else 0
 
 
@@ -299,6 +315,7 @@ def cmd_release_deploy(args: argparse.Namespace) -> int:
             allow=args.allow,
             warnings_as_errors=args.warnings_as_errors,
             overwrite=args.overwrite,
+            require_complete=args.require_complete,
         )
     except ReleaseBlockedError as exc:
         if args.json:
@@ -306,7 +323,7 @@ def cmd_release_deploy(args: argparse.Namespace) -> int:
         else:
             print(str(exc))
             _print_audit_report(exc.report)
-        return 2
+        return 3 if exc.report.operational_failure else 2
     if args.json:
         print_json(result.as_dict())
     else:
@@ -2655,6 +2672,11 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--profile", choices=("dev", "release"), default="dev")
     audit.add_argument("--allow", action="append", default=[], help="Подавить CODE или CODE:GLOB с записью в отчёт")
     audit.add_argument("--warnings-as-errors", action="store_true")
+    audit.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="Завершаться с кодом 2, если аудит честно отметил неполное покрытие",
+    )
     audit.add_argument("--tools-root")
     audit.add_argument("--json", action="store_true")
     audit.set_defaults(func=cmd_audit)
@@ -2670,6 +2692,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     release_check.add_argument("--allow", action="append", default=[])
     release_check.add_argument("--warnings-as-errors", action="store_true")
+    release_check.add_argument("--require-complete", action="store_true")
     release_check.add_argument("--tools-root")
     release_check.add_argument("--json", action="store_true")
     release_check.set_defaults(func=cmd_release_check)
@@ -2684,6 +2707,7 @@ def build_parser() -> argparse.ArgumentParser:
     release_build.add_argument("--exclude", action="append", default=[])
     release_build.add_argument("--allow", action="append", default=[])
     release_build.add_argument("--warnings-as-errors", action="store_true")
+    release_build.add_argument("--require-complete", action="store_true")
     release_build.add_argument("--overwrite", action="store_true")
     release_build.add_argument(
         "--strip-sources",
@@ -2707,6 +2731,7 @@ def build_parser() -> argparse.ArgumentParser:
     release_plan.add_argument("--exclude", action="append", default=[])
     release_plan.add_argument("--allow", action="append", default=[])
     release_plan.add_argument("--warnings-as-errors", action="store_true")
+    release_plan.add_argument("--require-complete", action="store_true")
     release_plan.add_argument(
         "--include-sources",
         action="store_true",
@@ -2729,6 +2754,7 @@ def build_parser() -> argparse.ArgumentParser:
     release_deploy.add_argument("--exclude", action="append", default=[])
     release_deploy.add_argument("--allow", action="append", default=[])
     release_deploy.add_argument("--warnings-as-errors", action="store_true")
+    release_deploy.add_argument("--require-complete", action="store_true")
     release_deploy.add_argument(
         "--include-sources",
         action="store_true",

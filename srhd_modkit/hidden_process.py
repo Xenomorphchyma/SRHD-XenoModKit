@@ -84,6 +84,22 @@ class HiddenProcessTimeout(TimeoutError):
         }
 
 
+def _abort_window_matches(window_text: tuple[str, ...], patterns: tuple[str, ...]) -> bool:
+    """Match modal failures without treating every harmless word 'error' as fatal."""
+
+    folded_lines = tuple(value.strip().casefold() for value in window_text if value.strip())
+    for raw_pattern in patterns:
+        pattern = raw_pattern.strip().casefold()
+        if not pattern:
+            continue
+        if pattern in {"error", "ошибка"}:
+            if any(line == pattern or line.startswith(pattern + ":") for line in folded_lines):
+                return True
+        elif any(pattern in line for line in folded_lines):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class HiddenControlAction:
     """Click or type into one control on a private invisible desktop."""
@@ -595,6 +611,15 @@ def run_on_hidden_desktop(
                     stable_since = stable_since or now
                     if now - stable_since >= settle_seconds:
                         captured_window_text = _read_desktop_window_text(user32, desktop)
+                        if abort_window_patterns and _abort_window_matches(
+                            captured_window_text, abort_window_patterns
+                        ):
+                            terminate_process_tree(1)
+                            details = "; ".join(captured_window_text)
+                            raise RuntimeError(
+                                "Процесс создал выходные файлы, но затем показал окно ошибки: "
+                                f"{details}"
+                            )
                         terminate_process_tree(0)
                         forced = True
                         break
@@ -602,14 +627,12 @@ def run_on_hidden_desktop(
                     last_signature = signature
                     stable_since = now
                     mark_progress(now)
-            # Some legacy tools show a bogus modal after successfully writing
-            # their outputs. Once all expected files exist, settle and verify
-            # those files instead of treating the post-success dialog as fatal.
+            # A produced file is only provisional.  Before forced completion
+            # we still inspect the final window text and reject a real error.
             if not outputs_ready and abort_window_patterns and now - last_window_probe >= 0.25:
                 last_window_probe = now
                 window_text = _read_desktop_window_text(user32, desktop)
-                combined = "\n".join(window_text).casefold()
-                if any(pattern.casefold() in combined for pattern in abort_window_patterns):
+                if _abort_window_matches(window_text, abort_window_patterns):
                     terminate_process_tree(1)
                     details = "; ".join(window_text)
                     raise RuntimeError(f"Процесс показал окно ошибки: {details}")

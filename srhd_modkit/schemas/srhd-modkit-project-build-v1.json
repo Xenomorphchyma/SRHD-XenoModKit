@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-project-build-v1",
+  "title": "SRHD ModKit project build result",
+  "type": "object",
+  "required": ["schema", "project", "variant", "output", "verified", "artifacts", "cache", "deploy"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-project-build-v1"},
+    "project": {"type": "string"},
+    "variant": {"type": "string"},
+    "output": {"type": "string"},
+    "verified": {"type": "boolean"},
+    "artifacts": {"type": "array"},
+    "cache": {"type": "object"},
+    "deploy": {"type": "object"}
+  }
+}

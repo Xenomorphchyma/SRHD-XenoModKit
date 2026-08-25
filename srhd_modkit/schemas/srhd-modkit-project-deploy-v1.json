@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-project-deploy-v1",
+  "title": "SRHD ModKit project deployment workflow",
+  "type": "object",
+  "required": ["schema", "project", "variant", "target", "dry_run", "operation_semantics", "build", "plan", "deploy"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-project-deploy-v1"},
+    "project": {"type": "string"},
+    "variant": {"type": "string"},
+    "target": {"type": "object"},
+    "dry_run": {"type": "boolean"},
+    "operation_semantics": {"type": "object"},
+    "build": {"type": "object"},
+    "plan": {"type": "object"},
+    "deploy": {"type": ["object", "null"]}
+  }
+}

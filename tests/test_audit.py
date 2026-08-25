@@ -167,7 +167,7 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(matching[0].severity, "error")
             self.assertIn("Source\\Config\\CacheData.txt", matching[0].path or "")
 
-    def test_release_accepts_sources_config_spelling_for_script_metadata(self) -> None:
+    def test_dev_accepts_sources_config_but_release_requires_packaged_main_dat(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"
             _mod(root)
@@ -187,11 +187,15 @@ class AuditTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            report = audit_mod(root, profile="release", install_subpath="OtherMods/AuditFixture")
-            codes = {item.code for item in report.issues}
-            self.assertNotIn("main-dat-missing", codes)
-            self.assertNotIn("scr-unregistered", codes)
-            self.assertNotIn("cache-script-missing", codes)
+            dev = audit_mod(root, profile="dev", install_subpath="OtherMods/AuditFixture")
+            dev_codes = {item.code for item in dev.issues}
+            self.assertNotIn("main-dat-missing", dev_codes)
+            self.assertNotIn("scr-unregistered", dev_codes)
+            self.assertNotIn("cache-script-missing", dev_codes)
+
+            release = audit_mod(root, profile="release", install_subpath="OtherMods/AuditFixture")
+            release_codes = {item.code for item in release.issues}
+            self.assertIn("main-dat-missing", release_codes)
 
     def test_release_blocks_tgroup_without_planet_or_initial_state(self) -> None:
         with tempfile.TemporaryDirectory() as name:

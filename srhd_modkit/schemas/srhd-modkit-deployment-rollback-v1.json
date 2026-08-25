@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-deployment-rollback-v1",
+  "title": "SRHD ModKit deployment rollback result",
+  "type": "object",
+  "required": ["schema", "target", "transaction", "restored", "cleanup_required"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-deployment-rollback-v1"},
+    "target": {"type": "string"},
+    "transaction": {"type": "string"},
+    "restored": {"type": "boolean"},
+    "cleanup_required": {"type": "boolean"}
+  }
+}

@@ -304,6 +304,48 @@ class ToolchainWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "перезаписывать RSON"):
                 chain.compile_rson(source, source.with_suffix(".scr"), source, overwrite=True)
 
+    def test_forced_rscript_output_is_not_published_without_verified_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "source.rson"
+            source.write_text(json.dumps(PROJECT), encoding="utf-8")
+            scr = root / "output.scr"
+            lang = root / "output.lang.txt"
+            chain = Toolchain()
+
+            def fake_compile(_source, scr_output, lang_output, **_kwargs):
+                scr_output.write_bytes((8).to_bytes(4, "little") + b"provisional")
+                lang_output.write_bytes(b"\xff\xfe")
+                return (
+                    SimpleNamespace(
+                        exit_code=1,
+                        forced_after_outputs=True,
+                        elapsed_seconds=0.01,
+                        queue_seconds=0.0,
+                        progress_updates=1,
+                        last_progress_seconds=0.01,
+                    ),
+                    inspect_scr(scr_output),
+                    {"mode": "test"},
+                )
+
+            with patch.object(
+                chain, "_compile_rson_with_rscript", side_effect=fake_compile
+            ), patch.object(
+                chain,
+                "decompile_scr",
+                return_value={"status": "failed", "verified": False},
+            ):
+                with self.assertRaises(ScriptBuildFailure) as caught:
+                    chain.compile_rson(source, scr, lang)
+
+            self.assertEqual(
+                caught.exception.report["failure"]["code"],
+                "rscript-forced-output-roundtrip-failed",
+            )
+            self.assertFalse(scr.exists())
+            self.assertFalse(lang.exists())
+
     def test_compile_blocks_incomplete_tgroup_before_rscript(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -373,10 +415,21 @@ class ToolchainWorkflowTests(unittest.TestCase):
             unverified = root / "explicit-unverified.rson"
             source.write_bytes((8).to_bytes(4, "little") + b"test")
             chain = Toolchain(root / "tools")
-            stale = root / ".srhd-decompile-stale"
+            transaction_id = "d" * 32
+            stale = root / f".srhd-decompile-{transaction_id}"
             stale.mkdir()
             marker = stale / ".srhd-transaction"
-            marker.write_text("decompile-v1\n", encoding="ascii")
+            marker.write_text(
+                json.dumps(
+                    {
+                        "schema": "srhd-modkit-decompile-transaction-v1",
+                        "id": transaction_id,
+                        "pid": 12345,
+                        "created_at": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
             os.utime(marker, (0, 0))
             unmarked = root / ".srhd-decompile-user-data"
             unmarked.mkdir()

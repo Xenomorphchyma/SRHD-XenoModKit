@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-deploy-v1",
+  "title": "SRHD ModKit deployment result",
+  "type": "object",
+  "required": ["schema", "destination", "verified", "file_count", "audit_coverage_complete", "audit_operational_failure"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-deploy-v1"},
+    "destination": {"type": "string"},
+    "verified": {"type": "boolean"},
+    "file_count": {"type": "integer", "minimum": 0},
+    "audit_coverage_complete": {"type": "boolean"},
+    "audit_operational_failure": {"type": "boolean"},
+    "audit_report": {"type": "object"}
+  }
+}

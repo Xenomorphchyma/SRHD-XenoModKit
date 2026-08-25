@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-manifest-v1",
+  "title": "SRHD ModKit SHA-256 file manifest",
+  "type": "object",
+  "required": ["schema", "root_name", "file_count", "total_size", "files"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-manifest-v1"},
+    "root_name": {"type": "string"},
+    "file_count": {"type": "integer", "minimum": 0},
+    "total_size": {"type": "integer", "minimum": 0},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "size", "sha256"],
+        "properties": {
+          "path": {"type": "string"},
+          "size": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}
+        }
+      }
+    }
+  }
+}

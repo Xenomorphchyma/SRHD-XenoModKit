@@ -25,6 +25,7 @@ from .project import (
     _effective_artifact_source,
     _external_build_issues,
     _external_build_report,
+    _is_link_or_junction,
     _project_path,
     _resolve_variant,
     _safe_relative,
@@ -889,10 +890,19 @@ def clean_project(
     if apply:
         for item in selected:
             candidate = Path(item["path"])
-            if candidate.is_symlink() or not candidate.is_dir():
-                continue
-            shutil.rmtree(candidate)
-            removed.append(str(candidate))
+            if _is_link_or_junction(candidate) or not candidate.is_dir():
+                raise ProjectConfigError(
+                    f"Отказ очистки {item['kind']}: путь стал ссылкой, junction или не-каталогом: "
+                    f"{candidate}"
+                )
+            verified = _project_path(
+                project.root,
+                candidate,
+                f"project clean {item['kind']}",
+                reject_links=True,
+            )
+            shutil.rmtree(verified)
+            removed.append(str(verified))
     return {
         "schema": PROJECT_CLEAN_SCHEMA,
         "project": str(project.path),

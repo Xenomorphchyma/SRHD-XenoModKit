@@ -4,25 +4,37 @@ import hashlib
 import errno
 import json
 import os
+import re
+import stat
 import shutil
 import tempfile
 import zipfile
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator, Sequence
 
 from .audit import AuditProfile, AuditReport, audit_mod
-from .files import build_manifest, pack_mod, safe_archive_name, sha256_file, stage_tree
+from .files import (
+    build_manifest,
+    find_unsafe_tree_entry,
+    pack_mod,
+    safe_archive_name,
+    sha256_file,
+    stage_tree,
+    windows_archive_key,
+)
 from .safe_io import atomic_write_text, publish_files_transactionally
 
 
 RELEASE_SCHEMA = "srhd-modkit-release-v1"
+MANIFEST_SCHEMA = "srhd-modkit-manifest-v1"
 DEPLOY_SCHEMA = "srhd-modkit-deploy-v1"
 DEPLOY_PLAN_SCHEMA = "srhd-modkit-deploy-plan-v1"
 DEPLOY_TRANSACTION_SCHEMA = "srhd-modkit-deploy-transaction-v1"
+DEPLOY_LOCK_SCHEMA = "srhd-modkit-deploy-lock-v1"
 
 _SOURCE_ROOT_NAMES = {"source", "sources"}
 _SOURCE_FILE_PATTERNS = (
@@ -44,14 +56,23 @@ _SOURCE_FILE_PATTERNS = (
 
 
 class ReleaseBlockedError(RuntimeError):
-    def __init__(self, report: AuditReport, *, warnings_as_errors: bool = False) -> None:
+    def __init__(
+        self,
+        report: AuditReport,
+        *,
+        warnings_as_errors: bool = False,
+        require_complete: bool = False,
+    ) -> None:
         self.report = report
         self.warnings_as_errors = warnings_as_errors
+        self.require_complete = require_complete
         issues = report.blocking_issues(warnings_as_errors=warnings_as_errors)
         first = issues[0] if issues else None
         message = "Релиз заблокирован аудитом"
         if first:
             message += f" ({first.code}): {first.message}"
+        elif require_complete and not report.coverage_complete:
+            message += " (audit-coverage-incomplete): не все форматы и проверки покрыты"
         super().__init__(message)
 
     def as_dict(self) -> dict[str, Any]:
@@ -59,6 +80,7 @@ class ReleaseBlockedError(RuntimeError):
             "schema": "srhd-modkit-release-blocked-v1",
             "blocked": True,
             "warnings_as_errors": self.warnings_as_errors,
+            "require_complete": self.require_complete,
             "message": str(self),
             "audit": self.report.as_dict(),
         }
@@ -90,6 +112,8 @@ class ReleaseResult:
             "file_count": self.file_count,
             "prefix": self.prefix,
             "verified": self.verified,
+            "audit_coverage_complete": self.report.coverage_complete,
+            "audit_operational_failure": self.report.operational_failure,
             "exclude": list(self.exclude),
             "strip_sources": self.strip_sources,
         }
@@ -122,6 +146,8 @@ class DeployResult:
             "total_size": self.total_size,
             "prefix": self.prefix,
             "verified": self.verified,
+            "audit_coverage_complete": self.report.coverage_complete,
+            "audit_operational_failure": self.report.operational_failure,
             "replaced_existing": self.replaced_existing,
             "stale_files_removed": self.stale_files_removed,
             "excluded_file_count": self.excluded_file_count,
@@ -163,6 +189,8 @@ class DeployPlan:
             "destination": str(self.destination),
             "prefix": self.prefix,
             "blocked": self.blocked,
+            "audit_coverage_complete": self.report.coverage_complete,
+            "audit_operational_failure": self.report.operational_failure,
             "strip_sources": self.strip_sources,
             "exclude": list(self.exclude),
             "file_count": self.file_count,
@@ -197,7 +225,7 @@ def verify_release_archive(
 ) -> dict[str, Any]:
     archive_path = Path(archive_path).resolve()
     expected: dict[str, dict[str, Any]] = {}
-    expected_folded: set[str] = set()
+    expected_folded: set[tuple[str, ...]] = set()
     safe_prefix = _safe_archive_name(prefix) if prefix else None
     for item in manifest.get("files", []):
         if not isinstance(item, dict):
@@ -211,7 +239,7 @@ def verify_release_archive(
         _safe_archive_name(archive_name)
         if archive_name in expected:
             raise ValueError(f"Манифест содержит точный дубль пути: {archive_name}")
-        folded_name = archive_name.casefold()
+        folded_name = windows_archive_key(archive_name)
         if folded_name in expected_folded:
             raise ValueError(
                 f"Манифест содержит пути, различающиеся только регистром: {archive_name}"
@@ -226,7 +254,7 @@ def verify_release_archive(
             normalized_names.append(_safe_archive_name(info.filename).as_posix())
         if len(normalized_names) != len(set(normalized_names)):
             raise ValueError("ZIP содержит точные дубли путей, включая каталоги")
-        normalized_folded = [name.casefold() for name in normalized_names]
+        normalized_folded = [windows_archive_key(name) for name in normalized_names]
         if len(normalized_folded) != len(set(normalized_folded)):
             raise ValueError("ZIP содержит пути, различающиеся только регистром")
 
@@ -291,6 +319,41 @@ def _distribution_excludes(
     return tuple(dict.fromkeys(patterns))
 
 
+def _retarget_audit_report(
+    report: AuditReport,
+    staged_root: Path,
+    source_root: Path,
+) -> AuditReport:
+    """Replace ephemeral staging paths with stable source-relative paths."""
+
+    staged_root = staged_root.resolve()
+    source_root = source_root.resolve()
+
+    def stable_path(value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = Path(value)
+        try:
+            relative = candidate.resolve().relative_to(staged_root)
+        except (ValueError, OSError):
+            return value
+        return str(source_root / relative)
+
+    checks = tuple(
+        replace(
+            check,
+            checked_files=tuple(stable_path(value) or value for value in check.checked_files),
+            issues=tuple(replace(issue, path=stable_path(issue.path)) for issue in check.issues),
+        )
+        for check in report.checks
+    )
+    children = tuple(
+        _retarget_audit_report(child, staged_root, source_root)
+        for child in report.children
+    )
+    return replace(report, target=str(source_root), checks=checks, children=children)
+
+
 def _manifest_files(manifest: dict[str, Any]) -> dict[str, tuple[int, str]]:
     return {
         str(item["path"]): (int(item["size"]), str(item["sha256"]))
@@ -349,59 +412,54 @@ def _write_transaction(path: Path, value: dict[str, Any]) -> None:
 
 @contextmanager
 def _deployment_lock(destination: Path) -> Iterator[Path]:
+    """Acquire a fail-closed sibling lock without following existing links.
+
+    Exclusive creation is the lock primitive.  A crash may leave a visible
+    stale file, which is safer than reopening an attacker-controlled path;
+    ``doctor deployments`` reports it for explicit inspection.
+    """
+
     lock_path = destination.parent / f".{destination.name}.srhd-deploy.lock"
+    _assert_no_link_components(destination.parent)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    stream = lock_path.open("a+b")
-    locked = False
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_BINARY", 0)
     try:
-        stream.seek(0)
-        if stream.read(1) == b"":
-            stream.write(b"\0")
-            stream.flush()
-        stream.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            locked = True
-        except OSError as exc:
-            raise RuntimeError(
-                f"Другая сборка уже изменяет эту папку: {destination}"
-            ) from exc
-        stream.seek(0)
-        stream.truncate()
-        stream.write(
-            json.dumps(
-                {"pid": os.getpid(), "destination": str(destination), "started_at": _utc_now()},
+        descriptor = os.open(lock_path, flags, 0o600)
+    except FileExistsError as exc:
+        if _is_link_or_junction(lock_path):
+            raise ValueError(f"Deploy lock является ссылкой или junction: {lock_path}") from exc
+        raise RuntimeError(
+            f"Deploy lock уже существует: {lock_path}. Проверьте doctor deployments; "
+            "не удаляйте его, пока владеющий процесс активен"
+        ) from exc
+    owned_stat = os.fstat(descriptor)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(
+                {
+                    "schema": DEPLOY_LOCK_SCHEMA,
+                    "pid": os.getpid(),
+                    "destination": str(destination),
+                    "started_at": _utc_now(),
+                },
+                stream,
                 ensure_ascii=False,
-            ).encode("utf-8")
-        )
-        stream.flush()
-        yield lock_path
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+            yield lock_path
     finally:
-        if locked:
-            try:
-                stream.seek(0)
-                if os.name == "nt":
-                    import msvcrt
-
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-            finally:
-                stream.close()
+        try:
+            current = os.lstat(lock_path)
+            if (
+                stat.S_ISREG(current.st_mode)
+                and current.st_ino == owned_stat.st_ino
+                and current.st_dev == owned_stat.st_dev
+            ):
                 lock_path.unlink(missing_ok=True)
-        else:
-            stream.close()
+        except FileNotFoundError:
+            pass
 
 
 def _is_link_or_junction(path: Path) -> bool:
@@ -436,6 +494,7 @@ def plan_deploy(
     tools_root: str | Path | None = None,
     allow: Sequence[str] = (),
     warnings_as_errors: bool = False,
+    require_complete: bool = False,
 ) -> DeployPlan:
     mod_dir = Path(mod_dir).resolve()
     destination_root = Path(destination_root).absolute()
@@ -447,7 +506,7 @@ def plan_deploy(
     if destination == mod_dir or destination in mod_dir.parents or mod_dir in destination.parents:
         raise ValueError("Исходный мод и папка развёртывания не должны быть вложены друг в друга")
 
-    report = audit_mod(
+    source_report = audit_mod(
         mod_dir,
         profile=AuditProfile.RELEASE,
         tools_root=tools_root,
@@ -460,7 +519,24 @@ def plan_deploy(
         strip_sources=strip_sources,
     )
     full_manifest = build_manifest(mod_dir)
-    source_manifest = build_manifest(mod_dir, exclude=effective_exclude)
+    with tempfile.TemporaryDirectory(prefix=".srhd-deploy-plan-") as temp_name:
+        staged = Path(temp_name) / mod_dir.name
+        stage_tree(mod_dir, staged, exclude=effective_exclude)
+        source_manifest = build_manifest(staged)
+        staged_report = audit_mod(
+            staged,
+            profile=AuditProfile.RELEASE,
+            tools_root=tools_root,
+            install_subpath=archive_prefix,
+            allow=allow,
+        )
+        staged_report = _retarget_audit_report(staged_report, staged, mod_dir)
+    report = (
+        source_report
+        if source_report.blocking_issues(warnings_as_errors=warnings_as_errors)
+        or (require_complete and not source_report.coverage_complete)
+        else staged_report
+    )
     target_manifest = build_manifest(destination) if destination.is_dir() else {"files": []}
     added, changed, removed, identical = _deployment_diff(source_manifest, target_manifest)
     included_keys = set(_manifest_index(source_manifest))
@@ -484,7 +560,8 @@ def plan_deploy(
         file_count=len(source_manifest.get("files", [])),
         total_size=sum(int(item["size"]) for item in source_manifest.get("files", [])),
         report=report,
-        blocked=bool(report.blocking_issues(warnings_as_errors=warnings_as_errors)),
+        blocked=bool(report.blocking_issues(warnings_as_errors=warnings_as_errors))
+        or (require_complete and not report.coverage_complete),
         source_manifest=source_manifest,
         target_manifest=target_manifest,
     )
@@ -501,6 +578,7 @@ def build_release(
     warnings_as_errors: bool = False,
     overwrite: bool = False,
     strip_sources: bool = False,
+    require_complete: bool = False,
 ) -> ReleaseResult:
     mod_dir = Path(mod_dir).resolve()
     output = Path(output).resolve()
@@ -516,15 +594,21 @@ def build_release(
 
     archive_prefix = prefix if prefix is not None else mod_dir.name
     _safe_archive_name(archive_prefix)
-    report = audit_mod(
+    source_report = audit_mod(
         mod_dir,
         profile=AuditProfile.RELEASE,
         tools_root=tools_root,
         install_subpath=archive_prefix,
         allow=allow,
     )
-    if report.blocking_issues(warnings_as_errors=warnings_as_errors):
-        raise ReleaseBlockedError(report, warnings_as_errors=warnings_as_errors)
+    if source_report.blocking_issues(warnings_as_errors=warnings_as_errors) or (
+        require_complete and not source_report.coverage_complete
+    ):
+        raise ReleaseBlockedError(
+            source_report,
+            warnings_as_errors=warnings_as_errors,
+            require_complete=require_complete,
+        )
 
     effective_exclude = _distribution_excludes(
         mod_dir,
@@ -537,13 +621,29 @@ def build_release(
         temp = Path(temp_name)
         staged = temp / "staged" / mod_dir.name
         stage_result = stage_tree(mod_dir, staged, exclude=effective_exclude)
+        report = audit_mod(
+            staged,
+            profile=AuditProfile.RELEASE,
+            tools_root=tools_root,
+            install_subpath=archive_prefix,
+            allow=allow,
+        )
+        report = _retarget_audit_report(report, staged, mod_dir)
+        if report.blocking_issues(warnings_as_errors=warnings_as_errors) or (
+            require_complete and not report.coverage_complete
+        ):
+            raise ReleaseBlockedError(
+                report,
+                warnings_as_errors=warnings_as_errors,
+                require_complete=require_complete,
+            )
         raw_manifest = build_manifest(staged)
         files = [
             {"path": item["path"], "size": item["size"], "sha256": item["sha256"]}
             for item in raw_manifest["files"]
         ]
         manifest: dict[str, Any] = {
-            "schema": RELEASE_SCHEMA,
+            "schema": MANIFEST_SCHEMA,
             "source": str(mod_dir),
             "root_name": mod_dir.name,
             "prefix": archive_prefix,
@@ -552,6 +652,8 @@ def build_release(
             "file_count": len(files),
             "total_size": sum(item["size"] for item in files),
             "stage_verified": bool(stage_result["verified"]),
+            "audit_coverage_complete": report.coverage_complete,
+            "audit_operational_failure": report.operational_failure,
             "files": files,
         }
 
@@ -610,6 +712,7 @@ def deploy_mod(
     allow: Sequence[str] = (),
     warnings_as_errors: bool = False,
     overwrite: bool = False,
+    require_complete: bool = False,
 ) -> DeployResult:
     """Audit and publish an exact game-ready mod directory without merging.
 
@@ -628,9 +731,14 @@ def deploy_mod(
         tools_root=tools_root,
         allow=allow,
         warnings_as_errors=warnings_as_errors,
+        require_complete=require_complete,
     )
     if plan.blocked:
-        raise ReleaseBlockedError(plan.report, warnings_as_errors=warnings_as_errors)
+        raise ReleaseBlockedError(
+            plan.report,
+            warnings_as_errors=warnings_as_errors,
+            require_complete=require_complete,
+        )
 
     mod_dir = plan.source
     destination_root = plan.destination_root
@@ -649,6 +757,10 @@ def deploy_mod(
             raise ValueError(f"Нельзя заменить не-каталог или ссылку: {destination}")
 
         replaced_existing = destination.exists()
+        if replaced_existing and (unsafe := find_unsafe_tree_entry(destination)) is not None:
+            raise ValueError(
+                f"Существующая папка назначения содержит ссылку или junction: {unsafe}"
+            )
         old_manifest = build_manifest(destination) if replaced_existing else {"files": []}
         transaction_id = uuid.uuid4().hex
         transaction = destination.parent / f".{destination.name}.srhd-deploy-{transaction_id}"
@@ -769,7 +881,23 @@ def _find_transaction_dirs(root: Path) -> list[Path]:
     return sorted(result, key=lambda item: str(item).casefold())
 
 
+_DEPLOY_TRANSACTION_NAME_RE = re.compile(
+    r"^\.(?P<target>.+)\.srhd-deploy-(?P<id>[0-9a-f]{32})$"
+)
+
+
+def _transaction_identity(directory: Path) -> tuple[str, str, Path] | None:
+    match = _DEPLOY_TRANSACTION_NAME_RE.fullmatch(directory.name)
+    if match is None:
+        return None
+    target_name = match.group("target")
+    transaction_id = match.group("id")
+    target = directory.parent / target_name
+    return target_name, transaction_id, target
+
+
 def _read_transaction(directory: Path) -> dict[str, Any]:
+    directory = directory.absolute()
     metadata_path = directory / "transaction.json"
     metadata: dict[str, Any]
     try:
@@ -779,15 +907,49 @@ def _read_transaction(directory: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         metadata = {}
         metadata_error = str(exc)
-    backup = Path(str(metadata.get("backup") or directory / "previous"))
-    staged = Path(str(metadata.get("staged") or directory / "new"))
+    identity = _transaction_identity(directory)
+    backup = directory / "previous"
+    staged = directory / "new"
     destination_value = metadata.get("destination")
     destination = Path(str(destination_value)) if destination_value else None
+    validation_errors: list[str] = []
+    if metadata_error is not None:
+        validation_errors.append(metadata_error)
+    if _is_link_or_junction(directory):
+        validation_errors.append("transaction является ссылкой или junction")
+    if identity is None:
+        validation_errors.append("имя transaction не содержит штатный UUID")
+        expected_id = None
+        expected_destination = None
+    else:
+        _target_name, expected_id, expected_destination = identity
+        if metadata.get("schema") != DEPLOY_TRANSACTION_SCHEMA:
+            validation_errors.append("неверная schema transaction")
+        if metadata.get("id") != expected_id:
+            validation_errors.append("id не совпадает с именем transaction")
+        if destination is None:
+            validation_errors.append("destination отсутствует")
+        else:
+            try:
+                if destination.resolve() != expected_destination.resolve():
+                    validation_errors.append("destination не совпадает с именем transaction")
+            except OSError as exc:
+                validation_errors.append(f"destination не удалось проверить: {exc}")
+    backup_safe = (
+        backup.is_dir()
+        and not _is_link_or_junction(backup)
+        and find_unsafe_tree_entry(backup) is None
+    )
+    staged_safe = (
+        staged.is_dir()
+        and not _is_link_or_junction(staged)
+        and find_unsafe_tree_entry(staged) is None
+    )
     return {
         "path": str(directory),
         "metadata": str(metadata_path),
-        "metadata_valid": metadata_error is None,
-        "metadata_error": metadata_error,
+        "metadata_valid": not validation_errors,
+        "metadata_error": "; ".join(validation_errors) if validation_errors else None,
         "id": metadata.get("id"),
         "state": metadata.get("state", "unknown"),
         "created_at": metadata.get("created_at"),
@@ -797,10 +959,10 @@ def _read_transaction(directory: Path) -> dict[str, Any]:
         "destination": str(destination) if destination is not None else None,
         "destination_exists": bool(destination is not None and destination.exists()),
         "backup": str(backup),
-        "backup_exists": backup.is_dir(),
+        "backup_exists": backup_safe,
         "staged": str(staged),
-        "staged_exists": staged.is_dir(),
-        "recovery_available": backup.is_dir(),
+        "staged_exists": staged_safe,
+        "recovery_available": backup_safe and not validation_errors,
     }
 
 
@@ -810,7 +972,7 @@ def inspect_deployments(root: str | Path) -> dict[str, Any]:
     locks = sorted(
         str(path)
         for path in root.rglob(".*.srhd-deploy.lock")
-        if path.is_file()
+        if path.is_file() or _is_link_or_junction(path)
     ) if root.exists() else []
     return {
         "schema": "srhd-modkit-deployment-audit-v1",
@@ -830,7 +992,7 @@ def _candidate_transactions_for_target(target: Path) -> list[Path]:
     candidates = [
         path
         for path in target.parent.glob(f"{prefix}*")
-        if path.is_dir()
+        if path.is_dir() and not _is_link_or_junction(path)
     ]
     return sorted(candidates, key=lambda item: item.stat().st_mtime_ns, reverse=True)
 
@@ -845,12 +1007,7 @@ def rollback_deployment(target: str | Path) -> dict[str, Any]:
     selected_info: dict[str, Any] | None = None
     for candidate in candidates:
         info = _read_transaction(candidate)
-        recorded_destination = info.get("destination")
-        destination_matches = (
-            recorded_destination is None
-            or Path(str(recorded_destination)).resolve() == target
-        )
-        if info["backup_exists"] and destination_matches:
+        if info["metadata_valid"] and info["recovery_available"]:
             selected = candidate
             selected_info = info
             break
@@ -864,7 +1021,9 @@ def rollback_deployment(target: str | Path) -> dict[str, Any]:
             metadata = {}
     except (OSError, json.JSONDecodeError):
         metadata = {}
-    backup = Path(selected_info["backup"])
+    backup = selected / "previous"
+    if backup.resolve().parent != selected.resolve() or _is_link_or_junction(backup):
+        raise ValueError(f"Небезопасная резервная копия deploy: {backup}")
     displaced = selected / f"displaced-current-{uuid.uuid4().hex}"
     current_moved = False
     with _deployment_lock(target):
@@ -872,6 +1031,10 @@ def rollback_deployment(target: str | Path) -> dict[str, Any]:
             if target.exists():
                 if not target.is_dir() or _is_link_or_junction(target):
                     raise ValueError(f"Нельзя отвести не-каталог или ссылку: {target}")
+                if (unsafe := find_unsafe_tree_entry(target)) is not None:
+                    raise ValueError(
+                        f"Текущая папка назначения содержит ссылку или junction: {unsafe}"
+                    )
                 os.replace(target, displaced)
                 current_moved = True
             os.replace(backup, target)
@@ -956,7 +1119,9 @@ def cleanup_deployments(
     apply: bool = False,
     force: bool = False,
 ) -> dict[str, Any]:
-    root = Path(root).resolve()
+    raw_root = Path(root).absolute()
+    _assert_no_link_components(raw_root)
+    root = raw_root.resolve()
     inspected = inspect_deployments(root)
     removed: list[str] = []
     refused: list[dict[str, str]] = []
@@ -978,12 +1143,23 @@ def cleanup_deployments(
                 }
             )
             continue
-        destination_text = item.get("destination")
-        if not destination_text and not force:
+        identity = _transaction_identity(path)
+        if identity is None:
             refused.append(
                 {
                     "path": str(path),
-                    "reason": "Нельзя доказать цель транзакции; используйте --force только после ручной проверки",
+                    "reason": "Имя transaction не содержит штатный UUID; автоматическая очистка запрещена",
+                }
+            )
+            continue
+        if not item.get("metadata_valid") and not force:
+            refused.append(
+                {
+                    "path": str(path),
+                    "reason": (
+                        "Метаданные transaction не прошли проверку; используйте --force "
+                        "только после ручной проверки"
+                    ),
                 }
             )
             continue
@@ -997,19 +1173,78 @@ def cleanup_deployments(
             continue
         planned.append(str(path))
         if apply:
-            if destination_text:
-                destination = Path(str(destination_text)).absolute()
-                _assert_no_link_components(destination)
-                try:
-                    with _deployment_lock(destination.resolve()):
-                        shutil.rmtree(path)
-                except RuntimeError as exc:
-                    refused.append({"path": str(path), "reason": str(exc)})
-                    planned.pop()
-                    continue
-            else:
-                shutil.rmtree(path)
+            _target_name, _transaction_id, derived_target = identity
+            try:
+                _assert_no_link_components(path)
+                resolved_path = path.resolve()
+                if root != resolved_path and root not in resolved_path.parents:
+                    raise ValueError(f"Transaction вышел за проверяемый root: {path}")
+                if (unsafe := find_unsafe_tree_entry(resolved_path)) is not None:
+                    raise ValueError(f"Transaction содержит ссылку или junction: {unsafe}")
+                with _deployment_lock(derived_target):
+                    shutil.rmtree(resolved_path)
+            except (RuntimeError, ValueError, OSError) as exc:
+                refused.append({"path": str(path), "reason": str(exc)})
+                planned.pop()
+                continue
             removed.append(str(path))
+    for raw_lock in inspected["locks"]:
+        lock = Path(raw_lock).absolute()
+        if _is_link_or_junction(lock) or not lock.is_file():
+            refused.append({"path": str(lock), "reason": "Deploy lock является ссылкой или не-файлом"})
+            continue
+        prefix = "."
+        suffix = ".srhd-deploy.lock"
+        target_name = lock.name[len(prefix) : -len(suffix)] if lock.name.startswith(prefix) and lock.name.endswith(suffix) else ""
+        if not target_name or target_name in {".", ".."}:
+            refused.append({"path": str(lock), "reason": "Имя deploy lock не соответствует штатному формату"})
+            continue
+        try:
+            metadata = json.loads(lock.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except (OSError, json.JSONDecodeError):
+            metadata = {}
+        pid = metadata.get("pid")
+        pid_state = _pid_state(pid)
+        if pid_state in {"alive", "unknown"}:
+            refused.append(
+                {
+                    "path": str(lock),
+                    "reason": (
+                        f"Deploy lock принадлежит активному процессу PID {pid}"
+                        if pid_state == "alive"
+                        else f"Нельзя доказать завершение процесса PID {pid}; lock сохранён"
+                    ),
+                }
+            )
+            continue
+        derived_target = lock.parent / target_name
+        metadata_destination = metadata.get("destination")
+        metadata_valid = metadata.get("schema") == DEPLOY_LOCK_SCHEMA
+        if isinstance(metadata_destination, str) and metadata_destination:
+            try:
+                metadata_valid = metadata_valid and Path(metadata_destination).resolve() == derived_target.resolve()
+            except OSError:
+                metadata_valid = False
+        else:
+            metadata_valid = False
+        if not force:
+            reason = "Stale deploy lock удаляется только с явным --force"
+            if not metadata_valid:
+                reason += "; метаданные не прошли проверку"
+            refused.append({"path": str(lock), "reason": reason})
+            continue
+        try:
+            resolved_lock = lock.resolve()
+            if root != resolved_lock.parent and root not in resolved_lock.parents:
+                raise ValueError(f"Deploy lock вышел за проверяемый root: {lock}")
+            planned.append(str(lock))
+            if apply:
+                lock.unlink()
+                removed.append(str(lock))
+        except (OSError, ValueError) as exc:
+            refused.append({"path": str(lock), "reason": str(exc)})
     return {
         "schema": "srhd-modkit-deployment-cleanup-v1",
         "root": str(root),

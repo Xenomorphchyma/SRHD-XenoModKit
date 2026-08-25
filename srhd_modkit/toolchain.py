@@ -38,7 +38,7 @@ from .rsm import RsmProject, inspect_rsm_project
 from .hidden_process import HiddenControlAction, HiddenProcessTimeout, run_on_hidden_desktop
 from .legacy_manifest import ensure_legacy_codepage_executable, legacy_codepage_identity
 from .executable_version import ExecutableVersion, detect_executable_version
-from .safe_io import atomic_write_bytes, publish_files_transactionally
+from .safe_io import atomic_write_bytes, atomic_write_text, publish_files_transactionally
 
 
 EMPTY_RSCRIPT_LANG_DAT = b"\xff\xfe"
@@ -251,21 +251,64 @@ def _project_graph_sha256(project: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+_DECOMPILE_TRANSACTION_RE = re.compile(r"^\.srhd-decompile-(?P<id>[0-9a-f]{32})$")
+
+
+def _path_is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
+def _tree_contains_links(root: Path) -> bool:
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if entry.is_symlink() or _path_is_link_or_junction(path):
+                        return True
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(path)
+        except OSError:
+            return True
+    return False
+
+
 def _cleanup_stale_decompile_transactions(parent: Path, *, older_than_seconds: float = 86400.0) -> list[str]:
-    """Remove only marked ModKit transactions left by an interrupted process."""
+    """Remove only authenticated, link-free ModKit transactions left after a crash."""
 
     removed: list[str] = []
     now = time.time()
     for candidate in parent.glob(".srhd-decompile-*"):
+        match = _DECOMPILE_TRANSACTION_RE.fullmatch(candidate.name)
         marker = candidate / ".srhd-transaction"
-        if not candidate.is_dir() or not marker.is_file():
+        if (
+            match is None
+            or _path_is_link_or_junction(candidate)
+            or _path_is_link_or_junction(marker)
+            or not candidate.is_dir()
+            or not marker.is_file()
+        ):
             continue
         try:
+            metadata = json.loads(marker.read_text(encoding="utf-8"))
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("schema") != "srhd-modkit-decompile-transaction-v1"
+                or metadata.get("id") != match.group("id")
+                or not isinstance(metadata.get("pid"), int)
+                or isinstance(metadata.get("pid"), bool)
+                or int(metadata["pid"]) <= 0
+            ):
+                continue
             if now - marker.stat().st_mtime < older_than_seconds:
+                continue
+            if _tree_contains_links(candidate):
                 continue
             shutil.rmtree(candidate)
             removed.append(str(candidate))
-        except OSError:
+        except (OSError, ValueError, json.JSONDecodeError):
             continue
     return removed
 
@@ -1417,6 +1460,93 @@ class Toolchain:
             fragment = inspect_rscript_lang_fragment(staged_fragment)
             _reject_invalid_rscript_lang_fragment(fragment)
             fragment_sha256 = sha256_file(staged_fragment)
+            forced_output_audit: dict[str, Any] | None = None
+            if process_result.forced_after_outputs:
+                forced_rson = transaction / "forced-output-audit.rson"
+                try:
+                    forced_output_audit = self.decompile_scr(
+                        staged_scr,
+                        forced_rson,
+                        overwrite=True,
+                        decompile_timeout=timeout,
+                        roundtrip_timeout=timeout,
+                    )
+                except Exception as exc:
+                    forced_output_audit = {
+                        "schema": "srhd-modkit-decompile-v1",
+                        "status": "failed",
+                        "verified": False,
+                        "operational_failure": True,
+                        "error": str(exc),
+                    }
+                if not forced_output_audit.get("verified"):
+                    failure = {
+                        "code": "rscript-forced-output-roundtrip-failed",
+                        "message": (
+                            "RScript был завершён после создания выходов, но SCR не прошёл "
+                            "обязательный SCR -> RSON -> SCR round-trip"
+                        ),
+                        "decompile": forced_output_audit,
+                    }
+                    raise ScriptBuildFailure(
+                        failure["message"],
+                        {
+                            "schema": "srhd-modkit-script-build-v1",
+                            "status": "failed",
+                            "source": str(source),
+                            "scr": str(scr_output),
+                            "lang": str(requested_lang_output),
+                            "compiler_started": True,
+                            "compiler_output_created": staged_scr.is_file(),
+                            "language_output_created": staged_fragment.is_file(),
+                            "published_outputs": False,
+                            "failure": failure,
+                        },
+                    )
+                recovered_project = load_rson(forced_rson)
+                source_summary = project.summary()
+                recovered_summary = recovered_project.summary()
+                stable_fields = ("file_version", "objects", "links", "code_lines", "types")
+                if project.name != recovered_project.name or any(
+                    source_summary.get(field) != recovered_summary.get(field)
+                    for field in stable_fields
+                ):
+                    failure = {
+                        "code": "rscript-forced-output-structure-mismatch",
+                        "message": (
+                            "Принудительно завершённый RScript создал SCR, но восстановленный "
+                            "граф не совпал с исходным RSON"
+                        ),
+                        "source_summary": source_summary,
+                        "recovered_summary": recovered_summary,
+                    }
+                    raise ScriptBuildFailure(
+                        failure["message"],
+                        {
+                            "schema": "srhd-modkit-script-build-v1",
+                            "status": "failed",
+                            "source": str(source),
+                            "scr": str(scr_output),
+                            "lang": str(requested_lang_output),
+                            "compiler_started": True,
+                            "compiler_output_created": True,
+                            "language_output_created": staged_fragment.is_file(),
+                            "published_outputs": False,
+                            "failure": failure,
+                        },
+                    )
+                forced_output_audit = {
+                    "schema": "srhd-modkit-forced-rscript-output-audit-v1",
+                    "status": "verified",
+                    "verified": True,
+                    "source_version": forced_output_audit.get("source_version"),
+                    "objects": recovered_summary.get("objects"),
+                    "links": recovered_summary.get("links"),
+                    "code_lines": recovered_summary.get("code_lines"),
+                    "types": recovered_summary.get("types"),
+                    "runtime_issues": forced_output_audit.get("runtime_issues", []),
+                    "temporary_outputs_persisted": False,
+                }
             game_lang: dict[str, Any] | None = None
             staged_lang_dat: Path | None = None
             if requested_lang_dat is not None:
@@ -1517,6 +1647,7 @@ class Toolchain:
                 getattr(process_result, "last_progress_seconds", 0.0), 3
             ),
             "compiler_timeout": timeout_policy,
+            "forced_output_audit": forced_output_audit,
             "runtime_warnings": [
                 issue.as_dict() for issue in runtime_issues if issue.severity == "warning"
             ],
@@ -1693,9 +1824,24 @@ class Toolchain:
 
         destination.parent.mkdir(parents=True, exist_ok=True)
         stale_transactions_removed = _cleanup_stale_decompile_transactions(destination.parent)
-        transaction = destination.parent / f".srhd-decompile-{uuid.uuid4().hex}"
+        transaction_id = uuid.uuid4().hex
+        transaction = destination.parent / f".srhd-decompile-{transaction_id}"
         transaction.mkdir()
-        (transaction / ".srhd-transaction").write_text("decompile-v1\n", encoding="ascii")
+        atomic_write_text(
+            transaction / ".srhd-transaction",
+            json.dumps(
+                {
+                    "schema": "srhd-modkit-decompile-transaction-v1",
+                    "id": transaction_id,
+                    "pid": os.getpid(),
+                    "created_at": time.time(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         recovered = transaction / "recovered.rson"
         phases: list[dict[str, Any]] = [
             {"name": "inspect-source", "status": "passed", "seconds": 0.0}

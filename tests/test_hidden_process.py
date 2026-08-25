@@ -14,12 +14,22 @@ from pathlib import Path
 from srhd_modkit.cli import main
 from srhd_modkit.hidden_process import (
     HiddenProcessTimeout,
+    _abort_window_matches,
     inspect_hidden_processes,
     run_on_hidden_desktop,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class HiddenWindowPatternTests(unittest.TestCase):
+    def test_generic_error_pattern_requires_error_dialog_text(self) -> None:
+        self.assertFalse(_abort_window_matches(("Build completed without errors",), ("Error",)))
+        self.assertTrue(_abort_window_matches(("Error", "File could not be opened"), ("Error",)))
+        self.assertTrue(
+            _abort_window_matches(("Access violation at address 0",), ("Access violation",))
+        )
 
 
 @unittest.skipUnless(os.name == "nt", "private desktops and Job Objects are Windows-only")

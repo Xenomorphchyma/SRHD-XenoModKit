@@ -252,6 +252,9 @@
   компилятора, создания staged SCR и публикации результата исключают ложный
   успех; подтверждённый возврат к главному окну RScript без SCR классифицируется
   как `rscript-build-silent-main-window-stall`.
+  Если RScript пришлось завершить после появления файлов, SCR публикуется
+  только после отдельного `SCR → RSON → SCR` и сравнения структуры с исходным
+  RSON; окно ошибки остаётся ошибкой даже при уже созданном provisional output.
 - Структура релиза: ModuleInfo, небезопасные ссылки, коллизии регистра, мусорные
   файлы, воспроизводимый ZIP, staging и внешние JSON-схемы
   `srhd-modkit-audit-v1`, `srhd-modkit-release-v1`,
@@ -259,8 +262,11 @@
   `srhd-modkit-scr-compare-v1`, `srhd-modkit-rsm-v1`,
   `srhd-modkit-rsm-export-v1`, `srhd-modkit-rsm-build-v1`,
   `srhd-modkit-project-v1`, `srhd-modkit-project-build-v1`,
+  `srhd-modkit-project-provenance-v1`, `srhd-modkit-manifest-v1`,
   `srhd-modkit-project-deploy-v1`, `srhd-modkit-project-publish-v1`,
-  `srhd-modkit-deploy-plan-v1`,
+  `srhd-modkit-deploy-plan-v1`, `srhd-modkit-deploy-v1`,
+  `srhd-modkit-deployment-audit-v1`, `srhd-modkit-deployment-rollback-v1`,
+  `srhd-modkit-deployment-cleanup-v1`,
   `srhd-modkit-process-audit-v1` и
   `srhd-modkit-process-cleanup-v1`.
 - Проектная сборка кэширует отдельные DAT/SCR только по полному отпечатку

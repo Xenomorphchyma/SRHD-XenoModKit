@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-deployment-cleanup-v1",
+  "title": "SRHD ModKit deployment cleanup result",
+  "type": "object",
+  "required": ["schema", "root", "apply", "force", "planned", "removed", "refused", "summary"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-deployment-cleanup-v1"},
+    "root": {"type": "string"},
+    "apply": {"type": "boolean"},
+    "force": {"type": "boolean"},
+    "planned": {"type": "array"},
+    "removed": {"type": "array"},
+    "refused": {"type": "array"},
+    "summary": {"type": "object"}
+  }
+}

@@ -244,6 +244,10 @@ python -B srhd.py release cleanup-transactions "D:/Game/Mods" --apply --json
 сохраняется даже с `--apply`; её можно удалить лишь после rollback либо явно с
 `--apply --force`. Транзакция активного PID не удаляется даже с `--force`, а
 перед удалением ModKit получает lock той же целевой папки.
+Lock, оставшийся после аварийного завершения процесса, также показывается
+`doctor`. Он не удаляется обычным `--apply`: после проверки мёртвого PID нужна
+явная команда `cleanup-transactions --apply --force`. Ссылка или junction под
+видом lock/транзакции никогда не удаляется автоматически.
 
 Служебную очистку проекта сначала просматривают:
 
@@ -261,7 +265,8 @@ python -B srhd.py project clean --build --cache --apply --json
 Основные JSON-схемы:
 
 - `srhd-modkit-project-v1` — конфигурация;
-- `srhd-modkit-project-build-v1` — сборка и provenance;
+- `srhd-modkit-project-build-v1` — результат сборки;
+- `srhd-modkit-project-provenance-v1` — хэши входов, инструменты и provenance;
 - `srhd-modkit-project-deploy-v1` — план и результат цели;
 - `srhd-modkit-project-publish-v1` — единый выпуск;
 - `srhd-modkit-project-init-v1` — найденные связи и предупреждения черновика;
@@ -270,6 +275,8 @@ python -B srhd.py project clean --build --cache --apply --json
 - `srhd-modkit-project-clean-v1` — dry-run/результат очистки;
 - `srhd-modkit-build-cache-v1` — внутренняя проверяемая запись кэша;
 - `srhd-modkit-deploy-plan-v1` — точный dry-run;
+- `srhd-modkit-deploy-v1` — результат точной замены папки;
+- `srhd-modkit-manifest-v1` — файловый SHA-256-манифест;
 - `srhd-modkit-deploy-transaction-v1` — журнал восстановления.
 
 Python API предоставляет `initialize_project`, `load_project`, `plan_project`,

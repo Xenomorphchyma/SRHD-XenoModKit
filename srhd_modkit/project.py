@@ -32,6 +32,7 @@ from .toolchain import Toolchain
 
 PROJECT_SCHEMA = "srhd-modkit-project-v1"
 PROJECT_BUILD_SCHEMA = "srhd-modkit-project-build-v1"
+PROJECT_PROVENANCE_SCHEMA = "srhd-modkit-project-provenance-v1"
 PROJECT_DEPLOY_SCHEMA = "srhd-modkit-project-deploy-v1"
 PROJECT_PUBLISH_SCHEMA = "srhd-modkit-project-publish-v1"
 CACHE_SCHEMA = "srhd-modkit-build-cache-v1"
@@ -235,13 +236,9 @@ def _project_path(
     raw = Path(str(value))
     unresolved = raw.absolute() if raw.is_absolute() else (root / raw).absolute()
     if reject_links:
-        current = unresolved
-        while True:
+        for current in reversed((unresolved, *unresolved.parents)):
             if _is_link_or_junction(current):
                 raise ProjectConfigError(f"{field} проходит через ссылку или junction: {current}")
-            if current == root or root not in current.parents:
-                break
-            current = current.parent
     candidate = unresolved.resolve()
     if not allow_absolute and root != candidate and root not in candidate.parents:
         raise ProjectConfigError(f"{field} вышел за корень проекта: {candidate}")
@@ -444,8 +441,15 @@ def _validate_project_config(path: Path, raw: Mapping[str, Any]) -> None:
     if variants and not isinstance(variants, Mapping):
         raise ProjectConfigError("variants должен быть таблицей")
     if isinstance(variants, Mapping):
+        variant_keys: set[str] = set()
         for name, variant in variants.items():
             _safe_output_component(str(name), f"variants.{name}")
+            folded_name = str(name).casefold()
+            if folded_name in variant_keys:
+                raise ProjectConfigError(
+                    f"Имена variants различаются только регистром Windows: {name!r}"
+                )
+            variant_keys.add(folded_name)
             if not isinstance(variant, Mapping):
                 raise ProjectConfigError(f"variants.{name} должен быть таблицей")
             if variant.get("inherits") is not None and not isinstance(variant.get("inherits"), str):
@@ -1574,7 +1578,7 @@ def build_project(
     cache_hits = sum(item["cache"] == "hit" for item in artifact_results)
     cache_misses = sum(item["cache"] == "miss" for item in artifact_results)
     provenance = {
-        "schema": PROJECT_BUILD_SCHEMA,
+        "schema": PROJECT_PROVENANCE_SCHEMA,
         "project": project.as_dict(),
         "variant": variant_name,
         "variables": variables,

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-project-provenance-v1",
+  "title": "SRHD ModKit project build provenance",
+  "type": "object",
+  "required": ["schema", "project", "variant", "variables", "output", "artifacts", "cache", "tools", "source_manifest", "output_manifest", "audit"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-project-provenance-v1"},
+    "project": {"type": "object"},
+    "variant": {"type": "string"},
+    "variables": {"type": "object"},
+    "output": {"type": "string"},
+    "artifacts": {"type": "array"},
+    "cache": {"type": "object"},
+    "tools": {"type": "array"},
+    "source_manifest": {"type": "object"},
+    "output_manifest": {"type": "object"},
+    "audit": {"type": "object"}
+  }
+}

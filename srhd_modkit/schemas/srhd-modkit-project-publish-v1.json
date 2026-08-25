@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-project-publish-v1",
+  "title": "SRHD ModKit project publication workflow",
+  "type": "object",
+  "required": ["schema", "project", "variant", "build", "release", "deployments", "provenance"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-project-publish-v1"},
+    "project": {"type": "string"},
+    "variant": {"type": "string"},
+    "build": {"type": "object"},
+    "release": {"type": "object"},
+    "deployments": {"type": "array"},
+    "provenance": {"type": "object"},
+    "report": {"type": "string"}
+  }
+}

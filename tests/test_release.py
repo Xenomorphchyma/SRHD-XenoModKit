@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import srhd_modkit.release as release_module
-from srhd_modkit.audit import AuditProfile, AuditReport
+from srhd_modkit.audit import AuditCheck, AuditIssue, AuditProfile, AuditReport
 from srhd_modkit.release import (
     ReleaseBlockedError,
     build_release,
@@ -19,6 +19,7 @@ from srhd_modkit.release import (
     rollback_deployment,
     verify_release_archive,
 )
+from srhd_modkit.schemas import validate_schema_document
 
 
 def _mod(root: Path) -> bytes:
@@ -68,6 +69,8 @@ class ReleaseTests(unittest.TestCase):
             self.assertTrue(first.verified)
             self.assertTrue(first.manifest_path.is_file())
             self.assertTrue(first.audit_path.is_file())
+            self.assertTrue(validate_schema_document(first.as_dict(include_audit=False))["valid"])
+            self.assertTrue(validate_schema_document(first.manifest_path)["valid"])
             with zipfile.ZipFile(first.output) as archive:
                 names = archive.namelist()
                 self.assertNotIn("ReleaseFixture.audit.json", names)
@@ -257,13 +260,14 @@ class ReleaseTests(unittest.TestCase):
             target = base / "Mods" / "Example"
             target.mkdir(parents=True)
             (target / "new.bin").write_bytes(b"new")
-            transaction = target.parent / ".Example.srhd-deploy-test"
+            transaction_id = "a" * 32
+            transaction = target.parent / f".Example.srhd-deploy-{transaction_id}"
             backup = transaction / "previous"
             backup.mkdir(parents=True)
             (backup / "old.bin").write_bytes(b"old")
             metadata = {
                 "schema": "srhd-modkit-deploy-transaction-v1",
-                "id": "test",
+                "id": transaction_id,
                 "state": "rollback-failed",
                 "destination": str(target),
                 "backup": str(backup),
@@ -336,13 +340,14 @@ class ReleaseTests(unittest.TestCase):
             root = Path(name) / "Mods"
             target = root / "Example"
             target.parent.mkdir(parents=True)
-            transaction = root / ".Example.srhd-deploy-live"
+            transaction_id = "b" * 32
+            transaction = root / f".Example.srhd-deploy-{transaction_id}"
             transaction.mkdir()
             (transaction / "transaction.json").write_text(
                 __import__("json").dumps(
                     {
                         "schema": "srhd-modkit-deploy-transaction-v1",
-                        "id": "live",
+                        "id": transaction_id,
                         "state": "preparing",
                         "pid": os.getpid(),
                         "destination": str(target),
@@ -360,13 +365,14 @@ class ReleaseTests(unittest.TestCase):
             root = Path(name) / "Mods"
             target = root / "Example"
             target.parent.mkdir(parents=True)
-            transaction = root / ".Example.srhd-deploy-unknown"
+            transaction_id = "c" * 32
+            transaction = root / f".Example.srhd-deploy-{transaction_id}"
             transaction.mkdir()
             (transaction / "transaction.json").write_text(
                 __import__("json").dumps(
                     {
                         "schema": "srhd-modkit-deploy-transaction-v1",
-                        "id": "unknown",
+                        "id": transaction_id,
                         "state": "staged",
                         "pid": 987654,
                         "destination": str(target),
@@ -380,6 +386,116 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(result["summary"]["refused"], 1)
             self.assertIn("Нельзя доказать", result["refused"][0]["reason"])
             self.assertTrue(transaction.is_dir())
+
+    def test_rollback_ignores_forged_backup_path_from_transaction_json(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "Mods"
+            target = root / "Example"
+            target.mkdir(parents=True)
+            (target / "current.bin").write_bytes(b"current")
+            external = Path(name) / "outside"
+            external.mkdir()
+            (external / "victim.bin").write_bytes(b"outside")
+            transaction_id = "e" * 32
+            transaction = root / f".Example.srhd-deploy-{transaction_id}"
+            backup = transaction / "previous"
+            backup.mkdir(parents=True)
+            (backup / "safe.bin").write_bytes(b"safe")
+            (transaction / "transaction.json").write_text(
+                __import__("json").dumps(
+                    {
+                        "schema": "srhd-modkit-deploy-transaction-v1",
+                        "id": transaction_id,
+                        "state": "rollback-failed",
+                        "destination": str(target),
+                        "backup": str(external),
+                        "staged": str(external),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = rollback_deployment(target)
+            self.assertTrue(result["restored"])
+            self.assertEqual((target / "safe.bin").read_bytes(), b"safe")
+            self.assertEqual((external / "victim.bin").read_bytes(), b"outside")
+
+    def test_deploy_lock_symlink_is_rejected_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            mod = base / "ReleaseFixture"
+            _mod(mod)
+            mods = base / "Mods"
+            mods.mkdir()
+            victim = base / "victim.txt"
+            victim.write_text("unchanged", encoding="utf-8")
+            lock = mods / ".ReleaseFixture.srhd-deploy.lock"
+            try:
+                os.symlink(victim, lock)
+            except OSError as exc:
+                self.skipTest(f"Символические ссылки недоступны: {exc}")
+            with self.assertRaisesRegex(ValueError, "lock|ссылк"):
+                deploy_mod(mod, mods)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "unchanged")
+
+    def test_stale_deploy_lock_requires_force_and_can_be_cleaned_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "Mods"
+            root.mkdir()
+            target = root / "Example"
+            lock = root / ".Example.srhd-deploy.lock"
+            lock.write_text(
+                __import__("json").dumps(
+                    {
+                        "schema": "srhd-modkit-deploy-lock-v1",
+                        "pid": 987654,
+                        "destination": str(target),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("srhd_modkit.release._pid_state", return_value="dead"):
+                preview = cleanup_deployments(root)
+                self.assertEqual(preview["summary"]["refused"], 1)
+                self.assertTrue(lock.is_file())
+                cleaned = cleanup_deployments(root, apply=True, force=True)
+            self.assertEqual(cleaned["summary"]["removed"], 1)
+            self.assertFalse(lock.exists())
+
+    def test_release_reaudits_exact_staged_distribution(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            mod = base / "ReleaseFixture"
+            _mod(mod)
+            clean = AuditReport(str(mod), AuditProfile.RELEASE, ())
+            issue = AuditIssue("error", "staged-only-error", "Ошибка точного состава")
+            blocked = AuditReport(
+                str(mod),
+                AuditProfile.RELEASE,
+                (AuditCheck("staged", "issues", (issue,)),),
+            )
+            with patch(
+                "srhd_modkit.release.audit_mod",
+                side_effect=(clean, blocked),
+            ):
+                with self.assertRaises(ReleaseBlockedError) as caught:
+                    build_release(mod, base / "blocked.zip")
+            self.assertEqual(caught.exception.report.issues[0].code, "staged-only-error")
+            self.assertFalse((base / "blocked.zip").exists())
+
+    def test_require_complete_is_opt_in_for_passthrough_formats(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            mod = base / "ReleaseFixture"
+            _mod(mod)
+            normal = build_release(mod, base / "normal.zip")
+            self.assertFalse(normal.report.coverage_complete)
+            with self.assertRaisesRegex(ReleaseBlockedError, "audit-coverage-incomplete"):
+                build_release(
+                    mod,
+                    base / "strict.zip",
+                    require_complete=True,
+                )
 
 
 if __name__ == "__main__":

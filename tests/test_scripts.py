@@ -46,6 +46,12 @@ class RsonTests(unittest.TestCase):
             result = project.search_code("HullHP")
             self.assertEqual(result[0]["object_id"], 2)
 
+    def test_boolean_object_id_is_rejected_as_non_integer_json_value(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0]["Operations"][0]["#"] = True
+        issues = RsonProject(data, Path("boolean-id.rson")).validate()
+        self.assertIn("rson-object-id", {issue.code for issue in issues})
+
     def test_titem_requires_items_collection_and_place_field(self) -> None:
         valid = deepcopy(SAMPLE)
         valid["Visual.Objects"][0]["Items"] = [

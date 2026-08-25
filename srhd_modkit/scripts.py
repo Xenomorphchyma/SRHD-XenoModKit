@@ -209,7 +209,11 @@ class RsonProject:
         raise KeyError(f"Объект с #={object_id} не найден")
 
     def next_object_id(self) -> int:
-        identifiers = [item.get("#") for item in self.iter_objects() if isinstance(item.get("#"), int)]
+        identifiers = [
+            item.get("#")
+            for item in self.iter_objects()
+            if isinstance(item.get("#"), int) and not isinstance(item.get("#"), bool)
+        ]
         return max(identifiers, default=-1) + 1
 
     def clone_object(self, object_id: int, *, name: str | None = None) -> dict[str, Any]:
@@ -521,7 +525,7 @@ class RsonProject:
         identifiers: list[int] = []
         for index, item in enumerate(objects):
             location = f"object[{index}]"
-            if not isinstance(item.get("#"), int):
+            if not isinstance(item.get("#"), int) or isinstance(item.get("#"), bool):
                 issues.append(ScriptIssue("error", "rson-object-id", "У объекта нет целочисленного #", location))
             else:
                 identifiers.append(item["#"])

@@ -127,6 +127,11 @@ python -B srhd.py release deploy C:\Work\MyMod "C:\Games\Space Rangers HD\Mods" 
 внутри него. Существующая целевая папка заменяется только при явном
 `--overwrite`; это точная замена, поэтому файлы, удалённые из проекта, не
 сохраняются от прежней сборки. Исходники исключены по умолчанию.
+Release staging is audited again after all excludes are applied. A source
+`Source/.../Main.txt` does not replace runtime `CFG/Main.dat`, and symlinks or
+junctions are rejected instead of silently omitted. Unknown formats remain
+non-blocking by default; CI can opt into `--require-complete`. Failed audit
+execution is exposed as `operational_failure=true` and exit code 3.
 
 Для постоянной разработки удобнее один раз добавить проектный файл, а затем
 использовать короткие команды:
