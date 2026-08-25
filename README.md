@@ -19,18 +19,22 @@ Headless modding toolkit for **Space Rangers HD: A War Apart** / **Космич�
 - детерминированно собирать подтверждённые разновидности `GAI` и `PKG`;
 - нативно читать, проверять, редактировать через JSON и собирать текстовые квесты `QM/QMM` без TGE;
 - анализировать зависимости и конфликты активного набора модов;
+- собирать варианты проекта, кэшировать дорогие компиляции и публиковать папку/ZIP из одного `srhd-modkit.toml`;
 - сохранять неизвестные форматы побайтно и отмечать неполное покрытие.
 
-ModKit разворачивает мод в игру только по явной команде `release deploy`, не
-изменяет `ModCFG.txt` и не требует GUI.
+ModKit разворачивает мод в игру только по явной `release deploy`,
+`project deploy` либо настроенной `project publish`, не изменяет `ModCFG.txt`
+и не требует GUI.
 
 ### Что изменилось в 0.9.9
 
-- Добавлена `release deploy` для проверенного headless-развёртывания готового мода непосредственно в корень `Mods` игры или в `Builds`.
-- Deploy по умолчанию исключает `SOURCE`/`SOURCES`, RSON/RSM/SVR и известные служебные текстовые исходники; `--include-sources` оставляет их для отладочной копии.
-- `--overwrite` выполняет полную транзакционную замену дерева вместо копирования поверх старой папки. Новый состав предварительно проверяется по SHA-256, устаревшие файлы исчезают, а при сбое прежняя папка восстанавливается.
-- Для ZIP добавлен симметричный режим `release build --strip-sources`; без флага сохранено совместимое поведение открытого релиза с исходниками.
-- Deploy не запускает игру, не включает мод и не меняет `ModCFG.txt`.
+- Добавлен декларативный `srhd-modkit.toml`: артефакты `TXT → DAT`, `RSON/RSM → SCR`, ресурсы, варианты и цели развёртывания описываются один раз; локальные пути остаются в игнорируемом `srhd-modkit.local.toml`.
+- Новые `project build`, `project deploy` и `project publish` собирают исходники, выполняют release-аудит и создают игровую папку, ZIP, manifest, audit и provenance из одного проверенного состава.
+- Безопасный кэш компиляции учитывает SHA-256 всех входов, языковых баз, связанных файлов, параметров, версий и исполняемых файлов инструментов. Кэшированный результат перед публикацией всегда проверяется заново.
+- Варианты с `inherits`, `overlays`, `include`, `exclude` и переменными позволяют держать release/test/diagnostic в одном проекте без копий всего каталога.
+- `release plan` и `release deploy --dry-run` показывают точные добавления, изменения, удаления, исключённые исходники, целевую папку и аудит до изменения цели.
+- Deploy выполняет полную транзакционную замену без старых файлов. `doctor deployments`, `release rollback` и `release cleanup-transactions` позволяют увидеть и явно восстановить/очистить прерванную операцию; резервная копия не удаляется неявно.
+- `release build --strip-sources` и обычный deploy исключают `SOURCE`/`SOURCES`, RSON/RSM/SVR, project TOML и известные служебные исходники. Игра и `ModCFG.txt` автоматически не запускаются и не меняются.
 
 ## Быстрый старт
 
@@ -114,6 +118,7 @@ python -B srhd.py audit C:\Mods\MyMod --profile dev --json
 ```powershell
 python -B srhd.py release check C:\Mods\MyMod --json
 python -B srhd.py release build C:\Mods\MyMod C:\Releases\MyMod.zip --json
+python -B srhd.py release plan C:\Work\MyMod "C:\Games\Space Rangers HD\Mods" --prefix OtherMods/MyMod --json
 python -B srhd.py release deploy C:\Work\MyMod "C:\Games\Space Rangers HD\Mods" --prefix OtherMods/MyMod --overwrite --json
 ```
 
@@ -121,6 +126,19 @@ python -B srhd.py release deploy C:\Work\MyMod "C:\Games\Space Rangers HD\Mods" 
 внутри него. Существующая целевая папка заменяется только при явном
 `--overwrite`; это точная замена, поэтому файлы, удалённые из проекта, не
 сохраняются от прежней сборки. Исходники исключены по умолчанию.
+
+Для постоянной разработки удобнее один раз добавить проектный файл, а затем
+использовать короткие команды:
+
+```powershell
+python -B srhd.py project validate
+python -B srhd.py project build --variant earth-test --json
+python -B srhd.py project deploy --variant earth-test --target game --dry-run --json
+python -B srhd.py project publish --variant release --json
+```
+
+Полная схема, варианты, кэш, цели и восстановление описаны в
+[руководстве по проектной сборке](PROJECTS_RU.md).
 
 Безопасная рабочая копия:
 
@@ -229,6 +247,7 @@ python -B srhd.py compat "C:\Games\Space Rangers HD\Mods\ModCFG.txt" `
 - [Архитектура аудита и границы форматов](AUDIT_RU.md)
 - [Скриптинг SRHD и runtime-lint](SCRIPTING_GUIDE_RU.md)
 - [Текстовые квесты QM/QMM](QUESTS_RU.md)
+- [Проектная сборка, варианты, кэш и deploy](PROJECTS_RU.md)
 - [Внешние инструменты и SHA-256](THIRD_PARTY_TOOLS_RU.md)
 - [Уведомления о сторонних исследованиях форматов](THIRD_PARTY_NOTICES.md)
 - [Авторство](AUTHORS.md)
@@ -249,7 +268,7 @@ $srhd-modkit
 python -B -m unittest discover -s tests -v
 ```
 
-Текущий набор из 293 тестов проверяет нативные PNG/GI, лексический preflight,
+Текущий набор из 325 тестов проверяет нативные PNG/GI, лексический preflight,
 прогресс-зависимые таймауты, fail-closed декомпиляцию, глубокий round-trip,
 RScript 4.10f/4.15f, RSM/rsmc, BlockPar 2.1 и завершение скрытого дерева
 процессов при обрыве агента, а также

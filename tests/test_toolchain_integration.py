@@ -13,6 +13,7 @@ from pathlib import Path
 from srhd_modkit.cli import main
 from srhd_modkit.formats import inspect_file
 from srhd_modkit.image_codec import RgbaImage, read_png, write_png
+from srhd_modkit.project import build_project
 from srhd_modkit.scripts import inspect_scr, load_rson
 from srhd_modkit.toolchain import Toolchain, _replace_cross_device_safe
 
@@ -175,6 +176,88 @@ class ToolchainIntegrationTests(unittest.TestCase):
                 "[t_OnEnteringForm,t_OnPlayerBuyEq|]",
                 inspect_scr(scr)["event_signatures"],
             )
+
+    def test_project_cache_reuses_real_audited_rscript_compilation(self) -> None:
+        rscript = self.chain.tools["rscript"].path
+        source_svr = self.chain.tools["rscript410"].path.parent / "LastOneHP.svr"
+        if not rscript.is_file() or not source_svr.is_file():
+            self.skipTest("RScript 4.15f или legacy-проверочный SVR не найден")
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            mod = root / "RuntimeMod"
+            mod.mkdir()
+            (mod / "ModuleInfo.txt").write_text(
+                "Name=ProjectRScriptFixture\nSection=Test\nPriority=1\nLanguages=Rus\n",
+                encoding="cp1251",
+            )
+            source = root / "Source" / "LastOneHP.rson"
+            source.parent.mkdir()
+            self.chain.convert_script_project(source_svr, source)
+            (root / "srhd-modkit.toml").write_text(
+                """\
+schema = "srhd-modkit-project-v1"
+name = "ProjectRScriptFixture"
+mod_root = "RuntimeMod"
+prefix = "ProjectRScriptFixture"
+allow = ["main-dat-missing"]
+
+[[artifacts]]
+id = "worker"
+kind = "rson"
+source = "Source/LastOneHP.rson"
+output = "DATA/Script/LastOneHP.scr"
+""",
+                encoding="utf-8",
+            )
+
+            first = build_project(root, tools_root=self.chain.tools_root)
+            self.assertEqual(first.cache_misses, 1)
+            self.assertTrue(
+                inspect_scr(first.output / "DATA" / "Script" / "LastOneHP.scr")[
+                    "supported_version"
+                ]
+            )
+            second = build_project(root, tools_root=self.chain.tools_root)
+            self.assertEqual(second.cache_hits, 1)
+            self.assertTrue(second.deploy.verified)
+
+    def test_project_cache_reuses_real_semantically_checked_dat_compilation(self) -> None:
+        if not self.chain.tools["blockpar"].path.is_file():
+            self.skipTest("BlockParEditor не найден")
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            mod = root / "RuntimeMod"
+            mod.mkdir()
+            (mod / "ModuleInfo.txt").write_text(
+                "Name=ProjectDatFixture\nSection=Test\nPriority=1\nLanguages=Rus\n",
+                encoding="cp1251",
+            )
+            source = root / "Source" / "Config.txt"
+            source.parent.mkdir()
+            source.write_bytes((Path(__file__).parent / "fixtures" / "unicode_blockpar.txt").read_bytes())
+            (root / "srhd-modkit.toml").write_text(
+                """\
+schema = "srhd-modkit-project-v1"
+name = "ProjectDatFixture"
+mod_root = "RuntimeMod"
+prefix = "ProjectDatFixture"
+
+[[artifacts]]
+id = "config"
+kind = "dat"
+source = "Source/Config.txt"
+output = "CFG/Config.dat"
+""",
+                encoding="utf-8",
+            )
+
+            first = build_project(root, tools_root=self.chain.tools_root)
+            self.assertEqual(first.cache_misses, 1)
+            self.assertTrue((first.output / "CFG" / "Config.dat").is_file())
+            self.assertFalse((first.output / "SOURCE").exists())
+            second = build_project(root, tools_root=self.chain.tools_root)
+            self.assertEqual(second.cache_hits, 1)
+            self.assertTrue(second.deploy.verified)
 
     def test_rscript_decompiles_scr_headlessly_and_roundtrips(self) -> None:
         rscript = self.chain.tools["rscript"].path

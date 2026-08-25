@@ -54,7 +54,16 @@ from .runtime_lint import (
 )
 from .validation import validate_collection
 from .audit import AuditProfile, AuditReport, audit_collection, audit_mod
-from .release import ReleaseBlockedError, build_release, deploy_mod
+from .release import (
+    ReleaseBlockedError,
+    build_release,
+    cleanup_deployments,
+    deploy_mod,
+    inspect_deployments,
+    plan_deploy,
+    rollback_deployment,
+)
+from .project import build_project, deploy_project, load_project, publish_project
 from .compat import analyze_modset
 from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
 
@@ -235,7 +244,46 @@ def cmd_release_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_deploy_plan(plan: Any) -> None:
+    print(f"Цель: {plan.destination}")
+    print(
+        f"Добавится: {len(plan.added)}; изменится: {len(plan.changed)}; "
+        f"удалится: {len(plan.removed)}; без изменений: {len(plan.identical)}"
+    )
+    print(f"Исключено из сборки: {len(plan.excluded)}")
+    for label, values in (
+        ("ДОБАВИТЬ", plan.added),
+        ("ИЗМЕНИТЬ", plan.changed),
+        ("УДАЛИТЬ", plan.removed),
+        ("ИСКЛЮЧИТЬ", plan.excluded),
+    ):
+        for value in values:
+            print(f"{label:10} {value}")
+    if plan.report.issues:
+        _print_audit_report(plan.report)
+
+
+def cmd_release_plan(args: argparse.Namespace) -> int:
+    plan = plan_deploy(
+        args.mod,
+        args.destination_root,
+        prefix=args.prefix,
+        exclude=args.exclude,
+        strip_sources=not args.include_sources,
+        tools_root=args.tools_root,
+        allow=args.allow,
+        warnings_as_errors=args.warnings_as_errors,
+    )
+    if args.json:
+        print_json(plan.as_dict())
+    else:
+        _print_deploy_plan(plan)
+    return 2 if plan.blocked else 0
+
+
 def cmd_release_deploy(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        return cmd_release_plan(args)
     try:
         result = deploy_mod(
             args.mod,
@@ -264,6 +312,129 @@ def cmd_release_deploy(args: argparse.Namespace) -> int:
         print(f"Устаревших файлов удалено: {result.stale_files_removed}")
         print(f"Папка повторно проверена: {'да' if result.verified else 'НЕТ'}")
         print("ModCFG.txt не изменялся")
+    return 0
+
+
+def cmd_release_rollback(args: argparse.Namespace) -> int:
+    result = rollback_deployment(args.target)
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Восстановлено: {result['target']}")
+        if result.get("displaced_current"):
+            print(f"Сменённая копия сохранена: {result['displaced_current']}")
+        print(f"Для удаления транзакции используйте cleanup-transactions: {result['transaction']}")
+    return 0
+
+
+def cmd_release_cleanup_transactions(args: argparse.Namespace) -> int:
+    result = cleanup_deployments(args.root, apply=args.apply, force=args.force)
+    if args.json:
+        print_json(result)
+    else:
+        action = "Удалено" if args.apply else "Будет удалено с --apply"
+        print(f"{action}: {len(result['removed']) if args.apply else len(result['planned'])}")
+        for path in result["removed"] if args.apply else result["planned"]:
+            print(path)
+        for item in result["refused"]:
+            print(f"СОХРАНЕНО {item['path']}: {item['reason']}")
+    return 0 if not result["refused"] else 2
+
+
+def cmd_doctor_deployments(args: argparse.Namespace) -> int:
+    result = inspect_deployments(args.root)
+    if args.json:
+        print_json(result)
+    else:
+        print(
+            f"Транзакций: {result['summary']['transactions']}; "
+            f"доступно восстановление: {result['summary']['recoverable']}; "
+            f"lock-файлов: {result['summary']['locks']}"
+        )
+        for item in result["transactions"]:
+            print(
+                f"{item['state']:18} {item['path']} "
+                f"backup={'да' if item['backup_exists'] else 'нет'}"
+            )
+    return 0
+
+
+def cmd_project_validate(args: argparse.Namespace) -> int:
+    project = load_project(args.project)
+    if args.json:
+        print_json(project.as_dict())
+    else:
+        print(f"Проект: {project.name}")
+        print(f"Конфигурация: {project.path}")
+        print(f"Корень мода: {project.mod_root}")
+        print(f"Варианты: {', '.join(project.as_dict()['variants']) or 'default'}")
+        print(f"Артефакты: {len(project.artifacts)}; цели: {len(project.targets)}")
+    return 0
+
+
+def cmd_project_build(args: argparse.Namespace) -> int:
+    result = build_project(
+        args.project,
+        variant=args.variant,
+        use_cache=not args.no_cache,
+        tools_root=args.tools_root,
+        warnings_as_errors=args.warnings_as_errors,
+        allow=args.allow,
+    )
+    if args.json:
+        print_json(result.as_dict())
+    else:
+        print(f"Собрано: {result.output}")
+        print(f"Вариант: {result.variant}; артефактов: {len(result.artifacts)}")
+        print(f"Кэш: {result.cache_hits} попаданий, {result.cache_misses} новых сборок")
+        print(f"Provenance: {result.provenance_path}")
+    return 0
+
+
+def cmd_project_deploy(args: argparse.Namespace) -> int:
+    result = deploy_project(
+        args.project,
+        variant=args.variant,
+        target=args.target,
+        dry_run=args.dry_run,
+        use_cache=not args.no_cache,
+        tools_root=args.tools_root,
+        warnings_as_errors=args.warnings_as_errors,
+        allow=args.allow,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Проект: {result['project']}; variant: {result['variant']}")
+        if args.dry_run:
+            plan = result["plan"]
+            print(
+                f"Dry-run: +{plan['summary']['added']} ~{plan['summary']['changed']} "
+                f"-{plan['summary']['removed']}; цель {plan['destination']}"
+            )
+        else:
+            print(f"Развёрнуто: {result['deploy']['destination']}")
+    return 0
+
+
+def cmd_project_publish(args: argparse.Namespace) -> int:
+    result = publish_project(
+        args.project,
+        variant=args.variant,
+        output=args.output,
+        targets=args.target if args.target else None,
+        use_cache=not args.no_cache,
+        tools_root=args.tools_root,
+        warnings_as_errors=args.warnings_as_errors,
+        allow=args.allow,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Архив: {result['release']['output']}")
+        print(f"SHA-256: {result['release']['sha256']}")
+        print(f"Развёрнуто целей: {len(result['deployments'])}")
+        print(f"Отчёт: {result['report']}")
     return 0
 
 
@@ -2272,6 +2443,28 @@ def build_parser() -> argparse.ArgumentParser:
     release_build.add_argument("--json", action="store_true")
     release_build.set_defaults(func=cmd_release_build)
 
+    release_plan = release_sub.add_parser(
+        "plan",
+        help="Показать точный план развёртывания без изменения целевой папки",
+    )
+    release_plan.add_argument("mod", help="Корень готового мода с ModuleInfo.txt")
+    release_plan.add_argument("destination_root", help="Папка Mods игры либо корень Builds")
+    release_plan.add_argument(
+        "--prefix",
+        help="Точный путь внутри destination_root, например OtherMods/MyMod",
+    )
+    release_plan.add_argument("--exclude", action="append", default=[])
+    release_plan.add_argument("--allow", action="append", default=[])
+    release_plan.add_argument("--warnings-as-errors", action="store_true")
+    release_plan.add_argument(
+        "--include-sources",
+        action="store_true",
+        help="Сохранить SOURCE/SOURCES и известные исходники",
+    )
+    release_plan.add_argument("--tools-root")
+    release_plan.add_argument("--json", action="store_true")
+    release_plan.set_defaults(func=cmd_release_plan)
+
     release_deploy = release_sub.add_parser(
         "deploy",
         help="Проверить и развернуть игровую папку мода без слияния со старой",
@@ -2295,9 +2488,85 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Полностью заменить существующую целевую папку после staging-проверки",
     )
+    release_deploy.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Только показать добавляемые, изменяемые, удаляемые и исключённые файлы",
+    )
     release_deploy.add_argument("--tools-root")
     release_deploy.add_argument("--json", action="store_true")
     release_deploy.set_defaults(func=cmd_release_deploy)
+
+    release_rollback = release_sub.add_parser(
+        "rollback",
+        help="Восстановить сохранённую копию прерванного развёртывания",
+    )
+    release_rollback.add_argument("target", help="Точная целевая папка мода")
+    release_rollback.add_argument("--json", action="store_true")
+    release_rollback.set_defaults(func=cmd_release_rollback)
+
+    release_cleanup = release_sub.add_parser(
+        "cleanup-transactions",
+        help="Показать или явно удалить завершённые транзакции развёртывания",
+    )
+    release_cleanup.add_argument("root", help="Корень Builds, Mods или родитель целевого мода")
+    release_cleanup.add_argument(
+        "--apply",
+        action="store_true",
+        help="Фактически удалить безопасные завершённые транзакции",
+    )
+    release_cleanup.add_argument(
+        "--force",
+        action="store_true",
+        help="С --apply удалить также транзакции с сохранённой резервной копией",
+    )
+    release_cleanup.add_argument("--json", action="store_true")
+    release_cleanup.set_defaults(func=cmd_release_cleanup_transactions)
+
+    project = sub.add_parser("project", help="Собрать, проверить и выпустить мод по srhd-modkit.toml")
+    project_sub = project.add_subparsers(dest="project_command", required=True)
+
+    project_validate = project_sub.add_parser("validate", help="Проверить конфигурацию проекта")
+    project_validate.add_argument("project", nargs="?", default=".")
+    project_validate.add_argument("--json", action="store_true")
+    project_validate.set_defaults(func=cmd_project_validate)
+
+    project_build = project_sub.add_parser("build", help="Собрать проверенную игровую папку варианта")
+    project_build.add_argument("project", nargs="?", default=".")
+    project_build.add_argument("--variant")
+    project_build.add_argument("--no-cache", action="store_true")
+    project_build.add_argument("--allow", action="append", default=[])
+    project_build.add_argument("--warnings-as-errors", action="store_true")
+    project_build.add_argument("--tools-root")
+    project_build.add_argument("--json", action="store_true")
+    project_build.set_defaults(func=cmd_project_build)
+
+    project_deploy = project_sub.add_parser("deploy", help="Собрать и развернуть выбранный вариант")
+    project_deploy.add_argument("project", nargs="?", default=".")
+    project_deploy.add_argument("--variant")
+    project_deploy.add_argument("--target", help="Имя цели из [targets]; иначе default_target")
+    project_deploy.add_argument("--dry-run", action="store_true")
+    project_deploy.add_argument("--no-cache", action="store_true")
+    project_deploy.add_argument("--allow", action="append", default=[])
+    project_deploy.add_argument("--warnings-as-errors", action="store_true")
+    project_deploy.add_argument("--tools-root")
+    project_deploy.add_argument("--json", action="store_true")
+    project_deploy.set_defaults(func=cmd_project_deploy)
+
+    project_publish = project_sub.add_parser(
+        "publish",
+        help="Из одной проверенной сборки создать ZIP, отчёты и игровые папки",
+    )
+    project_publish.add_argument("project", nargs="?", default=".")
+    project_publish.add_argument("--variant")
+    project_publish.add_argument("--output", help="Путь ZIP; иначе используется [publish].output")
+    project_publish.add_argument("--target", action="append", default=[], help="Цель из [targets]; можно повторять")
+    project_publish.add_argument("--no-cache", action="store_true")
+    project_publish.add_argument("--allow", action="append", default=[])
+    project_publish.add_argument("--warnings-as-errors", action="store_true")
+    project_publish.add_argument("--tools-root")
+    project_publish.add_argument("--json", action="store_true")
+    project_publish.set_defaults(func=cmd_project_publish)
 
     compare = sub.add_parser("compare", help="Точно сравнить две папки")
     compare.add_argument("left")
@@ -2443,6 +2712,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor_processes.add_argument("--json", action="store_true")
     doctor_processes.set_defaults(func=cmd_doctor_processes)
+
+    doctor_deployments = doctor_sub.add_parser(
+        "deployments",
+        help="Найти прерванные транзакции и доступные резервные копии",
+    )
+    doctor_deployments.add_argument("root", help="Корень Builds, Mods или родитель целевого мода")
+    doctor_deployments.add_argument("--json", action="store_true")
+    doctor_deployments.set_defaults(func=cmd_doctor_deployments)
 
     convert = sub.add_parser("convert", help="Безопасно преобразовать GI <-> PNG")
     convert.add_argument("direction", choices=("gi-png", "png-gi"))

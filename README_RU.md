@@ -7,8 +7,8 @@
 Локальная Python-библиотека и командная строка для безопасной работы с модами
 Space Rangers HD. Запускается на Python 3.12+ и не требует установки пакетов.
 
-Библиотека меняет папку игры только по явной команде `release deploy` и никогда
-не меняет `ModCFG.txt`. Она работает в указанном пользователем каталоге,
+Библиотека меняет папку игры только по явной `release deploy`, `project deploy`
+либо настроенной `project publish` и никогда не меняет `ModCFG.txt`. Она работает в указанном пользователем каталоге,
 сохраняет неизвестные бинарные файлы без изменений и никогда не объявляет
 закрытый формат «преобразованным», если штатный инструмент не подтвердил результат.
 
@@ -18,11 +18,12 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 
 ## Новое в 0.9.9
 
-- Добавлена headless-команда `release deploy`: она проводит полный релизный аудит и разворачивает готовый мод прямо в указанный корень `Mods` либо `Builds`.
-- При deploy исходники по умолчанию исключаются: верхнеуровневые `SOURCE`/`SOURCES`, RSON/RSM/SVR и служебные `*.source.txt`/`*.lang.txt` не попадают в игровую папку. Для отладочной копии доступен явный `--include-sources`.
-- Повторный deploy с `--overwrite` не сливает каталоги. Новое дерево сначала собирается рядом, сверяется по SHA-256, прежнее дерево целиком отводится в резерв и только затем заменяется. Поэтому удалённые из проекта файлы не остаются в `Builds` или игре; при ошибке прежняя папка восстанавливается.
-- `release build --strip-sources` создаёт ZIP без исходников по тем же правилам. Обычный `release build` сохраняет прежнее поведение для открытых исходных релизов.
-- `release deploy` не запускает игру, не включает мод и не изменяет `ModCFG.txt`.
+- `srhd-modkit.toml` описывает мод, варианты, компилируемые артефакты, языковые базы, ресурсы и цели; локальные пути вынесены в непубликуемый `srhd-modkit.local.toml`.
+- `project build/deploy/publish` создают игровую папку, ZIP, manifest, audit и provenance из одного проверенного состава. Release/test/diagnostic наследуются без копирования всего дерева.
+- Безопасный кэш учитывает все входные SHA-256, параметры и точные версии/хэши внешних инструментов; кэшированный результат всё равно повторно проходит SCR/DAT и release-аудит.
+- `release plan` и `release deploy --dry-run` заранее показывают добавленные, изменённые, удаляемые и исключённые файлы вместе с точной целью и аудитом.
+- Deploy выполняет полную транзакционную замену. `doctor deployments`, `release rollback` и `release cleanup-transactions` дают явное восстановление и очистку; единственная резервная копия автоматически не удаляется.
+- Исходники, включая project TOML, по умолчанию не попадают в игровую папку. Игра не запускается, мод не включается и `ModCFG.txt` не изменяется.
 
 ## Поддержка форматов
 
@@ -112,6 +113,8 @@ python srhd.py formats D:\path\file.dat --hash
 python srhd.py audit D:\work\MyMod --profile dev
 python srhd.py release check D:\work\MyMod
 python srhd.py release build D:\work\MyMod D:\Releases\MyMod.zip
+python srhd.py release plan D:\work\MyMod "D:\Game\Mods" `
+  --prefix OtherMods/MyMod
 python srhd.py release deploy D:\work\MyMod "D:\Game\Mods" `
   --prefix OtherMods/MyMod --overwrite
 python srhd.py compat "D:\Game\Mods\ModCFG.txt" --mods-root "D:\Game\Mods"
@@ -135,6 +138,20 @@ python srhd.py compat "D:\Game\Mods\ModCFG.txt" --mods-root "D:\Game\Mods"
 только с `--overwrite`, причём это полная проверенная замена, а не копирование
 поверх старых файлов. Для сохранения исходников используйте `--include-sources`.
 Команда не читает и не записывает `ModCFG.txt`.
+
+Для постоянно разрабатываемого мода предпочтителен декларативный workflow:
+
+```powershell
+python -B srhd.py project validate
+python -B srhd.py project build --variant earth-test --json
+python -B srhd.py project deploy --variant earth-test --target game --dry-run --json
+python -B srhd.py project publish --variant release --json
+```
+
+Общий `srhd-modkit.toml` можно публиковать, а путь к игре и инструментам держать
+в игнорируемом `srhd-modkit.local.toml`. Схема артефактов, наследование
+вариантов, правила кэша и восстановление транзакций описаны в
+[PROJECTS_RU.md](PROJECTS_RU.md).
 
 `compat` читает ModCFG без изменений, строит зависимости и циклы, различает
 идентичные, бинарные, языковые, скриптовые и BlockPar-пересечения. Порядок
@@ -571,7 +588,7 @@ ModKit через GitHub.
 python -B -m unittest discover -s tests -v
 ```
 
-В наборе из 293 тестов используются нативные PNG/GI/QM/QMM-кодеки, RSM/rsmc и локальные BlockParEditor/RScript:
+В наборе из 325 тестов используются нативные PNG/GI/QM/QMM-кодеки, RSM/rsmc и локальные BlockParEditor/RScript:
 проверяют пиксель-в-пиксель круговой проход RGBA8, все три режима GI, CRC,
 палитры и Adam7, ASCII/Unicode DAT,
 события TState в собранном SCR, runtime-блокировки, граф RSON, аудит/релиз,

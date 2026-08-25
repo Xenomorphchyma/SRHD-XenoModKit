@@ -11,7 +11,11 @@ from srhd_modkit.audit import AuditProfile, AuditReport
 from srhd_modkit.release import (
     ReleaseBlockedError,
     build_release,
+    cleanup_deployments,
     deploy_mod,
+    inspect_deployments,
+    plan_deploy,
+    rollback_deployment,
     verify_release_archive,
 )
 
@@ -89,15 +93,20 @@ class ReleaseTests(unittest.TestCase):
             source.mkdir()
             (source / "project.source.txt").write_text("source", encoding="utf-8")
             (root / "LOOSE.RSM").write_text("source", encoding="utf-8")
+            (root / "srhd-modkit.toml").write_text("schema='test'", encoding="utf-8")
+            (root / "srhd-modkit.local.toml").write_text("secret='local'", encoding="utf-8")
 
             normal = build_release(root, base / "normal.zip")
             stripped = build_release(root, base / "stripped.zip", strip_sources=True)
 
             with zipfile.ZipFile(normal.output) as archive:
                 self.assertIn("ReleaseFixture/Source/project.source.txt", archive.namelist())
+                self.assertIn("ReleaseFixture/srhd-modkit.toml", archive.namelist())
             with zipfile.ZipFile(stripped.output) as archive:
                 self.assertNotIn("ReleaseFixture/Source/project.source.txt", archive.namelist())
                 self.assertNotIn("ReleaseFixture/LOOSE.RSM", archive.namelist())
+                self.assertNotIn("ReleaseFixture/srhd-modkit.toml", archive.namelist())
+                self.assertNotIn("ReleaseFixture/srhd-modkit.local.toml", archive.namelist())
                 self.assertIn("ReleaseFixture/DATA/opaque.cmap", archive.namelist())
             self.assertTrue(stripped.strip_sources)
 
@@ -162,7 +171,7 @@ class ReleaseTests(unittest.TestCase):
                 manifest = original_build_manifest(path, *args, **kwargs)
                 if Path(path).resolve() == destination.resolve():
                     destination_reads += 1
-                    if destination_reads == 2:
+                    if destination_reads == 3:
                         manifest = {**manifest, "files": []}
                 return manifest
 
@@ -196,7 +205,7 @@ class ReleaseTests(unittest.TestCase):
                 manifest = original_build_manifest(path, *args, **kwargs)
                 if Path(path).resolve() == destination.resolve():
                     destination_reads += 1
-                    if destination_reads == 2:
+                    if destination_reads == 3:
                         manifest = {**manifest, "files": []}
                 return manifest
 
@@ -215,6 +224,68 @@ class ReleaseTests(unittest.TestCase):
             transactions = list(destination.parent.glob(".ReleaseFixture.srhd-deploy-*"))
             self.assertEqual(len(transactions), 1)
             self.assertEqual((transactions[0] / "previous" / "old-only.bin").read_bytes(), b"old")
+
+    def test_deploy_plan_is_read_only_and_lists_exact_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "ReleaseFixture"
+            _mod(root)
+            source = root / "SOURCE"
+            source.mkdir()
+            (source / "project.rson").write_bytes(b"source")
+            mods_root = base / "Mods"
+            destination = mods_root / "ReleaseFixture"
+            destination.mkdir(parents=True)
+            (destination / "ModuleInfo.txt").write_text("old", encoding="cp1251")
+            (destination / "stale.bin").write_bytes(b"stale")
+
+            report = AuditReport(str(root), AuditProfile.RELEASE, ())
+            with patch("srhd_modkit.release.audit_mod", return_value=report):
+                plan = plan_deploy(root, mods_root)
+
+            self.assertFalse(plan.blocked)
+            self.assertIn("DATA/opaque.cmap", plan.added)
+            self.assertIn("ModuleInfo.txt", plan.changed)
+            self.assertIn("stale.bin", plan.removed)
+            self.assertIn("SOURCE/project.rson", plan.excluded)
+            self.assertTrue((destination / "stale.bin").is_file())
+
+    def test_doctor_can_rollback_and_cleanup_preserved_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            target = base / "Mods" / "Example"
+            target.mkdir(parents=True)
+            (target / "new.bin").write_bytes(b"new")
+            transaction = target.parent / ".Example.srhd-deploy-test"
+            backup = transaction / "previous"
+            backup.mkdir(parents=True)
+            (backup / "old.bin").write_bytes(b"old")
+            metadata = {
+                "schema": "srhd-modkit-deploy-transaction-v1",
+                "id": "test",
+                "state": "rollback-failed",
+                "destination": str(target),
+                "backup": str(backup),
+                "staged": str(transaction / "new"),
+            }
+            (transaction / "transaction.json").write_text(
+                __import__("json").dumps(metadata), encoding="utf-8"
+            )
+
+            inspected = inspect_deployments(base / "Mods")
+            self.assertEqual(inspected["summary"]["recoverable"], 1)
+            preview = cleanup_deployments(base / "Mods")
+            self.assertEqual(preview["summary"]["refused"], 1)
+            self.assertTrue(transaction.is_dir())
+
+            rollback = rollback_deployment(target)
+            self.assertTrue(rollback["restored"])
+            self.assertEqual((target / "old.bin").read_bytes(), b"old")
+            self.assertTrue(Path(rollback["displaced_current"]).is_dir())
+
+            cleanup = cleanup_deployments(base / "Mods", apply=True)
+            self.assertEqual(cleanup["summary"]["removed"], 1)
+            self.assertFalse(transaction.exists())
 
     def test_archive_verifier_rejects_parent_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as name:
