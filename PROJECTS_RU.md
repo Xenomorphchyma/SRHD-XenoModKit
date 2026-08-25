@@ -1,19 +1,29 @@
 # Проектная сборка SRHD ModKit
 
-`srhd-modkit.toml` сводит сборку мода к четырём headless-командам:
+`srhd-modkit.toml` сводит сборку мода к короткому headless-workflow:
 
 ```powershell
+python -B srhd.py project init "D:/Work/ExistingMod" --json
+python -B srhd.py project plan --variant release --json
+python -B srhd.py project doctor --json
 python -B srhd.py project validate
 python -B srhd.py project build --variant release --json
 python -B srhd.py project deploy --variant earth-test --target game --dry-run --json
 python -B srhd.py project publish --variant release --json
+python -B srhd.py project clean --json
 ```
 
-`project build` создаёт точную игровую папку без исходников. `project deploy`
+`project init` один раз создаёт консервативный черновик конфигурации вокруг
+существующего мода. `project plan` и `doctor` ничего не компилируют и не
+оставляют staging-каталогов. `project build` создаёт точную игровую папку без исходников. `project deploy`
 собирает её и безопасно заменяет выбранную цель. `project publish` один раз
 собирает проверенный состав, затем из него создаёт ZIP, `*.manifest.json`,
 `*.audit.json`, provenance сборки и все настроенные игровые папки. Ни одна
 команда не запускает игру и не меняет `ModCFG.txt`.
+
+Неоднозначные TXT/DAT или несколько RSON с общей языковой базой `project init`
+оставляет в предупреждениях. Такой черновик загружается ModKit, но спорные
+правила сборки следует один раз уточнить вручную в TOML.
 
 ## Минимальный проект
 
@@ -158,6 +168,17 @@ variants = ["earth-test", "diagnostic"]
 
 ## План и транзакционное развёртывание
 
+До компиляции можно увидеть ключи кэша и точный будущий состав:
+
+```powershell
+python -B srhd.py project plan --variant earth-test --json
+python -B srhd.py project doctor --variant earth-test --json
+```
+
+`project plan` объясняет cache miss через изменение входов, параметров,
+инструментов или движка кэша. `project doctor` дополнительно проверяет пути,
+цели, обязательные инструменты, размер кэша и оставшиеся `.srhd-*`.
+
 Перед изменением папки игры:
 
 ```powershell
@@ -192,6 +213,17 @@ python -B srhd.py release cleanup-transactions "D:/Game/Mods" --apply --json
 сохраняется даже с `--apply`; её можно удалить лишь после rollback либо явно с
 `--apply --force`.
 
+Служебную очистку проекта сначала просматривают:
+
+```powershell
+python -B srhd.py project clean --json
+python -B srhd.py project clean --build --cache --json
+python -B srhd.py project clean --build --cache --apply --json
+```
+
+Без `--apply` ничего не удаляется. По умолчанию в план попадают только
+служебные workspace старше суток; build/cache добавляются отдельными флагами.
+
 ## Результаты
 
 Основные JSON-схемы:
@@ -200,10 +232,15 @@ python -B srhd.py release cleanup-transactions "D:/Game/Mods" --apply --json
 - `srhd-modkit-project-build-v1` — сборка и provenance;
 - `srhd-modkit-project-deploy-v1` — план и результат цели;
 - `srhd-modkit-project-publish-v1` — единый выпуск;
+- `srhd-modkit-project-init-v1` — найденные связи и предупреждения черновика;
+- `srhd-modkit-project-plan-v1` — пересборки, cache hit/miss и файловый состав;
+- `srhd-modkit-project-doctor-v1` — инструменты, пути, кэш и workspace;
+- `srhd-modkit-project-clean-v1` — dry-run/результат очистки;
 - `srhd-modkit-build-cache-v1` — внутренняя проверяемая запись кэша;
 - `srhd-modkit-deploy-plan-v1` — точный dry-run;
 - `srhd-modkit-deploy-transaction-v1` — журнал восстановления.
 
-Python API предоставляет `load_project`, `build_project`, `deploy_project`,
+Python API предоставляет `initialize_project`, `load_project`, `plan_project`,
+`doctor_project`, `clean_project`, `build_project`, `deploy_project`,
 `publish_project`, `plan_deploy`, `inspect_deployments`, `rollback_deployment`
 и `cleanup_deployments`.

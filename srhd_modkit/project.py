@@ -657,12 +657,35 @@ class ArtifactCache:
                 "path": entry,
                 "key": key,
                 "identity": (variant, identifier),
+                "fingerprint": fingerprint,
                 "files": expected_files,
                 "bytes": expected_size,
                 "modified": entry.stat().st_mtime,
             }
         except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, ProjectConfigError):
             return None
+
+    def probe(self, key: str) -> dict[str, Any] | None:
+        """Return a verified cache record without restoring files or touching LRU state."""
+
+        return self._record(self._entry(key), verify_files=True)
+
+    def latest(self, variant: str, artifact_id: str) -> dict[str, Any] | None:
+        """Return the newest readable fingerprint for one logical artifact."""
+
+        if not self.root.is_dir() or self.root.is_symlink():
+            return None
+        matches: list[dict[str, Any]] = []
+        for bucket in self.root.iterdir():
+            if not bucket.is_dir() or bucket.is_symlink() or len(bucket.name) != 2:
+                continue
+            for entry in bucket.iterdir():
+                if not entry.is_dir() or entry.is_symlink():
+                    continue
+                record = self._record(entry)
+                if record is not None and record["identity"] == (variant, artifact_id):
+                    matches.append(record)
+        return max(matches, key=lambda item: item["modified"]) if matches else None
 
     def maintain(self, *, protected_keys: Sequence[str] = ()) -> dict[str, Any]:
         """Remove stale/invalid derived cache data and bound retained history."""

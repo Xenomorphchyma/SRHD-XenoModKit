@@ -106,6 +106,10 @@ from .project import (
     publish_project,
     resolve_project_target,
 )
+from .project_ops import clean_project, doctor_project, initialize_project, plan_project
+from .upgrade import check_upgrade
+from .language import build_language, diff_languages, extract_language, language_coverage
+from .schemas import list_schemas, load_schema, validate_schema_document
 from .compat import ModSetReport, OverlayCollision, OverlayOwner, analyze_modset
 from .image_codec import (
     analyze_alpha_geometry,
@@ -252,6 +256,18 @@ __all__ = [
     "load_project",
     "publish_project",
     "resolve_project_target",
+    "initialize_project",
+    "plan_project",
+    "doctor_project",
+    "clean_project",
+    "check_upgrade",
+    "extract_language",
+    "build_language",
+    "diff_languages",
+    "language_coverage",
+    "list_schemas",
+    "load_schema",
+    "validate_schema_document",
     "ModSetReport",
     "OverlayCollision",
     "OverlayOwner",
@@ -300,4 +316,4 @@ __all__ = [
     "build_quest_from_json",
 ]
 
-__version__ = "0.9.9"
+__version__ = "0.10.0"

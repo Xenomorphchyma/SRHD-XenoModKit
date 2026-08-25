@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xenomorphchyma.github.io/SRHD-XenoModKit/schema/srhd-modkit-modset-v1.json",
+  "title": "SRHD ModKit mod-set report",
+  "type": "object",
+  "required": ["schema", "config", "mods_root", "load_order", "collisions", "issues", "summary"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-modset-v1"},
+    "config": {"type": "string"},
+    "mods_root": {"type": "string"},
+    "load_order": {"type": "array", "items": {"type": "object"}},
+    "collisions": {"type": "array", "items": {"type": "object"}},
+    "issues": {"type": "array", "items": {"type": "object"}},
+    "summary": {"type": "object"}
+  },
+  "additionalProperties": true
+}

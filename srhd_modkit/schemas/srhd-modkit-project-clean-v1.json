@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xenomorphchyma.github.io/SRHD-XenoModKit/schema/srhd-modkit-project-clean-v1.json",
+  "title": "SRHD ModKit project cleanup result",
+  "type": "object",
+  "required": ["schema", "project", "apply", "planned", "removed", "summary"],
+  "properties": {"schema": {"const": "srhd-modkit-project-clean-v1"}, "project": {"type": "string"}, "apply": {"type": "boolean"}, "planned": {"type": "array"}, "removed": {"type": "array"}, "summary": {"type": "object"}},
+  "additionalProperties": true
+}

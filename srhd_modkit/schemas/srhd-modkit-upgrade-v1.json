@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xenomorphchyma.github.io/SRHD-XenoModKit/schema/srhd-modkit-upgrade-v1.json",
+  "title": "SRHD ModKit upgrade compatibility report",
+  "type": "object",
+  "required": ["schema", "old", "new", "compatible", "tree", "scripts", "issues", "summary"],
+  "properties": {"schema": {"const": "srhd-modkit-upgrade-v1"}, "old": {"type": "string"}, "new": {"type": "string"}, "compatible": {"type": "boolean"}, "tree": {"type": "object"}, "scripts": {"type": "object"}, "issues": {"type": "array"}, "summary": {"type": "object"}},
+  "additionalProperties": true
+}

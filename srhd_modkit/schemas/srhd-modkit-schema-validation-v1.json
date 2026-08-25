@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xenomorphchyma.github.io/SRHD-XenoModKit/schema/srhd-modkit-schema-validation-v1.json",
+  "title": "SRHD ModKit schema validation result",
+  "type": "object",
+  "required": ["schema", "document_schema", "valid", "errors"],
+  "properties": {"schema": {"const": "srhd-modkit-schema-validation-v1"}, "document_schema": {"type": "string"}, "valid": {"type": "boolean"}, "errors": {"type": "array"}},
+  "additionalProperties": true
+}

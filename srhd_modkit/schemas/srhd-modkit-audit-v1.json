@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xenomorphchyma.github.io/SRHD-XenoModKit/schema/srhd-modkit-audit-v1.json",
+  "title": "SRHD ModKit audit report",
+  "type": "object",
+  "required": ["schema", "target", "profile", "coverage_complete", "summary", "checks", "issues"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-audit-v1"},
+    "target": {"type": "string"},
+    "profile": {"enum": ["dev", "release"]},
+    "coverage_complete": {"type": "boolean"},
+    "summary": {"type": "object"},
+    "checks": {"type": "array", "items": {"type": "object"}},
+    "issues": {"type": "array", "items": {"type": "object"}}
+  },
+  "additionalProperties": true
+}

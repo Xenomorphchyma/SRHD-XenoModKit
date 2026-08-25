@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xenomorphchyma.github.io/SRHD-XenoModKit/schema/srhd-modkit-project-init-v1.json",
+  "title": "SRHD ModKit project initialization result",
+  "type": "object",
+  "required": ["schema", "mod", "output", "artifacts", "issues", "summary"],
+  "properties": {"schema": {"const": "srhd-modkit-project-init-v1"}, "mod": {"type": "string"}, "output": {"type": "string"}, "artifacts": {"type": "array"}, "issues": {"type": "array"}, "summary": {"type": "object"}},
+  "additionalProperties": true
+}

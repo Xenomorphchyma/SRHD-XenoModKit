@@ -739,15 +739,64 @@ def inspect_hidden_processes() -> dict[str, object]:
             kernel32.CloseHandle(snapshot)
 
     process_snapshot = _snapshot_processes(kernel32)
-    desktops: list[dict[str, object]] = []
-    all_process_ids: set[int] = set()
+    rows: dict[str, list[dict[str, object]]] = {}
     for name in sorted(desktop_names, key=str.casefold):
         processes: list[dict[str, object]] = []
         for process_id in sorted(process_ids.get(name, ())):
-            all_process_ids.add(process_id)
-            details = process_snapshot.get(process_id, {"pid": process_id, "parent_pid": None, "name": None})
+            details = process_snapshot.get(process_id)
+            if details is None and not _process_is_running(kernel32, process_id):
+                # Thread enumeration can briefly retain a terminating thread
+                # after its process has already reached the signalled state.
+                continue
+            details = details or {"pid": process_id, "parent_pid": None, "name": None}
             processes.append(details)
-        desktops.append({"name": name, "processes": processes})
+        rows[name] = processes
+
+    # Sample names again after the more expensive thread/process snapshots so
+    # a short helper that started during inspection is still observable.
+    refreshed: set[str] = set()
+
+    @desktop_callback_type
+    def refreshed_callback(name: str, _parameter: int) -> bool:
+        if name.startswith(_HIDDEN_DESKTOP_PREFIX):
+            refreshed.add(name)
+        return True
+
+    if not user32.EnumDesktopsW(station, refreshed_callback, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+    for name in refreshed:
+        rows.setdefault(name, [])
+
+    empty_names = {name for name, processes in rows.items() if not processes}
+    if empty_names:
+        # A desktop with no enumerable process may either host a console-less
+        # helper whose thread is not visible to this process, or be a transient
+        # name left while Windows releases the final desktop handle. A short
+        # second sample preserves live Task Manager visibility without turning
+        # that normal release race into a false leftover warning.
+        time.sleep(0.05)
+        final_names: set[str] = set()
+
+        @desktop_callback_type
+        def final_callback(name: str, _parameter: int) -> bool:
+            if name.startswith(_HIDDEN_DESKTOP_PREFIX):
+                final_names.add(name)
+            return True
+
+        if not user32.EnumDesktopsW(station, final_callback, 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+        for name in empty_names - final_names:
+            rows.pop(name, None)
+
+    desktops = [
+        {"name": name, "processes": rows[name]}
+        for name in sorted(rows, key=str.casefold)
+    ]
+    all_process_ids = {
+        int(item["pid"])
+        for processes in rows.values()
+        for item in processes
+    }
     return {
         "schema": "srhd-modkit-process-audit-v1",
         "status": "issues" if desktops else "passed",
@@ -765,6 +814,8 @@ def terminate_hidden_processes() -> dict[str, object]:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.QueryFullProcessImageNameW.argtypes = [
         wintypes.HANDLE,
         wintypes.DWORD,
@@ -855,6 +906,8 @@ def _configure_snapshot_api(kernel32: ctypes.WinDLL) -> None:
     kernel32.Process32NextW.restype = wintypes.BOOL
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.QueryFullProcessImageNameW.argtypes = [
         wintypes.HANDLE,
         wintypes.DWORD,
@@ -907,6 +960,16 @@ def _snapshot_processes(kernel32: ctypes.WinDLL) -> dict[int, dict[str, object]]
     finally:
         kernel32.CloseHandle(snapshot)
     return result
+
+
+def _process_is_running(kernel32: ctypes.WinDLL, process_id: int) -> bool:
+    handle = kernel32.OpenProcess(_SYNCHRONIZE, False, process_id)
+    if not handle:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _query_process_image(kernel32: ctypes.WinDLL, handle: wintypes.HANDLE) -> str | None:

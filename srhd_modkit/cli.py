@@ -64,6 +64,10 @@ from .release import (
     rollback_deployment,
 )
 from .project import build_project, deploy_project, load_project, publish_project
+from .project_ops import clean_project, doctor_project, initialize_project, plan_project
+from .upgrade import check_upgrade
+from .language import build_language, diff_languages, extract_language, language_coverage
+from .schemas import list_schemas, load_schema, validate_schema_document
 from .compat import analyze_modset
 from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
 
@@ -372,6 +376,92 @@ def cmd_project_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_project_init(args: argparse.Namespace) -> int:
+    result = initialize_project(
+        args.mod,
+        output=args.output,
+        name=args.name,
+        prefix=args.prefix,
+        overwrite=args.overwrite,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Создан черновик: {result['output']}")
+        print(f"Найдено артефактов: {result['summary']['artifacts']}")
+        for issue in result["issues"]:
+            print(f"{issue['severity'].upper():7} {issue['code']}: {issue['message']}")
+    return 0
+
+
+def cmd_project_plan(args: argparse.Namespace) -> int:
+    result = plan_project(args.project, variant=args.variant, tools_root=args.tools_root)
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Проект: {result['project']}; вариант: {result['variant']}")
+        print(f"Build: {result['destinations']['build']}")
+        if result["destinations"].get("release"):
+            print(f"ZIP: {result['destinations']['release']}")
+        for target in result["destinations"]["targets"]:
+            if target["status"] == "configured":
+                print(f"Цель {target['name']}: {target['destination']}")
+            else:
+                print(f"Цель {target['name']}: не настроена ({target['reason']})")
+        for artifact in result["artifacts"]:
+            reasons = ", ".join(artifact.get("reasons", []))
+            print(
+                f"{'CACHE' if artifact.get('cache') == 'hit' else 'BUILD':5} "
+                f"{artifact['id']} ({artifact['kind']}){': ' + reasons if reasons else ''}"
+            )
+        print("Игровой состав:")
+        for path in result["files"]["game"]:
+            print(f"  {path}")
+        if result["files"]["excluded"]:
+            print("Исключены из выпуска:")
+            for path in result["files"]["excluded"]:
+                print(f"  {path}")
+        for issue in result["issues"]:
+            print(f"{issue['severity'].upper():7} {issue['code']}: {issue['message']}")
+    return 2 if result["blocked"] else 0
+
+
+def cmd_project_doctor(args: argparse.Namespace) -> int:
+    result = doctor_project(args.project, variant=args.variant, tools_root=args.tools_root)
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Проект исправен: {'да' if result['healthy'] else 'НЕТ'}")
+        print(
+            f"Кэш: {result['cache']['files']} файлов, "
+            f"{human_size(result['cache']['bytes'])}; "
+            f"оставшихся workspace: {len(result['workspaces'])}"
+        )
+        for issue in result["issues"]:
+            print(f"{issue['severity'].upper():7} {issue['code']}: {issue['message']}")
+    return 0 if result["healthy"] else 2
+
+
+def cmd_project_clean(args: argparse.Namespace) -> int:
+    result = clean_project(
+        args.project,
+        apply=args.apply,
+        build=args.build,
+        cache=args.cache,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        action = "Удалено" if args.apply else "Найдено; для удаления добавьте --apply"
+        print(
+            f"{action}: {result['summary']['candidates']} каталогов, "
+            f"{result['summary']['files']} файлов, {human_size(result['summary']['bytes'])}"
+        )
+        for item in result["removed"] if args.apply else result["planned"]:
+            print(item if isinstance(item, str) else item["path"])
+    return 0
+
+
 def cmd_project_build(args: argparse.Namespace) -> int:
     result = build_project(
         args.project,
@@ -443,6 +533,111 @@ def cmd_project_publish(args: argparse.Namespace) -> int:
         print(f"Развёрнуто целей: {len(result['deployments'])}")
         print(f"Отчёт: {result['report']}")
     return 0
+
+
+def cmd_release_upgrade_check(args: argparse.Namespace) -> int:
+    result = check_upgrade(
+        args.old,
+        args.new,
+        tools_root=args.tools_root,
+        deep_scripts=args.deep_scripts,
+        audit=not args.no_audit,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        summary = result["summary"]
+        print(
+            f"Обновление: ошибок {summary['errors']}, предупреждений {summary['warnings']}; "
+            f"файлов +{summary['added_files']} ~{summary['changed_files']} -{summary['removed_files']}"
+        )
+        for issue in result["issues"]:
+            print(f"{issue['severity'].upper():7} {issue['code']}: {issue['message']}")
+    return 0 if result["compatible"] else 2
+
+
+def cmd_lang_extract(args: argparse.Namespace) -> int:
+    result = extract_language(
+        args.source,
+        args.output,
+        tools_root=args.tools_root,
+        overwrite=args.overwrite,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Язык извлечён: {args.output}")
+    return 0
+
+
+def cmd_lang_build(args: argparse.Namespace) -> int:
+    result = build_language(
+        args.source,
+        args.output,
+        tools_root=args.tools_root,
+        overwrite=args.overwrite,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Lang.dat собран и проверен: {args.output}")
+    return 0
+
+
+def cmd_lang_diff(args: argparse.Namespace) -> int:
+    result = diff_languages(args.left, args.right, tools_root=args.tools_root)
+    if args.json:
+        print_json(result)
+    else:
+        summary = result["summary"]
+        print(
+            f"Языковые ключи: +{summary['added']} -{summary['removed']} "
+            f"~{summary['changed']} ={summary['unchanged']}"
+        )
+        for item in result["changed"]:
+            print(f"ИЗМЕНЕНО {item['path']}")
+    summary = result["summary"]
+    return 1 if summary["added"] or summary["removed"] or summary["changed"] else 0
+
+
+def cmd_lang_coverage(args: argparse.Namespace) -> int:
+    result = language_coverage(args.mod, base=args.base, tools_root=args.tools_root)
+    if args.json:
+        print_json(result)
+    else:
+        print(
+            f"Языков: {result['summary']['languages']}; ошибок {result['summary']['errors']}; "
+            f"предупреждений {result['summary']['warnings']}"
+        )
+        for issue in result["issues"]:
+            print(f"{issue['severity'].upper():7} {issue['code']}: {issue['message']}")
+    return 0 if result["valid"] else 2
+
+
+def cmd_schema_list(args: argparse.Namespace) -> int:
+    result = list_schemas()
+    if args.json:
+        print_json({"schemas": result})
+    else:
+        for item in result:
+            print(f"{item['name']}\t{item['title']}")
+    return 0
+
+
+def cmd_schema_show(args: argparse.Namespace) -> int:
+    print_json(load_schema(args.name))
+    return 0
+
+
+def cmd_schema_validate(args: argparse.Namespace) -> int:
+    result = validate_schema_document(args.document, name=args.name)
+    if args.json:
+        print_json(result)
+    else:
+        print(f"JSON соответствует схеме: {'да' if result['valid'] else 'НЕТ'}")
+        for error in result["errors"]:
+            print(f"{error['path']}: {error['message']} ({error['code']})")
+    return 0 if result["valid"] else 2
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
@@ -2387,7 +2582,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.9.9")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.10.0")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -2530,13 +2725,56 @@ def build_parser() -> argparse.ArgumentParser:
     release_cleanup.add_argument("--json", action="store_true")
     release_cleanup.set_defaults(func=cmd_release_cleanup_transactions)
 
+    release_upgrade = release_sub.add_parser(
+        "upgrade-check",
+        help="Свести проверки совместимости обновления старой и новой версии мода",
+    )
+    release_upgrade.add_argument("old", help="Каталог старой версии мода")
+    release_upgrade.add_argument("new", help="Каталог новой версии мода")
+    release_upgrade.add_argument("--deep-scripts", action="store_true", help="Выполнить медленный SCR round-trip")
+    release_upgrade.add_argument("--no-audit", action="store_true", help="Не запускать полный release-аудит обеих папок")
+    release_upgrade.add_argument("--tools-root")
+    release_upgrade.add_argument("--json", action="store_true")
+    release_upgrade.set_defaults(func=cmd_release_upgrade_check)
+
     project = sub.add_parser("project", help="Собрать, проверить и выпустить мод по srhd-modkit.toml")
     project_sub = project.add_subparsers(dest="project_command", required=True)
+
+    project_init = project_sub.add_parser("init", help="Создать консервативный черновик проекта из готового мода")
+    project_init.add_argument("mod")
+    project_init.add_argument("--output")
+    project_init.add_argument("--name")
+    project_init.add_argument("--prefix")
+    project_init.add_argument("--overwrite", action="store_true")
+    project_init.add_argument("--json", action="store_true")
+    project_init.set_defaults(func=cmd_project_init)
 
     project_validate = project_sub.add_parser("validate", help="Проверить конфигурацию проекта")
     project_validate.add_argument("project", nargs="?", default=".")
     project_validate.add_argument("--json", action="store_true")
     project_validate.set_defaults(func=cmd_project_validate)
+
+    project_plan = project_sub.add_parser("plan", help="Показать сборку, кэш и точный игровой состав без компиляции")
+    project_plan.add_argument("project", nargs="?", default=".")
+    project_plan.add_argument("--variant")
+    project_plan.add_argument("--tools-root")
+    project_plan.add_argument("--json", action="store_true")
+    project_plan.set_defaults(func=cmd_project_plan)
+
+    project_doctor = project_sub.add_parser("doctor", help="Проверить инструменты, пути, кэш и служебные каталоги")
+    project_doctor.add_argument("project", nargs="?", default=".")
+    project_doctor.add_argument("--variant")
+    project_doctor.add_argument("--tools-root")
+    project_doctor.add_argument("--json", action="store_true")
+    project_doctor.set_defaults(func=cmd_project_doctor)
+
+    project_clean = project_sub.add_parser("clean", help="Показать очистку; удалять только с явным --apply")
+    project_clean.add_argument("project", nargs="?", default=".")
+    project_clean.add_argument("--build", action="store_true", help="Также включить build_root")
+    project_clean.add_argument("--cache", action="store_true", help="Также включить cache_root")
+    project_clean.add_argument("--apply", action="store_true", help="Выполнить показанное удаление")
+    project_clean.add_argument("--json", action="store_true")
+    project_clean.set_defaults(func=cmd_project_clean)
 
     project_build = project_sub.add_parser("build", help="Собрать проверенную игровую папку варианта")
     project_build.add_argument("project", nargs="?", default=".")
@@ -2574,6 +2812,53 @@ def build_parser() -> argparse.ArgumentParser:
     project_publish.add_argument("--tools-root")
     project_publish.add_argument("--json", action="store_true")
     project_publish.set_defaults(func=cmd_project_publish)
+
+    lang = sub.add_parser("lang", help="Извлечь, собрать и сверить игровые языковые DAT")
+    lang_sub = lang.add_subparsers(dest="lang_command", required=True)
+
+    lang_extract = lang_sub.add_parser("extract", help="Преобразовать Lang.dat в Lang.txt")
+    lang_extract.add_argument("source")
+    lang_extract.add_argument("output")
+    lang_extract.add_argument("--overwrite", action="store_true")
+    lang_extract.add_argument("--tools-root")
+    lang_extract.add_argument("--json", action="store_true")
+    lang_extract.set_defaults(func=cmd_lang_extract)
+
+    lang_build = lang_sub.add_parser("build", help="Собрать и семантически проверить Lang.dat")
+    lang_build.add_argument("source")
+    lang_build.add_argument("output")
+    lang_build.add_argument("--overwrite", action="store_true")
+    lang_build.add_argument("--tools-root")
+    lang_build.add_argument("--json", action="store_true")
+    lang_build.set_defaults(func=cmd_lang_build)
+
+    lang_diff = lang_sub.add_parser("diff", help="Сравнить ключи и значения двух Lang DAT/TXT")
+    lang_diff.add_argument("left")
+    lang_diff.add_argument("right")
+    lang_diff.add_argument("--tools-root")
+    lang_diff.add_argument("--json", action="store_true")
+    lang_diff.set_defaults(func=cmd_lang_diff)
+
+    lang_coverage = lang_sub.add_parser("coverage", help="Проверить языки ModuleInfo, ключи, пустые значения и code stubs")
+    lang_coverage.add_argument("mod")
+    lang_coverage.add_argument("--base", help="Базовый язык из ModuleInfo, например Rus")
+    lang_coverage.add_argument("--tools-root")
+    lang_coverage.add_argument("--json", action="store_true")
+    lang_coverage.set_defaults(func=cmd_lang_coverage)
+
+    schema = sub.add_parser("schema", help="Показать и проверить машинные JSON Schema ModKit")
+    schema_sub = schema.add_subparsers(dest="schema_command", required=True)
+    schema_list = schema_sub.add_parser("list", help="Перечислить поставляемые схемы")
+    schema_list.add_argument("--json", action="store_true")
+    schema_list.set_defaults(func=cmd_schema_list)
+    schema_show = schema_sub.add_parser("show", help="Вывести JSON Schema")
+    schema_show.add_argument("name")
+    schema_show.set_defaults(func=cmd_schema_show)
+    schema_validate = schema_sub.add_parser("validate", help="Проверить JSON-отчёт по его полю schema")
+    schema_validate.add_argument("document")
+    schema_validate.add_argument("--name", help="Явно выбрать схему вместо поля schema")
+    schema_validate.add_argument("--json", action="store_true")
+    schema_validate.set_defaults(func=cmd_schema_validate)
 
     compare = sub.add_parser("compare", help="Точно сравнить две папки")
     compare.add_argument("left")

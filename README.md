@@ -1,4 +1,4 @@
-# SRHD XenoModKit 0.9.9
+# SRHD XenoModKit 0.10.0
 
 Headless modding toolkit for **Space Rangers HD: A War Apart** / **Космические рейнджеры HD: Революция**.
 
@@ -26,15 +26,15 @@ ModKit разворачивает мод в игру только по явно�
 `project deploy` либо настроенной `project publish`, не изменяет `ModCFG.txt`
 и не требует GUI.
 
-### Что изменилось в 0.9.9
+### Что изменилось в 0.10.0
 
-- Добавлен декларативный `srhd-modkit.toml`: артефакты `TXT → DAT`, `RSON/RSM → SCR`, ресурсы, варианты и цели развёртывания описываются один раз; локальные пути остаются в игнорируемом `srhd-modkit.local.toml`.
-- Новые `project build`, `project deploy` и `project publish` собирают исходники, выполняют release-аудит и создают игровую папку, ZIP, manifest, audit и provenance из одного проверенного состава.
-- Безопасный кэш компиляции учитывает SHA-256 всех входов, языковых баз, связанных файлов, параметров, версий и исполняемых файлов инструментов. Кэшированный результат перед публикацией всегда проверяется заново; старые ревизии автоматически ограничены тремя на артефакт/вариант, 256 записями и 2 ГиБ суммарно, а текущая сборка не удаляется.
-- Варианты с `inherits`, `overlays`, `include`, `exclude` и переменными позволяют держать release/test/diagnostic в одном проекте без копий всего каталога.
-- `release plan` и `release deploy --dry-run` показывают точные добавления, изменения, удаления, исключённые исходники, целевую папку и аудит до изменения цели.
-- Deploy выполняет полную транзакционную замену без старых файлов. `doctor deployments`, `release rollback` и `release cleanup-transactions` позволяют увидеть и явно восстановить/очистить прерванную операцию; резервная копия не удаляется неявно.
-- `release build --strip-sources` и обычный deploy исключают `SOURCE`/`SOURCES`, RSON/RSM/SVR, project TOML и известные служебные исходники. Игра и `ModCFG.txt` автоматически не запускаются и не меняются.
+- `project init` создаёт консервативный черновик `srhd-modkit.toml` из существующего мода; неоднозначные связи отмечаются, а не угадываются.
+- `project plan`, `project doctor` и безопасный `project clean` показывают пересборки, причины cache miss, итоговый игровой состав, инструменты, размер кэша и оставшиеся `.srhd-*`; удаление выполняется только с `--apply`.
+- `release upgrade-check OLD NEW` объединяет изменения ModuleInfo, persistent-схемы, runtime-имён/SAV-кэша, SCR, Main/CacheData/Lang и удалённых ресурсов. Глубокий SCR round-trip включается отдельно.
+- Команды `lang extract/build/diff/coverage` дают короткий workflow для нескольких языков, отсутствующих ключей, пустых значений и RScript code stubs.
+- Реальные JSON Schema для audit, release, project и modset поставляются внутри Python-пакета; `schema list/show/validate` доступны без сторонних зависимостей.
+- Планирование и диагностика не компилируют мод и не оставляют постоянные staging-файлы; кэш и сборки сохраняют прежние автоматические лимиты.
+- Диагностика скрытых legacy-процессов отфильтровывает уже завершившиеся Windows desktop, но сохраняет видимость реально работающего помощника и его PID.
 
 ## Быстрый старт
 
@@ -131,10 +131,21 @@ python -B srhd.py release deploy C:\Work\MyMod "C:\Games\Space Rangers HD\Mods" 
 использовать короткие команды:
 
 ```powershell
+python -B srhd.py project init C:\Work\MyMod --json
+python -B srhd.py project plan --variant earth-test --json
+python -B srhd.py project doctor --json
 python -B srhd.py project validate
 python -B srhd.py project build --variant earth-test --json
 python -B srhd.py project deploy --variant earth-test --target game --dry-run --json
 python -B srhd.py project publish --variant release --json
+```
+
+Проверка обновления и языков:
+
+```powershell
+python -B srhd.py release upgrade-check C:\Work\MyMod-old C:\Work\MyMod-new --json
+python -B srhd.py lang coverage C:\Work\MyMod-new --base Rus --json
+python -B srhd.py schema validate C:\Work\MyMod-new.audit.json --json
 ```
 
 Полная схема, варианты, кэш, цели и восстановление описаны в

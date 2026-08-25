@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xenomorphchyma.github.io/SRHD-XenoModKit/schema/srhd-modkit-project-doctor-v1.json",
+  "title": "SRHD ModKit project doctor report",
+  "type": "object",
+  "required": ["schema", "project", "healthy", "cache", "workspaces", "issues", "summary"],
+  "properties": {"schema": {"const": "srhd-modkit-project-doctor-v1"}, "project": {"type": "object"}, "healthy": {"type": "boolean"}, "cache": {"type": "object"}, "workspaces": {"type": "array"}, "issues": {"type": "array"}, "summary": {"type": "object"}},
+  "additionalProperties": true
+}

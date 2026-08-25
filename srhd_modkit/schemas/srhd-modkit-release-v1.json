@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xenomorphchyma.github.io/SRHD-XenoModKit/schema/srhd-modkit-release-v1.json",
+  "title": "SRHD ModKit release result",
+  "type": "object",
+  "required": ["schema", "output", "manifest", "audit", "sha256", "file_count", "verified"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-release-v1"},
+    "output": {"type": "string"},
+    "manifest": {"type": "string"},
+    "audit": {"type": "string"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+    "file_count": {"type": "integer"},
+    "verified": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}

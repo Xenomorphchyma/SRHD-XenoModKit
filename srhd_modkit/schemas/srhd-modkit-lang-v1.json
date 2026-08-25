@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xenomorphchyma.github.io/SRHD-XenoModKit/schema/srhd-modkit-lang-v1.json",
+  "title": "SRHD ModKit language operation result",
+  "type": "object",
+  "required": ["schema", "operation"],
+  "properties": {"schema": {"const": "srhd-modkit-lang-v1"}, "operation": {"enum": ["extract", "build", "diff", "coverage"]}},
+  "additionalProperties": true
+}

@@ -11,14 +11,15 @@ description: Headless inspection, editing, validation, compatibility analysis, a
 
 1. Найти корень репозитория, содержащий `srhd.py`, `pyproject.toml` и каталог `srhd_modkit`. Обозначать его как `<MODKIT_ROOT>`.
 2. Если этот скилл загружен прямо из репозитория, `<MODKIT_ROOT>` находится на три уровня выше `SKILL.md`: `.agents/skills/srhd-modkit/../../..`.
-3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.9.8` или новее.
+3. Выполнить `python -B srhd.py --version` из `<MODKIT_ROOT>`. Ожидать `SRHD ModKit 0.10.0` или новее.
 4. При другой версии сначала прочитать локальные `README_RU.md`, `AUDIT_RU.md` и вывод `python -B srhd.py --help`; не предполагать наличие `script decompile`.
 5. Если корень найти нельзя, запросить путь к клону ModKit. Не использовать каталог установленной игры вместо инструментария.
 6. Для точного синтаксиса читать [references/commands.md](references/commands.md).
 
 ## Выбирать workflow по задаче
 
-- Если найден `srhd-modkit.toml`, для обычной сборки предпочитать `project build`, перед выкладкой `project deploy --dry-run`, а для единого выпуска папки/ZIP/manifest/audit/provenance — `project publish`. Машинные пути брать только из непубликуемого `srhd-modkit.local.toml`. Project workflow точно заменяет одну папку варианта и автоматически ограничивает кэш; `.srhd-build`/`.srhd-cache` не копировать в релиз и не чистить вручную во время активной сборки. Подробности и синтаксис читать в [references/commands.md](references/commands.md) и `<MODKIT_ROOT>/PROJECTS_RU.md`; не пересобирать этот workflow вручную отдельными командами без причины.
+- Для существующего мода без TOML начинать с `project init`, затем просмотреть предупреждения и `project plan`. Если найден `srhd-modkit.toml`, для обычной сборки предпочитать `project build`, перед выкладкой `project deploy --dry-run`, а для единого выпуска папки/ZIP/manifest/audit/provenance — `project publish`. Машинные пути брать только из непубликуемого `srhd-modkit.local.toml`. Перед ручной очисткой использовать `project doctor` и dry-run `project clean`; `--apply`, `--build` и `--cache` добавлять осознанно. Project workflow точно заменяет одну папку варианта и автоматически ограничивает кэш; `.srhd-build`/`.srhd-cache` не копировать в релиз и не чистить вручную во время активной сборки. Подробности и синтаксис читать в [references/commands.md](references/commands.md) и `<MODKIT_ROOT>/PROJECTS_RU.md`; не пересобирать этот workflow вручную отдельными командами без причины.
+- Для сравнения выпуска с предыдущей версией использовать `release upgrade-check OLD NEW`; глубокий `--deep-scripts` включать только когда нужен SCR round-trip. Для нескольких языков использовать `lang coverage/diff`, а не вручную сопоставлять DAT. Машинные отчёты при интеграции проверять через `schema validate`.
 - Для первичного анализа запускать `audit --profile dev --json`.
 - Для проверки коллекции передавать корень коллекции той же команде; ModKit сам обнаружит моды.
 - Для DAT использовать только `dat`-команды. Сначала читать дерево или значение, затем писать в новый DAT и повторно запускать `dat validate` или релизный аудит.

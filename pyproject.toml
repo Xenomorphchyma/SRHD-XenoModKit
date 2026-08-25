@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "srhd-modkit"
-version = "0.9.9"
+version = "0.10.0"
 description = "Safe inspection, conversion and release tools for Space Rangers HD mods"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,3 +21,6 @@ srhd-mod = "srhd_modkit.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["srhd_modkit*"]
+
+[tool.setuptools.package-data]
+srhd_modkit = ["schemas/*.json"]

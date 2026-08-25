@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.9.9
+# Команды SRHD ModKit 0.10.0
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `1` — операционную ошибку.
 
@@ -13,6 +13,7 @@ python -B srhd.py release build "<MOD>" "<RELEASES>/MyMod-bin.zip" --prefix Othe
 python -B srhd.py release plan "<MOD>" "<GAME>/Mods" --prefix OtherMods/MyMod --json
 python -B srhd.py release deploy "<MOD>" "<GAME>/Mods" --prefix OtherMods/MyMod --dry-run --json
 python -B srhd.py release deploy "<MOD>" "<GAME>/Mods" --prefix OtherMods/MyMod --overwrite --json
+python -B srhd.py release upgrade-check "<OLD_MOD>" "<NEW_MOD>" --json
 ```
 
 `--prefix` задаёт точный путь относительно `Mods` и корень ZIP; без него
@@ -47,10 +48,14 @@ python -B srhd.py release cleanup-transactions "<GAME>/Mods" --apply --json
 Если рядом есть `srhd-modkit.toml`, предпочитать единый project workflow:
 
 ```powershell
+python -B srhd.py project init "<WORK>/ExistingMod" --json
+python -B srhd.py project plan --variant release --json
+python -B srhd.py project doctor --json
 python -B srhd.py project validate --json
 python -B srhd.py project build --variant release --json
 python -B srhd.py project deploy --variant earth-test --target game --dry-run --json
 python -B srhd.py project publish --variant release --json
+python -B srhd.py project clean --json
 ```
 
 Общий TOML описывает `mod_root`, prefix, DAT/RSON/RSM/copy-артефакты,
@@ -62,6 +67,26 @@ python -B srhd.py project publish --variant release --json
 сборки защищены. `cache.maintenance` в JSON показывает фактическую очистку.
 `--no-cache` отключает его для одного запуска. Подробная схема:
 `<MODKIT_ROOT>/PROJECTS_RU.md`.
+
+`project init` не угадывает неоднозначные связи. `project plan` не компилирует
+и показывает причины cache miss и итоговые файлы. `project clean` без
+`--apply` является только dry-run; `--build` и `--cache` включаются явно.
+
+## Языки и машинные схемы
+
+```powershell
+python -B srhd.py lang extract "<MOD>/CFG/Rus/Lang.dat" "<WORK>/Rus.txt"
+python -B srhd.py lang build "<WORK>/Rus.txt" "<OUT>/Lang.dat"
+python -B srhd.py lang diff "<WORK>/Rus.txt" "<WORK>/Eng.txt" --json
+python -B srhd.py lang coverage "<MOD>" --base Rus --json
+python -B srhd.py schema list --json
+python -B srhd.py schema show srhd-modkit-audit-v1
+python -B srhd.py schema validate "<WORK>/audit.json" --json
+```
+
+`lang coverage` следует языкам из ModuleInfo и проверяет отсутствующие ключи,
+пустые значения и code stubs. JSON Schema поставляются внутри wheel и не
+требуют `jsonschema` либо другого Python-пакета.
 
 ## DAT / BlockPar
 
