@@ -8,6 +8,7 @@ from copy import deepcopy
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from srhd_modkit.blockpar import parse_blockpar
 from srhd_modkit.cli import (
@@ -504,6 +505,7 @@ class ScriptArtifactTests(unittest.TestCase):
                 "script-dialog-lang-dat-missing",
                 {issue["code"] for issue in report["issues"]},
             )
+
             self.assertEqual(report["artifact_lint"]["language"], [
                 str((root / "SOURCE" / "Mod_Test.lang.txt").resolve())
             ])
@@ -556,6 +558,72 @@ class ScriptArtifactTests(unittest.TestCase):
             report = json.loads(output.getvalue())
             self.assertIn(
                 "script-dialog-lang-value-code-stub",
+                {issue["code"] for issue in report["issues"]},
+            )
+
+    def test_script_audit_executes_exact_registration_matcher(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "RegisteredScript"
+            script = root / "DATA" / "Script" / "Mod_Registered.scr"
+            main_dat = root / "CFG" / "Main.dat"
+            script.parent.mkdir(parents=True)
+            main_dat.parent.mkdir(parents=True)
+            script.write_bytes(b"fixture")
+            main_dat.write_bytes(b"fixture")
+
+            def fake_convert_dat(_source: Path, output: Path) -> None:
+                output.write_text(
+                    "Data ^{\n"
+                    "  Script ^{\n"
+                    "    Mod_Registered=1,Script.Mod_Registered\n"
+                    "  }\n"
+                    "}\n",
+                    encoding="cp1251",
+                )
+
+            runtime_lint = {
+                "issues": [],
+                "rson": [],
+                "main": [str(main_dat)],
+                "cachedata": [],
+                "module_info": None,
+            }
+            artifact_lint = {"issues": [], "cachedata": [], "language": []}
+            text_lint = {"issues": [], "checked": []}
+            scr_info = {
+                "path": str(script),
+                "name": script.stem,
+                "size": script.stat().st_size,
+                "version": 8,
+                "supported_version": True,
+                "utf16_strings": 0,
+                "event_signatures": [],
+                "dialog_language_keys": [],
+                "code_samples": [],
+            }
+
+            with (
+                patch("srhd_modkit.cli.Toolchain") as toolchain,
+                patch("srhd_modkit.cli.inspect_scr", return_value=scr_info),
+                patch("srhd_modkit.cli._runtime_lint_target", return_value=runtime_lint),
+                patch("srhd_modkit.cli._script_artifact_lint_target", return_value=artifact_lint),
+                patch("srhd_modkit.cli._game_text_lint_target", return_value=text_lint),
+            ):
+                toolchain.return_value.convert_dat.side_effect = fake_convert_dat
+                output = StringIO()
+                with redirect_stdout(output):
+                    code = cmd_script_audit_mod(
+                        SimpleNamespace(mod=str(root), tools_root=None, json=True)
+                    )
+
+            self.assertEqual(code, 0)
+            report = json.loads(output.getvalue())
+            self.assertEqual(
+                report["registrations"],
+                {"mod_registered": ["1,Script.Mod_Registered"]},
+            )
+            self.assertNotIn(
+                "scr-unregistered",
                 {issue["code"] for issue in report["issues"]},
             )
 

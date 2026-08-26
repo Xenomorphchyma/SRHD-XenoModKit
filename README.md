@@ -28,6 +28,7 @@ ModKit разворачивает мод в игру только по явно�
 
 ### Что изменилось в 0.10.0
 
+- Исправлен внутренний `NameError` в `script audit-mod` при сопоставлении готового SCR с точной регистрацией в `CFG/Main.dat`; добавлен регрессионный тест этой ветки.
 - `project init` создаёт консервативный черновик `srhd-modkit.toml`; неоднозначные связи не угадываются, а найденные C++/C# проекты, DLL и launcher блокируют выпуск до явного подтверждения `external_builds`.
 - `project plan`, `project doctor` и безопасный `project clean` показывают пересборки, причины cache miss, итоговый игровой состав, инструменты, размер кэша и оставшиеся `.srhd-*`; удаление выполняется только с `--apply`.
 - `release upgrade-check OLD NEW` объединяет изменения ModuleInfo, persistent-схемы, runtime-имён/SAV-кэша, SCR, Main/CacheData/Lang и удалённых ресурсов. Глубокий SCR round-trip включается отдельно.
