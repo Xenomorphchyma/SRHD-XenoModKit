@@ -59,6 +59,13 @@ XenoNativeLoader при старте игры. `DllMain`/Query должны бы
 эффектов, а Initialize на неподдерживаемом EXE должен вернуть ошибку до частичной
 мутации, чтобы Loader мог безопасно выбрать следующий capability-owner/fallback.
 
+Если RScript обращается к плагину через `ImportedFunction`, native discovery и
+PE-экспорт сами по себе недостаточны. В `CFG/Main.dat` нужны узел
+`Data/ScriptLibs/<Library>`, `Path`, сигнатура каждой функции и параметр
+`<ScriptName>=<Library>`. `script lint-runtime`, `script audit-mod`, project
+build и release-аудит проверяют эту цепочку, включая число аргументов и точный
+PE export, не загружая DLL.
+
 `srhd compat` использует для native-модов тот же эффективный порядок, что игра
 и Loader: стабильную сортировку активных `CurrentMod` по возрастанию `Priority`
 и проверку `Dependence`. Для каждой позиции отчёт показывает число найденных

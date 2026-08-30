@@ -3,25 +3,34 @@ from __future__ import annotations
 import struct
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 from srhd_modkit.audit import audit_mod
+from srhd_modkit.blockpar import parse_blockpar
 from srhd_modkit.native_loader import (
     initialize_native_mod,
     inspect_native_dll,
     validate_native_mod,
 )
+from srhd_modkit.runtime_lint import lint_imported_functions
+from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION, RsonProject
 from srhd_modkit.project import load_project
 from srhd_modkit.project_ops import initialize_project
 from srhd_modkit.schemas import validate_schema_document
 
 
-def _plugin_dll(*, machine: int = 0x014C, magic: int = 0x10B) -> bytes:
+def _plugin_dll(
+    *,
+    machine: int = 0x014C,
+    magic: int = 0x10B,
+    extra_export: str | None = None,
+) -> bytes:
     pe_offset = 0x80
     optional_size = 0xE0 if magic == 0x10B else 0xF0
     optional = pe_offset + 24
     section = optional + optional_size
-    data = bytearray(0x600)
+    data = bytearray(0x800)
     data[:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, pe_offset)
     data[pe_offset : pe_offset + 4] = b"PE\0\0"
@@ -32,6 +41,9 @@ def _plugin_dll(*, machine: int = 0x014C, magic: int = 0x10B) -> bytes:
     data[section : section + 8] = b".edata\0\0"
     struct.pack_into("<IIII", data, section + 8, 0x300, 0x1000, 0x300, 0x200)
     export = 0x200
+    exports = ["XenoPlugin_Query", "XenoPlugin_Initialize"]
+    if extra_export:
+        exports.append(extra_export)
     struct.pack_into(
         "<IIHHIIIIIII",
         data,
@@ -40,20 +52,30 @@ def _plugin_dll(*, machine: int = 0x014C, magic: int = 0x10B) -> bytes:
         0,
         0,
         0,
-        0x1060,
+        0x1100,
         1,
-        2,
-        2,
+        len(exports),
+        len(exports),
         0x1040,
-        0x1048,
         0x1050,
+        0x1060,
     )
-    struct.pack_into("<II", data, 0x240, 0x1100, 0x1110)
-    struct.pack_into("<II", data, 0x248, 0x1080, 0x10A0)
-    struct.pack_into("<HH", data, 0x250, 0, 1)
-    data[0x260 : 0x260 + len(b"Fixture.dll\0")] = b"Fixture.dll\0"
-    data[0x280 : 0x280 + len(b"XenoPlugin_Query\0")] = b"XenoPlugin_Query\0"
-    data[0x2A0 : 0x2A0 + len(b"XenoPlugin_Initialize\0")] = b"XenoPlugin_Initialize\0"
+    struct.pack_into(
+        "<" + "I" * len(exports),
+        data,
+        0x240,
+        *(0x1200 + index * 0x10 for index in range(len(exports))),
+    )
+    cursor = 0x280
+    name_rvas: list[int] = []
+    for export_name in exports:
+        encoded = export_name.encode("ascii") + b"\0"
+        name_rvas.append(0x1000 + (cursor - 0x200))
+        data[cursor : cursor + len(encoded)] = encoded
+        cursor += len(encoded)
+    struct.pack_into("<" + "I" * len(exports), data, 0x250, *name_rvas)
+    struct.pack_into("<" + "H" * len(exports), data, 0x260, *range(len(exports)))
+    data[0x300 : 0x300 + len(b"Fixture.dll\0")] = b"Fixture.dll\0"
     return bytes(data)
 
 
@@ -66,6 +88,130 @@ def _mod(root: Path) -> None:
 
 
 class NativeLoaderTests(unittest.TestCase):
+    def test_imported_function_closes_rson_main_signature_and_pe_export(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "NativeFixture"
+            _mod(root)
+            native = root / "Native"
+            native.mkdir()
+            dll = native / "Fixture.XenoPlugin.dll"
+            dll.write_bytes(_plugin_dll(extra_export="Fixture_GetValue"))
+            project = RsonProject(
+                {
+                    "FileID": RSON_FILE_ID,
+                    "FileVersion": RSON_FILE_VERSION,
+                    "ScriptName": "Mod_NativeFixture",
+                    "Visual.Objects": [
+                        {
+                            "Operations": [
+                                {
+                                    "Type": "Top",
+                                    "Name": "Turn",
+                                    "#": 1,
+                                    "Code.Type": "Turn",
+                                    "Code": [
+                                        "unknown getter = ImportedFunction('FixtureLibrary', 'Fixture_GetValue');",
+                                        "int value = getter(7);",
+                                    ],
+                                }
+                            ]
+                        }
+                    ],
+                    "Visual.Links": [],
+                },
+                root / "SOURCE" / "Mod_NativeFixture.rson",
+            )
+            main = parse_blockpar(
+                "Data ^{\n"
+                " ScriptLibs ^{\n"
+                "  FixtureLibrary ^{\n"
+                "   Path=Mods\\OtherMods\\NativeFixture\\Native\\Fixture.XenoPlugin.dll\n"
+                "   Fixture_GetValue=int,Fixture_GetValue,int\n"
+                "  }\n"
+                "  Mod_NativeFixture=FixtureLibrary\n"
+                " }\n"
+                "}\n"
+            )
+            report = lint_imported_functions(root, [project], [(root / "CFG" / "Main.dat", main)])
+            self.assertTrue(report.complete)
+            self.assertEqual(report.issues, ())
+            self.assertEqual(report.checked_dlls, (str(dll.resolve()),))
+
+            missing = parse_blockpar(
+                "Data ^{\n"
+                " ScriptLibs ^{\n"
+                "  FixtureLibrary ^{\n"
+                "   Path=Mods\\OtherMods\\NativeFixture\\Native\\Fixture.XenoPlugin.dll\n"
+                "  }\n"
+                "  Mod_NativeFixture=FixtureLibrary\n"
+                " }\n"
+                "}\n"
+            )
+            codes = {
+                issue.code
+                for issue in lint_imported_functions(
+                    root, [project], [(root / "CFG" / "Main.dat", missing)]
+                ).issues
+            }
+            self.assertIn("runtime-imported-function-registration-missing", codes)
+
+            unbound = parse_blockpar(
+                "Data ^{\n"
+                " ScriptLibs ^{\n"
+                "  FixtureLibrary ^{\n"
+                "   Path=Mods\\OtherMods\\NativeFixture\\Native\\Fixture.XenoPlugin.dll\n"
+                "   Fixture_GetValue=int,Fixture_GetValue,int\n"
+                "  }\n"
+                " }\n"
+                "}\n"
+            )
+            codes = {
+                issue.code
+                for issue in lint_imported_functions(
+                    root, [project], [(root / "CFG" / "Main.dat", unbound)]
+                ).issues
+            }
+            self.assertIn("runtime-imported-function-script-binding-missing", codes)
+
+            wrong_arity_data = deepcopy(project.data)
+            wrong_arity_data["Visual.Objects"][0]["Operations"][0]["Code"][1] = (
+                "int value = getter();"
+            )
+            wrong_arity = RsonProject(wrong_arity_data, project.path)
+            codes = {
+                issue.code
+                for issue in lint_imported_functions(
+                    root, [wrong_arity], [(root / "CFG" / "Main.dat", main)]
+                ).issues
+            }
+            self.assertIn("runtime-imported-function-arity-mismatch", codes)
+
+            wrong_export = parse_blockpar(
+                "Data ^{\n"
+                " ScriptLibs ^{\n"
+                "  FixtureLibrary ^{\n"
+                "   Path=Mods\\OtherMods\\NativeFixture\\Native\\Fixture.XenoPlugin.dll\n"
+                "   Fixture_GetValue=int,Fixture_Missing,int\n"
+                "  }\n"
+                "  Mod_NativeFixture=FixtureLibrary\n"
+                " }\n"
+                "}\n"
+            )
+            codes = {
+                issue.code
+                for issue in lint_imported_functions(
+                    root, [project], [(root / "CFG" / "Main.dat", wrong_export)]
+                ).issues
+            }
+            self.assertIn("runtime-imported-function-pe-export-missing", codes)
+
+            unavailable = lint_imported_functions(root, [project], None)
+            self.assertFalse(unavailable.complete)
+            self.assertIn(
+                "runtime-imported-function-main-unavailable",
+                {issue.code for issue in unavailable.issues},
+            )
+
     def test_inspect_pe32_exports_without_loading_dll(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             dll = Path(name) / "Fixture.XenoPlugin.dll"

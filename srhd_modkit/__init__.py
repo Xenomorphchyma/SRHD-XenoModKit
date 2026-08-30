@@ -45,12 +45,15 @@ from .resources import (
 )
 from .runtime_lint import (
     CustomFactionUse,
+    ImportedFunctionReference,
+    ImportedFunctionReport,
     LiteralCTReference,
     RuntimeIssue,
     compare_storage_schemas,
     dialog_semantic_map,
     lint_literal_ct_keys,
     lint_custom_faction_resources,
+    lint_imported_functions,
     literal_custom_faction_uses,
     literal_ct_references,
     lint_main_runtime,

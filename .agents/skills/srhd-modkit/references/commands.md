@@ -88,6 +88,8 @@ python -B srhd.py native validate "<WORK>/MyNativeMod" --json
 
 Проверка не загружает DLL: доказываются discovery, INI, безопасные пути, x86
 PE32 и ABI exports. Runtime ID, capabilities и хуки оставлять Loader/игре.
+`script lint-runtime <MOD>` дополнительно замыкает литеральные ImportedFunction
+через Main.dat ScriptLibs, ScriptName binding, arity и точный PE export.
 
 ## Языки и машинные схемы
 

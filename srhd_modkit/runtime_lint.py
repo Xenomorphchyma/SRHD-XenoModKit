@@ -9,6 +9,7 @@ from .blockpar import BlockParDocument, BlockParNode
 from .files import iter_files
 from .module_info import find_module_info, parse_module_info
 from .models import ModuleInfo
+from .native_loader import inspect_native_dll
 from .resources import verify_resource
 from .rscript_api import RSCRIPT_RUNTIME_CALLS
 from .scripts import RsonProject
@@ -99,6 +100,36 @@ class RuntimeIssue:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ImportedFunctionReference:
+    script_name: str
+    library: str
+    function: str
+    alias: str | None
+    call_arities: tuple[int, ...]
+    path: str | None
+    location: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class ImportedFunctionReport:
+    references: int
+    dynamic_references: int
+    complete: bool
+    checked_dlls: tuple[str, ...]
+    issues: tuple[RuntimeIssue, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "references": self.references,
+            "dynamic_references": self.dynamic_references,
+            "complete": self.complete,
+            "checked_dlls": list(self.checked_dlls),
+            "issues": [issue.as_dict() for issue in self.issues],
+        }
 
 
 @dataclass(frozen=True)
@@ -5784,6 +5815,516 @@ def literal_custom_faction_uses(project: RsonProject) -> list[CustomFactionUse]:
                 )
             )
     return result
+
+
+def _imported_function_references(
+    project: RsonProject,
+) -> tuple[list[ImportedFunctionReference], int]:
+    references: list[ImportedFunctionReference] = []
+    dynamic = 0
+    source = str(project.path) if project.path else None
+    for container in _iter_code_containers(project):
+        spans: list[tuple[int, int]] = []
+        covered: set[int] = set()
+        index = 0
+        while index < len(container.lines):
+            if not FUNCTION_RE.match(_mask_non_code(container.lines[index])):
+                index += 1
+                continue
+            end = _brace_block_end(container.lines, index)
+            spans.append((index, end + 1))
+            covered.update(range(index, end + 1))
+            index = max(index + 1, end + 1)
+        index = 0
+        while index < len(container.lines):
+            while index < len(container.lines) and index in covered:
+                index += 1
+            start = index
+            while index < len(container.lines) and index not in covered:
+                index += 1
+            if start < index:
+                spans.append((start, index))
+
+        for scope_start, scope_end in sorted(spans):
+            scope_lines = container.lines[scope_start:scope_end]
+            if not any("ImportedFunction" in line for line in scope_lines):
+                continue
+            text = "\n".join(scope_lines)
+            masked = _mask_non_code(text)
+            raw: list[tuple[int, str, str, str | None, str, str]] = []
+            alias_targets: dict[str, set[tuple[str, str]]] = {}
+            for position, arguments, end in _iter_parsed_calls(text, "ImportedFunction"):
+                line_number = scope_start + text.count("\n", 0, position) + 1
+                location = f"{container.location}:{line_number}"
+                evidence = text[position:end].strip()
+                if len(arguments) < 2:
+                    dynamic += 1
+                    continue
+                library = _literal_string(arguments[0])
+                function = _literal_string(arguments[1])
+                if library is None or function is None or not library or not function:
+                    dynamic += 1
+                    continue
+                line_start = masked.rfind("\n", 0, position) + 1
+                alias_match = re.search(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*$",
+                    masked[line_start:position],
+                    re.IGNORECASE,
+                )
+                alias = alias_match.group(1) if alias_match else None
+                if alias:
+                    alias_targets.setdefault(alias.casefold(), set()).add(
+                        (library.casefold(), function.casefold())
+                    )
+                raw.append((position, library, function, alias, location, evidence))
+
+            alias_arities: dict[str, tuple[int, ...]] = {}
+            for alias, targets in alias_targets.items():
+                if len(targets) != 1:
+                    continue
+                arities = {
+                    0
+                    if len(arguments) == 1 and not arguments[0].strip()
+                    else len(arguments)
+                    for _position, arguments, _end in _iter_parsed_calls(text, alias)
+                }
+                alias_arities[alias] = tuple(sorted(arities))
+
+            for _position, library, function, alias, location, evidence in raw:
+                references.append(
+                    ImportedFunctionReference(
+                        project.name,
+                        library,
+                        function,
+                        alias,
+                        alias_arities.get(alias.casefold(), ()) if alias else (),
+                        source,
+                        location,
+                        evidence,
+                    )
+                )
+    return references, dynamic
+
+
+def _script_library_parts(value: str) -> tuple[str, ...]:
+    return tuple(
+        token
+        for token in re.findall(r"[A-Za-z0-9_.-]+", value)
+        if token
+    )
+
+
+def _local_script_library_dll(
+    root: Path,
+    module_name: str,
+    registered_path: str,
+) -> tuple[Path | None, bool]:
+    """Resolve a ScriptLibs DLL only when it is demonstrably owned by this mod."""
+
+    windows = PureWindowsPath(registered_path.strip().replace("/", "\\"))
+    if (
+        not registered_path.strip()
+        or windows.is_absolute()
+        or windows.drive
+        or windows.root
+        or any(part in {"", ".", ".."} for part in windows.parts)
+    ):
+        return None, True
+    parts = tuple(windows.parts)
+    folded = tuple(part.casefold() for part in parts)
+    owners = {root.name.casefold(), module_name.casefold()}
+    for index, part in enumerate(folded):
+        if part not in owners:
+            continue
+        tail = parts[index + 1 :]
+        if not tail:
+            return None, True
+        return root.joinpath(*tail), True
+    if folded and folded[0] != "mods":
+        return root.joinpath(*parts), True
+
+    basename = windows.name.casefold()
+    candidates = []
+    for path in iter_files(root):
+        if path.suffix.casefold() != ".dll" or path.name.casefold() != basename:
+            continue
+        relative = path.relative_to(root)
+        relative_parts = tuple(part.casefold() for part in relative.parts[:-1])
+        if any(
+            part in {"source", "sources"}
+            or part.startswith(".srhd-")
+            or part in {"_build", "_backups"}
+            for part in relative_parts
+        ):
+            continue
+        candidates.append(path)
+    if len(candidates) == 1:
+        return candidates[0], True
+    return None, False
+
+
+def lint_imported_functions(
+    root: str | Path,
+    projects: Sequence[RsonProject],
+    main_documents: Sequence[tuple[str | Path, BlockParDocument]] | None,
+) -> ImportedFunctionReport:
+    """Close RSON ImportedFunction references through Main/ScriptLibs and PE.
+
+    The check never loads a DLL.  It reads only the PE export directory and
+    deliberately reports dependency-provided libraries as incomplete rather
+    than claiming that a standalone mod owns the active global registry.
+    """
+
+    resolved_root = Path(root).resolve()
+    references: list[ImportedFunctionReference] = []
+    dynamic = 0
+    for project in projects:
+        project_references, project_dynamic = _imported_function_references(project)
+        references.extend(project_references)
+        dynamic += project_dynamic
+    if not references and not dynamic:
+        return ImportedFunctionReport(0, 0, True, (), ())
+
+    issues: list[RuntimeIssue] = []
+    reported: set[tuple[str, str, str, str]] = set()
+    complete = dynamic == 0
+    checked_dlls: set[str] = set()
+
+    def add(issue: RuntimeIssue, marker: tuple[str, str, str, str]) -> None:
+        if marker in reported:
+            return
+        reported.add(marker)
+        issues.append(issue)
+
+    if dynamic:
+        issues.append(
+            RuntimeIssue(
+                "info",
+                "runtime-imported-function-dynamic-unverified",
+                f"Найдено динамических вызовов ImportedFunction: {dynamic}; "
+                "имя библиотеки или функции не является строковым литералом, "
+                "поэтому статическая регистрация не доказана",
+                str(resolved_root),
+            )
+        )
+
+    documents = tuple(main_documents or ())
+    if not documents:
+        complete = False
+        for reference in references:
+            marker = (
+                "runtime-imported-function-main-unavailable",
+                reference.script_name.casefold(),
+                reference.library.casefold(),
+                reference.function.casefold(),
+            )
+            add(
+                RuntimeIssue(
+                    "warning",
+                    marker[0],
+                    f"ImportedFunction({reference.library!r}, {reference.function!r}) "
+                    "нельзя сверить с Data/ScriptLibs: Main.dat/Main.txt не передан. "
+                    "Проверяйте корень мода либо используйте --main",
+                    reference.path,
+                    reference.location,
+                    reference.evidence,
+                ),
+                marker,
+            )
+        return ImportedFunctionReport(
+            len(references), dynamic, complete, (), tuple(issues)
+        )
+
+    module_name = resolved_root.name
+    dependencies: set[str] = set()
+    info_path = find_module_info(resolved_root)
+    if info_path is not None:
+        try:
+            module = parse_module_info(info_path)
+            module_name = module.name or module_name
+            dependencies = {value.casefold() for value in module.dependencies}
+        except Exception:
+            pass
+
+    library_nodes: dict[str, list[tuple[str, BlockParNode]]] = {}
+    bindings: dict[str, list[tuple[str, str]]] = {}
+    scriptlibs_present = False
+    for source, document in documents:
+        try:
+            scriptlibs = document.find_node("Data/ScriptLibs")
+        except KeyError:
+            continue
+        scriptlibs_present = True
+        resolved_source = str(Path(source).resolve())
+        for node in scriptlibs.children:
+            library_nodes.setdefault(node.name.casefold(), []).append(
+                (resolved_source, node)
+            )
+        for parameter in scriptlibs.parameters:
+            bindings.setdefault(parameter.key.casefold(), []).append(
+                (resolved_source, parameter.value)
+            )
+
+    grouped: dict[tuple[str, str, str], list[ImportedFunctionReference]] = {}
+    for reference in references:
+        grouped.setdefault(
+            (
+                reference.script_name.casefold(),
+                reference.library.casefold(),
+                reference.function.casefold(),
+            ),
+            [],
+        ).append(reference)
+
+    pe_cache: dict[str, Any] = {}
+    for (script_folded, library_folded, function_folded), uses in sorted(grouped.items()):
+        first = uses[0]
+        nodes = library_nodes.get(library_folded, [])
+        if not nodes:
+            complete = False
+            local_export = False
+            for dll in iter_files(resolved_root):
+                if dll.suffix.casefold() != ".dll":
+                    continue
+                try:
+                    pe = inspect_native_dll(dll)
+                except Exception:
+                    continue
+                if any(name.casefold() == function_folded for name in pe.exports):
+                    local_export = True
+                    break
+            severity = "error" if local_export else "warning"
+            code = (
+                "runtime-imported-function-library-unregistered"
+                if scriptlibs_present
+                else "runtime-imported-function-scriptlibs-missing"
+            )
+            dependency_note = (
+                " Активная зависимость может добавить реестр; одиночный аудит это не доказывает."
+                if dependencies and not local_export
+                else ""
+            )
+            add(
+                RuntimeIssue(
+                    severity,
+                    code,
+                    f"ImportedFunction({first.library!r}, {first.function!r}) не имеет "
+                    f"локального узла Data/ScriptLibs/{first.library}."
+                    + dependency_note,
+                    first.path,
+                    first.location,
+                    first.evidence,
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+            continue
+
+        bound = any(
+            any(token.casefold() == library_folded for token in _script_library_parts(value))
+            for _source, value in bindings.get(script_folded, [])
+        )
+        if not bound:
+            code = "runtime-imported-function-script-binding-missing"
+            add(
+                RuntimeIssue(
+                    "error",
+                    code,
+                    f"ScriptName {first.script_name!r} вызывает библиотеку "
+                    f"{first.library!r}, но Data/ScriptLibs не содержит привязку "
+                    f"{first.script_name}={first.library}",
+                    first.path,
+                    first.location,
+                    first.evidence,
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+
+        declarations: list[tuple[str, str]] = []
+        paths: list[tuple[str, str]] = []
+        for source, node in nodes:
+            declarations.extend(
+                (source, parameter.value)
+                for parameter in node.parameters_named(first.function)
+            )
+            paths.extend(
+                (source, parameter.value)
+                for parameter in node.parameters_named("Path")
+            )
+        if not declarations:
+            code = "runtime-imported-function-registration-missing"
+            add(
+                RuntimeIssue(
+                    "error",
+                    code,
+                    f"Data/ScriptLibs/{first.library} существует, но не содержит "
+                    f"параметр {first.function}; PE-экспорт сам по себе не регистрирует функцию RScript",
+                    first.path,
+                    first.location,
+                    first.evidence,
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+            continue
+
+        signatures = {value.strip() for _source, value in declarations}
+        if len(signatures) > 1:
+            code = "runtime-imported-function-signature-conflict"
+            add(
+                RuntimeIssue(
+                    "error",
+                    code,
+                    f"Data/ScriptLibs/{first.library}/{first.function} имеет "
+                    f"несколько разных сигнатур: {sorted(signatures)}",
+                    declarations[0][0],
+                    f"Data/ScriptLibs/{first.library}/{first.function}",
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+            continue
+        signature = next(iter(signatures))
+        parts = tuple(part.strip() for part in signature.split(","))
+        if len(parts) < 2 or any(not part for part in parts):
+            code = "runtime-imported-function-signature-invalid"
+            add(
+                RuntimeIssue(
+                    "error",
+                    code,
+                    f"Регистрация {first.library}/{first.function} должна иметь "
+                    "форму ReturnType,ExportName[,ArgType...]",
+                    declarations[0][0],
+                    f"Data/ScriptLibs/{first.library}/{first.function}",
+                    signature,
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+            continue
+        export_name = parts[1]
+        expected_arity = len(parts) - 2
+        actual_arities = sorted(
+            {arity for use in uses for arity in use.call_arities}
+        )
+        wrong_arities = [arity for arity in actual_arities if arity != expected_arity]
+        if wrong_arities:
+            code = "runtime-imported-function-arity-mismatch"
+            add(
+                RuntimeIssue(
+                    "error",
+                    code,
+                    f"{first.function} зарегистрирована с {expected_arity} аргументами, "
+                    f"но импортированный callable вызывается с количеством {wrong_arities}",
+                    first.path,
+                    first.location,
+                    f"signature={signature}; aliases={sorted({use.alias for use in uses if use.alias})}",
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+
+        unique_paths = {value.strip() for _source, value in paths if value.strip()}
+        if not unique_paths:
+            code = "runtime-imported-function-library-path-missing"
+            add(
+                RuntimeIssue(
+                    "error",
+                    code,
+                    f"Data/ScriptLibs/{first.library} не содержит непустой Path к DLL",
+                    nodes[0][0],
+                    f"Data/ScriptLibs/{first.library}",
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+            continue
+        if len(unique_paths) > 1:
+            code = "runtime-imported-function-library-path-conflict"
+            add(
+                RuntimeIssue(
+                    "error",
+                    code,
+                    f"Data/ScriptLibs/{first.library} содержит несколько разных Path: "
+                    f"{sorted(unique_paths)}",
+                    nodes[0][0],
+                    f"Data/ScriptLibs/{first.library}",
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+            continue
+        registered_path = next(iter(unique_paths))
+        dll, local = _local_script_library_dll(
+            resolved_root, module_name, registered_path
+        )
+        if dll is None or not dll.is_file():
+            complete = False
+            code = (
+                "runtime-imported-function-dll-missing"
+                if local
+                else "runtime-imported-function-dll-external-unverified"
+            )
+            severity = "error" if local else "warning"
+            add(
+                RuntimeIssue(
+                    severity,
+                    code,
+                    (
+                        f"ScriptLibs Path {registered_path!r} указывает на отсутствующую локальную DLL"
+                        if local
+                        else f"ScriptLibs Path {registered_path!r} относится к внешнему модулю; одиночный аудит не может проверить DLL и PE-экспорт"
+                    ),
+                    paths[0][0],
+                    f"Data/ScriptLibs/{first.library}/Path",
+                    registered_path,
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+            continue
+        dll_key = str(dll.resolve()).casefold()
+        try:
+            pe = pe_cache.get(dll_key)
+            if pe is None:
+                pe = inspect_native_dll(dll)
+                pe_cache[dll_key] = pe
+            checked_dlls.add(str(dll.resolve()))
+        except Exception as exc:
+            code = "runtime-imported-function-dll-invalid"
+            add(
+                RuntimeIssue(
+                    "error",
+                    code,
+                    f"DLL библиотеки {first.library} нельзя проверить как PE: {exc}",
+                    str(dll),
+                    f"Data/ScriptLibs/{first.library}/Path",
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+            continue
+        if export_name not in pe.exports:
+            code = "runtime-imported-function-pe-export-missing"
+            case_match = next(
+                (name for name in pe.exports if name.casefold() == export_name.casefold()),
+                None,
+            )
+            detail = (
+                f"; найдено только отличающееся регистром имя {case_match!r}"
+                if case_match
+                else ""
+            )
+            add(
+                RuntimeIssue(
+                    "error",
+                    code,
+                    f"{Path(dll).name} не экспортирует точное имя {export_name!r}{detail}",
+                    str(dll),
+                    f"Data/ScriptLibs/{first.library}/{first.function}",
+                    signature,
+                ),
+                (code, script_folded, library_folded, function_folded),
+            )
+
+    return ImportedFunctionReport(
+        len(references),
+        dynamic,
+        complete,
+        tuple(sorted(checked_dlls, key=str.casefold)),
+        tuple(issues),
+    )
 
 
 def _custom_faction_emblem_keys(document: BlockParDocument) -> set[str]:

@@ -47,6 +47,7 @@ from .runtime_lint import (
     compare_storage_schemas,
     has_onstart_script_run,
     lint_custom_faction_resources,
+    lint_imported_functions,
     lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
@@ -1563,6 +1564,7 @@ def _runtime_lint_target(
         )
     else:
         raise FileNotFoundError(target)
+    mod_root = _find_mod_root(target) or root
 
     for path in rson_files:
         try:
@@ -1594,6 +1596,7 @@ def _runtime_lint_target(
                 main_candidates.append(candidate.resolve())
 
     main_documents: list[BlockParDocument] = []
+    main_artifacts: list[tuple[Path, BlockParDocument]] = []
     main_runtime_seen: set[tuple[str, str | None]] = set()
     with tempfile.TemporaryDirectory(prefix="srhd-runtime-lint-") as name:
         temp = Path(name)
@@ -1609,6 +1612,7 @@ def _runtime_lint_target(
                     main_runtime_seen.add(key)
                     issues.append(issue)
                 main_documents.append(document)
+                main_artifacts.append((path, document))
                 onstart_script_run = onstart_script_run or has_onstart_script_run(document)
                 checked_main.append(str(path))
             except Exception as exc:
@@ -1620,12 +1624,18 @@ def _runtime_lint_target(
             main_documents if main_documents else None,
         )
     )
+    imported_functions = lint_imported_functions(
+        mod_root,
+        rson_projects,
+        main_artifacts[:1] if main_artifacts else None,
+    )
+    issues.extend(imported_functions.issues)
 
     info_path: Path | None
     if module_info_path:
         info_path = Path(module_info_path).resolve()
-    elif target.is_dir():
-        info_path = find_module_info(root)
+    elif mod_root:
+        info_path = find_module_info(mod_root)
     else:
         info_path = None
     module_info = None
@@ -1725,6 +1735,7 @@ def _runtime_lint_target(
         "language": checked_language,
         "cachedata": checked_cache,
         "module_info": str(info_path) if info_path else None,
+        "imported_functions": imported_functions.as_dict(),
         "issues": [issue.as_dict() for issue in issues],
     }
 

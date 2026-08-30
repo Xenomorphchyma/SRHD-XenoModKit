@@ -129,6 +129,63 @@ class AuditTests(unittest.TestCase):
             )
             report = audit_mod(root, profile="release")
             self.assertTrue(any(item.code == "scr-unregistered" for item in report.issues))
+
+    def test_release_blocks_imported_function_missing_from_scriptlibs(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            source = root / "SOURCE"
+            cfg = source / "CFG"
+            cfg.mkdir(parents=True)
+            (cfg / "Main.txt").write_text(
+                "Data ^{\n"
+                " ScriptLibs ^{\n"
+                "  FixtureNative ^{\n"
+                "   Path=Mods\\OtherMods\\AuditFixture\\Native\\Fixture.dll\n"
+                "   Fixture_Other=int,Fixture_Other\n"
+                "  }\n"
+                "  Mod_AuditFixture=FixtureNative\n"
+                " }\n"
+                "}\n",
+                encoding="cp1251",
+            )
+            project = {
+                "FileID": RSON_FILE_ID,
+                "FileVersion": RSON_FILE_VERSION,
+                "ScriptName": "Mod_AuditFixture",
+                "Visual.Objects": [
+                    {
+                        "Operations": [
+                            {
+                                "Type": "Top",
+                                "Name": "Turn",
+                                "Parent": -1,
+                                "#": 1,
+                                "Code.Type": "Turn",
+                                "Code": [
+                                    "unknown getter = ImportedFunction('FixtureNative', 'Fixture_GetConfigInt');",
+                                    "int value = getter(1);",
+                                ],
+                            }
+                        ]
+                    }
+                ],
+                "Visual.Links": [],
+            }
+            (source / "Mod_AuditFixture.rson").write_text(
+                json.dumps(project),
+                encoding="utf-8",
+            )
+
+            report = audit_mod(root, profile="release")
+            issue = next(
+                item
+                for item in report.issues
+                if item.code == "runtime-imported-function-registration-missing"
+            )
+            self.assertEqual(issue.severity, "error")
+            self.assertIn(issue, report.blocking_issues())
+
     def test_release_checks_source_config_cache_against_install_subpath(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"

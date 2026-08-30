@@ -137,6 +137,9 @@ x86 PE32 и точные ABI exports `XenoPlugin_Query` / `XenoPlugin_Initialize
 `XenoCore.dll` и общий `XenoNative.ini` не входят в обычный мод. Подробнее:
 [NATIVE_LOADER_RU.md](NATIVE_LOADER_RU.md).
 
+При использовании `ImportedFunction` аудит также проверяет регистрацию
+`Data/ScriptLibs`, привязку `ScriptName`, сигнатуру callable и PE-экспорт.
+
 ## Универсальный аудит и релиз
 
 ```powershell

@@ -27,6 +27,7 @@ from .quests import inspect_quest, load_quest, quest_media, verify_quest
 from .runtime_lint import (
     has_onstart_script_run,
     lint_custom_faction_resources,
+    lint_imported_functions,
     lint_literal_ct_keys,
     lint_main_runtime,
     lint_module_runtime,
@@ -1523,6 +1524,18 @@ def _script_check(context: AuditContext) -> AuditCheck:
         AuditIssue.from_value(item, validator=name, mod=context.mod_name)
         for item in custom_faction_values
     )
+    imported_functions = lint_imported_functions(
+        context.root,
+        rson_projects,
+        ((main_path, main_document),)
+        if main_path is not None and main_document is not None
+        else None,
+    )
+    runtime_values.extend(imported_functions.issues)
+    issues.extend(
+        AuditIssue.from_value(item, validator=name, mod=context.mod_name)
+        for item in imported_functions.issues
+    )
 
     info_path = find_module_info(context.root)
     module_info = None
@@ -1702,7 +1715,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
         if project.name.strip()
     }
     uncovered_scripts = [path for path in scripts if path.stem.casefold() not in valid_script_names]
-    semantic_complete = not uncovered_scripts
+    semantic_complete = not uncovered_scripts and imported_functions.complete
     for path in uncovered_scripts:
         issues.append(
             _issue(
@@ -1727,6 +1740,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
             "rson": len(rsons),
             "valid_rson": valid_rsons,
             "semantic_uncovered_scr": [path.name for path in uncovered_scripts],
+            "imported_functions": imported_functions.as_dict(),
         },
         complete=semantic_complete,
     )
