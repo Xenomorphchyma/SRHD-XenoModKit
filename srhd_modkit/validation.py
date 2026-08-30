@@ -28,7 +28,31 @@ def validate_mod(mod: ModRecord) -> list[Issue]:
     name = mod.module.name.strip()
     if not name:
         issues.append(Issue("error", "missing-name", "В ModuleInfo.txt отсутствует Name.", mod.module.path, mod.name))
-    if not mod.has_cfg and not mod.has_data:
+    native_root = next(
+        (
+            child
+            for child in mod.root.iterdir()
+            if child.is_dir() and child.name.casefold() == "native"
+        ),
+        None,
+    )
+    has_native_runtime = (
+        any(
+            path.is_file()
+            and (
+                path.name.casefold().endswith(".xenoplugin.dll")
+                or path.name.casefold().endswith(".xenomanifest.ini")
+                or path.name.casefold() == "xenonativeplugin.ini"
+            )
+            for path in native_root.rglob("*")
+        )
+        if native_root is not None
+        else False
+    ) or any(
+        child.is_file() and child.name.casefold() == "xenonativeplugin.ini"
+        for child in mod.root.iterdir()
+    )
+    if not mod.has_cfg and not mod.has_data and not has_native_runtime:
         issues.append(Issue("warning", "missing-content", "Нет ни CFG, ни DATA.", mod.root, mod.name))
     if mod.module.first("Priority") and mod.module.priority is None:
         issues.append(Issue("warning", "invalid-priority", "Priority должен быть целым числом.", mod.module.path, mod.name))

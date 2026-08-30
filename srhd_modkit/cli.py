@@ -71,6 +71,7 @@ from .language import build_language, diff_languages, extract_language, language
 from .schemas import list_schemas, load_schema, validate_schema_document
 from .compat import analyze_modset
 from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
+from .native_loader import initialize_native_mod, inspect_native_dll, validate_native_mod
 
 
 def human_size(value: int) -> str:
@@ -921,6 +922,52 @@ def cmd_resource_build_pkg(args: argparse.Namespace) -> int:
         print(f"PKG: {result['output']}")
         print(f"Файлов: {result['files']}; после распаковки: {human_size(result['uncompressed_size'])}")
         print(f"SHA-256: {result['sha256']}; проверен: {'да' if result['verified'] else 'НЕТ'}")
+    return 0
+
+
+def cmd_native_inspect(args: argparse.Namespace) -> int:
+    result = inspect_native_dll(args.dll).as_dict()
+    if args.json:
+        print_json(result)
+    else:
+        print(f"DLL: {result['path']}")
+        print(f"Архитектура: {result['architecture']} {result['pe_kind']}")
+        print(f"Экспорты: {', '.join(result['exports']) or '—'}")
+    return 0
+
+
+def cmd_native_validate(args: argparse.Namespace) -> int:
+    report = validate_native_mod(args.mod)
+    result = report.as_dict()
+    if args.json:
+        print_json(result)
+    else:
+        print(
+            f"Native plugins: {result['summary']['plugins']}; "
+            f"ошибок: {result['summary']['errors']}; предупреждений: {result['summary']['warnings']}"
+        )
+        for issue in result["issues"]:
+            print(f"{issue['severity'].upper()} {issue['code']}: {issue['message']}")
+    return 0 if report.valid else 1
+
+
+def cmd_native_init(args: argparse.Namespace) -> int:
+    result = initialize_native_mod(
+        args.mod,
+        plugin_id=args.id,
+        name=args.name,
+        version=args.plugin_version,
+        description=args.description,
+        author=args.author,
+        capability=args.capability,
+        overwrite=args.overwrite,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        print(f"Создан XenoNativeLoader plugin-проект: {result['root']}")
+        for command in result["next"]:
+            print(command)
     return 0
 
 
@@ -2935,6 +2982,46 @@ def build_parser() -> argparse.ArgumentParser:
     schema_validate.add_argument("--name", help="Явно выбрать схему вместо поля schema")
     schema_validate.add_argument("--json", action="store_true")
     schema_validate.set_defaults(func=cmd_schema_validate)
+
+    native = sub.add_parser(
+        "native",
+        help="Создать и проверить плагины XenoNativeLoader 0.6.5 без исполнения DLL",
+    )
+    native_sub = native.add_subparsers(dest="native_command", required=True)
+    native_init = native_sub.add_parser(
+        "init",
+        help="Создать минимальный x86 plugin-проект и srhd-modkit.toml",
+    )
+    native_init.add_argument("mod", help="Новая корневая папка мода")
+    native_init.add_argument("--id", required=True, help="Уникальный ABI id и базовое имя DLL")
+    native_init.add_argument("--name", help="Name в ModuleInfo; по умолчанию равен id")
+    native_init.add_argument("--plugin-version", default="0.1.0")
+    native_init.add_argument("--description", default="Space Rangers HD native plugin")
+    native_init.add_argument("--author", default="Xenomorphchyma")
+    native_init.add_argument(
+        "--capability",
+        choices=("none", "galaxy-generator"),
+        default="none",
+    )
+    native_init.add_argument("--overwrite", action="store_true")
+    native_init.add_argument("--json", action="store_true")
+    native_init.set_defaults(func=cmd_native_init)
+
+    native_inspect = native_sub.add_parser(
+        "inspect",
+        help="Статически показать PE32/x86 и exports DLL, не загружая её",
+    )
+    native_inspect.add_argument("dll")
+    native_inspect.add_argument("--json", action="store_true")
+    native_inspect.set_defaults(func=cmd_native_inspect)
+
+    native_validate = native_sub.add_parser(
+        "validate",
+        help="Проверить automatic/manifest discovery и ABI всех plugin-DLL мода",
+    )
+    native_validate.add_argument("mod")
+    native_validate.add_argument("--json", action="store_true")
+    native_validate.set_defaults(func=cmd_native_validate)
 
     compare = sub.add_parser("compare", help="Точно сравнить две папки")
     compare.add_argument("left")

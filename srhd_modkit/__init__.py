@@ -134,6 +134,18 @@ from .hidden_process import (
     inspect_hidden_processes,
     terminate_hidden_processes,
 )
+from .native_loader import (
+    NATIVE_HOST_API,
+    NATIVE_LOADER_SCHEMA,
+    NATIVE_LOADER_VERSION,
+    NativeLoaderIssue,
+    NativeLoaderReport,
+    NativePluginInfo,
+    PeDllInfo,
+    initialize_native_mod,
+    inspect_native_dll,
+    validate_native_mod,
+)
 from .quest_formula import FormulaNode, QuestFormulaError, parse_quest_formula, validate_quest_formula
 from .quests import (
     QuestDocument,
@@ -294,6 +306,16 @@ __all__ = [
     "HiddenProcessTimeout",
     "inspect_hidden_processes",
     "terminate_hidden_processes",
+    "NATIVE_HOST_API",
+    "NATIVE_LOADER_SCHEMA",
+    "NATIVE_LOADER_VERSION",
+    "NativeLoaderIssue",
+    "NativeLoaderReport",
+    "NativePluginInfo",
+    "PeDllInfo",
+    "initialize_native_mod",
+    "inspect_native_dll",
+    "validate_native_mod",
     "FormulaNode",
     "QuestFormulaError",
     "parse_quest_formula",

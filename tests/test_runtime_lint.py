@@ -3530,6 +3530,72 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-object-api-behind-boolean-guard", codes)
 
+    def test_nullable_equipment_and_planet_consumers_reject_eager_boolean_guards(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword hook = ShipEqInSlot(pirate, t_CargoHook);",
+            "if(!hook || GetEquipmentStats(hook, 0) < 60) exit;",
+            "dword planet = GetShipPlanet(pirate);",
+            "if(planet && PlanetRace(planet) == Peleng) result = 1;",
+        ]
+        issues = lint_rson_runtime(RsonProject(data, Path("eager-nullable-consumers.rson")))
+        matching = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-object-api-behind-boolean-guard"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertTrue(any("getequipmentstats" in issue.message.casefold() for issue in matching))
+        advisory = [
+            issue
+            for issue in issues
+            if issue.code == "runtime-nullable-object-consumer-same-expression-guard"
+        ]
+        self.assertEqual(len(advisory), 1)
+        self.assertIn("planetrace", advisory[0].message.casefold())
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword hook = ShipEqInSlot(pirate, t_CargoHook);",
+            "if(!hook) exit;",
+            "int quality = GetEquipmentStats(hook, 0);",
+            "dword planet = GetShipPlanet(pirate);",
+            "if(planet)",
+            "{",
+            "    result = PlanetRace(planet);",
+            "}",
+        ]
+        safe_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("guarded-nullable-consumers.rson")))
+        }
+        self.assertNotIn("runtime-object-api-behind-boolean-guard", safe_codes)
+        self.assertNotIn("runtime-nullable-object-consumer-same-expression-guard", safe_codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword planet = GetShipPlanet(pirate);",
+            "if(other && planet)",
+            "    result = PlanetRace(planet);",
+            "else if(other && planet)",
+            "    result = PlanetOwner(planet);",
+        ]
+        branch_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("guarded-unbraced-body.rson")))
+        }
+        self.assertNotIn("runtime-object-api-behind-boolean-guard", branch_codes)
+        self.assertNotIn("runtime-nullable-object-consumer-same-expression-guard", branch_codes)
+
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "dword planet = StarPlanets(star, i);",
+            "if(planet && lowercase(Name(planet)) == wanted) result = 1;",
+        ]
+        tolerant_codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("zero-tolerant-name.rson")))
+        }
+        self.assertNotIn("runtime-object-api-behind-boolean-guard", tolerant_codes)
+        self.assertNotIn("runtime-nullable-object-consumer-same-expression-guard", tolerant_codes)
+
     def test_nullable_engine_handles_require_explicit_guards(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][1]["Code"] = [

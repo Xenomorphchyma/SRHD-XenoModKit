@@ -49,6 +49,7 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 | `.scr` | версия, строки и фрагменты кода, настоящий CLI SCR→RSON и сборка | собственный анализатор + RScript 4.15f |
 | `.rson`, `.rsm` | граф/модули, экспорт, сборка и смысловой runtime-lint | Python + RScript 4.15f + rsmc |
 | `.svr` | legacy-конвертация RSON↔SVR | совместимый RScript 4.10f из setup |
+| `.XenoPlugin.dll`, `.XenoManifest.ini` | PE32/x86, ABI exports, manifest/config discovery и безопасные пути XenoNativeLoader 0.6.5 | собственный статический инспектор; DLL не исполняется |
 | `.txt`, `.ini`, `.cfg`, `.json` | обычная текстовая обработка | Python |
 | `.wav`, `.dds`, `.webm`, `.psd`, `.jpg`, `.bmp`, `.vdo`, архивы, неизвестные | проверка известных сигнатур и точное копирование | standard/passthrough |
 
@@ -116,6 +117,25 @@ python srhd.py tools
 python srhd.py formats D:\SRHD_Modding\Projects\ModWorkspaces
 python srhd.py formats D:\path\file.dat --hash
 ```
+
+## XenoNativeLoader 0.6.5
+
+```powershell
+python -B srhd.py native init D:\Work\MyNativeMod --id MyNativeRuntime --json
+powershell -File D:\Work\MyNativeMod\SOURCE\Native\build.ps1
+python -B srhd.py native inspect D:\Work\MyNativeMod\Native\MyNativeRuntime.XenoPlugin.dll --json
+python -B srhd.py native validate D:\Work\MyNativeMod --json
+python -B srhd.py project build D:\Work --json
+```
+
+Проверяются automatic/manifest discovery, INI, безопасные относительные пути,
+x86 PE32 и точные ABI exports `XenoPlugin_Query` / `XenoPlugin_Initialize`.
+`project init` связывает `SOURCE/Native/build.ps1` со всеми готовыми
+`Native/*.XenoPlugin.dll` как явный внешний build. ModKit не загружает DLL и не
+вызывает `XenoPlugin_Query`: уникальный runtime ID, `exclusiveCapabilities`,
+сигнатуры EXE и хуки окончательно проверяет Loader/игра. `dsound.dll`,
+`XenoCore.dll` и общий `XenoNative.ini` не входят в обычный мод. Подробнее:
+[NATIVE_LOADER_RU.md](NATIVE_LOADER_RU.md).
 
 ## Универсальный аудит и релиз
 

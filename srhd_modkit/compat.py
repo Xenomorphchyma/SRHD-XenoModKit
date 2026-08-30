@@ -11,6 +11,7 @@ from .discovery import discover_mods
 from .files import iter_files, sha256_file
 from .modcfg import ModConfig, parse_modcfg, validate_modcfg
 from .models import ModRecord, normalize_ref
+from .native_loader import NativeLoaderReport, validate_native_mod
 from .textio import read_text
 from .toolchain import Toolchain
 from .validation import validate_collection
@@ -456,6 +457,20 @@ def analyze_modset(
                 evidence=entry.mod.module.first("Priority"),
             )
         )
+    native_reports: dict[str, NativeLoaderReport] = {}
+    for entry in enabled_entries:
+        report = validate_native_mod(entry.mod.root)
+        native_reports[str(entry.mod.root).casefold()] = report
+        if not report.detected:
+            continue
+        issues.extend(
+            AuditIssue.from_value(
+                issue,
+                validator="compat-native-loader",
+                mod=entry.mod.name,
+            )
+            for issue in report.issues
+        )
     effective_configured_orders = [entry.configured_order for entry in enabled_entries]
     configured_orders = [item[0] for item in configured_entries]
     if effective_configured_orders != configured_orders:
@@ -508,6 +523,18 @@ def analyze_modset(
             "priority": entry.mod.module.priority,
             "effective_priority": entry.effective_priority,
             "priority_source": entry.priority_source,
+            "native_loader": {
+                "detected": native_reports[str(entry.mod.root).casefold()].detected,
+                "plugins": len(native_reports[str(entry.mod.root).casefold()].plugins),
+                "enabled_plugins": sum(
+                    plugin.enabled
+                    for plugin in native_reports[str(entry.mod.root).casefold()].plugins
+                ),
+                "static_validation_complete": native_reports[
+                    str(entry.mod.root).casefold()
+                ].complete,
+                "runtime_query_executed": False,
+            },
         }
         for index, entry in enumerate(enabled_entries)
     )

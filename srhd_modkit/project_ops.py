@@ -13,6 +13,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from .blockpar import load_blockpar
 from .files import iter_files, stage_tree
 from .module_info import find_module_info, parse_module_info
+from .native_loader import validate_native_mod
 from .project import (
     ArtifactCache,
     ModProject,
@@ -223,6 +224,11 @@ def initialize_project(
         for path in files
         if path.suffix.casefold() in {".csproj", ".vcxproj"}
         or path.name.casefold() == "cmakelists.txt"
+        or (
+            path.name.casefold() == "build.ps1"
+            and "native" in {part.casefold() for part in path.relative_to(mod_root).parts}
+            and path.relative_to(mod_root).parts[0].casefold() in {"source", "sources"}
+        )
     ]
     runtime_binaries = [
         path
@@ -261,13 +267,30 @@ def initialize_project(
             if external_project.suffix.casefold() == ".vcxproj"
             else "cmake"
             if external_project.name.casefold() == "cmakelists.txt"
+            else "xeno-native-plugin"
+            if external_project.name.casefold() == "build.ps1"
             else "msbuild-solution"
         )
-        matching_outputs = [
-            binary
-            for binary in runtime_binaries
-            if binary.stem.casefold() == external_project.stem.casefold()
-        ]
+        if kind == "xeno-native-plugin":
+            matching_outputs = [
+                binary
+                for binary in runtime_binaries
+                if binary.name.casefold().endswith(".xenoplugin.dll")
+                and "native" in {
+                    part.casefold() for part in binary.relative_to(mod_root).parts[:-1]
+                }
+            ]
+        else:
+            matching_outputs = [
+                binary
+                for binary in runtime_binaries
+                if binary.stem.casefold() == external_project.stem.casefold()
+                or (
+                    binary.name.casefold().endswith(".xenoplugin.dll")
+                    and binary.name[: -len(".XenoPlugin.dll")].casefold()
+                    == external_project.stem.casefold()
+                )
+            ]
         for binary in matching_outputs:
             claimed_runtime.add(str(binary).casefold())
         external_builds.append(
@@ -298,10 +321,11 @@ def initialize_project(
         if str(binary).casefold() in claimed_runtime:
             continue
         relative_binary = binary.relative_to(destination.parent).as_posix()
+        native_plugin = binary.name.casefold().endswith(".xenoplugin.dll")
         external_builds.append(
             {
                 "id": _identifier(binary.stem, f"runtime-{len(external_builds) + 1}"),
-                "kind": "prebuilt-binary",
+                "kind": "xeno-native-plugin" if native_plugin else "prebuilt-binary",
                 "project": relative_binary,
                 "mode": "unconfigured",
                 "outputs": [relative_binary],
@@ -310,7 +334,11 @@ def initialize_project(
         issues.append(
             {
                 "severity": "warning",
-                "code": "project-init-runtime-binary-unconfirmed",
+                "code": (
+                    "project-init-native-plugin-build-unconfirmed"
+                    if native_plugin
+                    else "project-init-runtime-binary-unconfirmed"
+                ),
                 "message": (
                     f"Поставляемый runtime-бинарник {binary.name} не связан с найденным "
                     "проектом сборки. Подтвердите его как prebuilt output либо укажите "
@@ -475,6 +503,16 @@ def initialize_project(
 
     _make_artifact_ids_unique(artifacts)
     _make_artifact_ids_unique(external_builds)
+    native_report = validate_native_mod(mod_root)
+    issues.extend(
+        {
+            "severity": item.severity,
+            "code": item.code,
+            "message": item.message,
+            "path": item.path,
+        }
+        for item in native_report.issues
+    )
     selected_name = name or module.name or mod_root.name
     selected_prefix = prefix or _default_prefix(mod_root)
     rendered = _render_project_toml(
@@ -508,6 +546,7 @@ def initialize_project(
         "prefix": selected_prefix,
         "artifacts": artifacts,
         "external_builds": external_builds,
+        "native_loader": native_report.as_dict() if native_report.detected else None,
         "issues": issues,
         "summary": {
             "artifacts": len(artifacts),

@@ -77,6 +77,18 @@ python -B srhd.py project clean --json
 сборку и может обновить `.srhd-build`/`.srhd-cache`. `project clean` без
 `--apply` является только dry-run; `--build` и `--cache` включаются явно.
 
+## XenoNativeLoader 0.6.5
+
+```powershell
+python -B srhd.py native init "<WORK>/MyNativeMod" --id MyNativeRuntime --json
+powershell -File "<WORK>/MyNativeMod/SOURCE/Native/build.ps1"
+python -B srhd.py native inspect "<WORK>/MyNativeMod/Native/MyNativeRuntime.XenoPlugin.dll" --json
+python -B srhd.py native validate "<WORK>/MyNativeMod" --json
+```
+
+Проверка не загружает DLL: доказываются discovery, INI, безопасные пути, x86
+PE32 и ABI exports. Runtime ID, capabilities и хуки оставлять Loader/игре.
+
 ## Языки и машинные схемы
 
 ```powershell

@@ -21,6 +21,7 @@ from .game_text import (
     lint_rson_display_text,
 )
 from .module_info import find_module_info, parse_module_info
+from .native_loader import validate_native_mod
 from .resources import UnsupportedResourceFormat, verify_resource
 from .quests import inspect_quest, load_quest, quest_media, verify_quest
 from .runtime_lint import (
@@ -725,6 +726,42 @@ def _python_sources_check(context: AuditContext) -> AuditCheck:
         tuple(issues),
         tuple(checked),
         details={"files": len(paths), "scope": "decode-and-compile-without-execution"},
+    )
+
+
+def _native_loader_check(context: AuditContext) -> AuditCheck:
+    name = "native-loader"
+    report = validate_native_mod(context.root)
+    if not report.detected:
+        return AuditCheck(
+            name,
+            "skipped",
+            details={"reason": "XenoNativeLoader plugin/manifest не найден"},
+        )
+    issues = tuple(
+        _issue(
+            context,
+            name,
+            issue.severity,
+            issue.code,
+            issue.message,
+            issue.path,
+            remediation=issue.remediation,
+        )
+        for issue in report.issues
+    )
+    checked = tuple(
+        str(plugin.dll)
+        for plugin in report.plugins
+        if plugin.dll is not None and plugin.dll.is_file()
+    )
+    return AuditCheck(
+        name,
+        _status(issues),
+        issues,
+        checked,
+        details=report.as_dict(),
+        complete=report.complete,
     )
 
 
@@ -1702,6 +1739,7 @@ def default_registry() -> AuditRegistry:
     registry.register("format-signatures", _format_signatures_check)
     registry.register("unknown-formats", _unknown_formats_check)
     registry.register("python-sources", _python_sources_check)
+    registry.register("native-loader", _native_loader_check)
     registry.register("blockpar-dat", _dat_check)
     registry.register("game-text", _text_check)
     registry.register("scripts", _script_check)

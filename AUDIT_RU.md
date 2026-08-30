@@ -267,8 +267,13 @@
   `srhd-modkit-deploy-plan-v1`, `srhd-modkit-deploy-v1`,
   `srhd-modkit-deployment-audit-v1`, `srhd-modkit-deployment-rollback-v1`,
   `srhd-modkit-deployment-cleanup-v1`,
-  `srhd-modkit-process-audit-v1` и
-  `srhd-modkit-process-cleanup-v1`.
+  `srhd-modkit-process-audit-v1`, `srhd-modkit-process-cleanup-v1` и
+  `srhd-modkit-native-loader-v1`.
+- Проверка `native-loader` разбирает automatic/manifest discovery
+  XenoNativeLoader 0.6.5, INI и безопасные пути, затем статически доказывает
+  x86 PE32 и обязательные ABI exports. Она не вызывает `XenoPlugin_Query`,
+  поэтому runtime ID, capabilities и установку хуков честно оставляет
+  динамическому Loader/игре.
 - Проектная сборка кэширует отдельные DAT/SCR только по полному отпечатку
   исходников, языковой базы, параметров и точных EXE. Кэшированный контейнер и
   весь итоговый мод повторно проходят обычный аудит; кэш не повышает покрытие.

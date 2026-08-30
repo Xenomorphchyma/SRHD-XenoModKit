@@ -20,6 +20,7 @@ Headless modding toolkit for **Space Rangers HD: A War Apart** / **Космич�
 - нативно читать, проверять, редактировать через JSON и собирать текстовые квесты `QM/QMM` без TGE;
 - анализировать зависимости и конфликты активного набора модов;
 - собирать варианты проекта, кэшировать дорогие компиляции и публиковать папку/ZIP из одного `srhd-modkit.toml`;
+- создавать и статически проверять x86-плагины XenoNativeLoader 0.6.5, не исполняя недоверенную DLL;
 - сохранять неизвестные форматы побайтно и отмечать неполное покрытие.
 
 ModKit разворачивает мод в игру только по явной `release deploy`,
@@ -153,6 +154,8 @@ python -B srhd.py project publish --variant release --json
 python -B srhd.py release upgrade-check C:\Work\MyMod-old C:\Work\MyMod-new --json
 python -B srhd.py lang coverage C:\Work\MyMod-new --base Rus --json
 python -B srhd.py schema validate C:\Work\MyMod-new.audit.json --json
+python -B srhd.py native init C:\Work\MyNativeMod --id MyNativeRuntime --json
+python -B srhd.py native validate C:\Work\MyNativeMod --json
 ```
 
 Полная схема, варианты, кэш, цели и восстановление описаны в

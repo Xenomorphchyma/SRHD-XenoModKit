@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "srhd-modkit-native-loader-v1",
+  "title": "SRHD ModKit XenoNativeLoader report",
+  "type": "object",
+  "required": ["schema", "root", "loader", "detected", "valid", "complete", "plugins", "issues", "summary"],
+  "properties": {
+    "schema": {"const": "srhd-modkit-native-loader-v1"},
+    "root": {"type": "string"},
+    "loader": {
+      "type": "object",
+      "required": ["minimum_version", "host_api", "activation", "runtime_query_executed"],
+      "properties": {
+        "minimum_version": {"type": "string"},
+        "host_api": {"type": "integer", "minimum": 1},
+        "activation": {"type": "string"},
+        "runtime_query_executed": {"const": false}
+      },
+      "additionalProperties": true
+    },
+    "detected": {"type": "boolean"},
+    "valid": {"type": "boolean"},
+    "complete": {"type": "boolean"},
+    "plugins": {"type": "array", "items": {"type": "object"}},
+    "issues": {"type": "array", "items": {"type": "object"}},
+    "summary": {"type": "object"}
+  },
+  "additionalProperties": true
+}

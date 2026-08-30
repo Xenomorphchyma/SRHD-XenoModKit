@@ -458,6 +458,7 @@ def _lint_unavailable_engine_calls(
 
 _OBJECT_API_ARGUMENTS: dict[str, tuple[int, ...]] = {
     "dist": (0, 1),
+    "getequipmentstats": (0,),
     "id": (0,),
     "itemexist": (0,),
     "planettostar": (0,),
@@ -472,6 +473,17 @@ _OBJECT_API_ARGUMENTS: dict[str, tuple[int, ...]] = {
     "starplanets": (0,),
     "starruins": (0,),
     "starships": (0,),
+}
+
+
+# RScript evaluates boolean operands eagerly, but not every engine API rejects
+# a zero handle.  These consumers are plausible object dereferences without a
+# dedicated crash trace; keep them advisory until game evidence proves that
+# API(0) is itself unsafe.  In particular Name(0), CoordX/Y and ItemSize are not
+# listed because real mods intentionally use zero-tolerant forms.
+_ADVISORY_OBJECT_API_ARGUMENTS: dict[str, tuple[int, ...]] = {
+    "planetowner": (0,),
+    "planetrace": (0,),
 }
 
 
@@ -550,7 +562,11 @@ def _boolean_statement(masked: str, position: int) -> tuple[int, int, str]:
 def _call_is_inside_leading_control_condition(statement: str, relative: int) -> bool | None:
     """Distinguish an if/while condition from its unbraced body statement."""
 
-    match = re.match(r"\s*(?:if|while|for)\s*\(", statement, re.IGNORECASE)
+    match = re.match(
+        r"\s*(?:(?:else\s+)?if|while|for)\s*\(",
+        statement,
+        re.IGNORECASE,
+    )
     if not match:
         return None
     depth = 1
@@ -945,7 +961,22 @@ def _lint_object_api_behind_boolean_guard(
         text = "\n".join(block.lines[1:])
         masked = _mask_non_code(text)
         reported: set[tuple[int, str, str]] = set()
-        for call, indexes in _OBJECT_API_ARGUMENTS.items():
+        consumers = (
+            *(
+                (call, indexes, "error", "runtime-object-api-behind-boolean-guard")
+                for call, indexes in _OBJECT_API_ARGUMENTS.items()
+            ),
+            *(
+                (
+                    call,
+                    indexes,
+                    "warning",
+                    "runtime-nullable-object-consumer-same-expression-guard",
+                )
+                for call, indexes in _ADVISORY_OBJECT_API_ARGUMENTS.items()
+            ),
+        )
+        for call, indexes, severity, code in consumers:
             for position, arguments, _end in _iter_parsed_calls(text, call):
                 statement_start, _statement_end, statement = _boolean_statement(masked, position)
                 in_control_condition = _call_is_inside_leading_control_condition(
@@ -983,9 +1014,16 @@ def _lint_object_api_behind_boolean_guard(
                     reported.add(key)
                     issues.append(
                         RuntimeIssue(
-                            "error",
-                            "runtime-object-api-behind-boolean-guard",
-                            f"{call} получает объект {variable}, безопасность которого доказывается только соседним операндом &&/||. RScript runtime не гарантирует короткое замыкание; вынесите проверку объекта в отдельный предшествующий if/exit, а вызов API — в следующую инструкцию",
+                            severity,
+                            code,
+                            (
+                                f"{call} получает объект {variable}, безопасность которого доказывается только соседним операндом &&/||. "
+                                "RScript runtime не гарантирует короткое замыкание; вынесите проверку объекта в отдельный предшествующий if/exit, а вызов API — в следующую инструкцию"
+                                if severity == "error"
+                                else
+                                f"{call} получает возможный nullable-объект {variable} за проверкой в том же &&/||. "
+                                "RScript вычисляет соседние операнды eagerly, но падение этого API на 0 пока не подтверждено; отдельный guard устранит зависимость от неявного поведения движка"
+                            ),
                             path,
                             f"{block.location} line {block.start_line + line_number}",
                             block.lines[line_number].strip(),

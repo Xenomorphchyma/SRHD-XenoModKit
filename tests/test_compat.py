@@ -1,10 +1,52 @@
 from __future__ import annotations
 
+import struct
 import tempfile
 import unittest
 from pathlib import Path
 
 from srhd_modkit.compat import analyze_modset
+
+
+def _native_plugin_dll() -> bytes:
+    pe_offset = 0x80
+    optional_size = 0xE0
+    optional = pe_offset + 24
+    section = optional + optional_size
+    data = bytearray(0x600)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, pe_offset)
+    data[pe_offset : pe_offset + 4] = b"PE\0\0"
+    struct.pack_into(
+        "<HHIIIHH", data, pe_offset + 4, 0x014C, 1, 0, 0, 0, optional_size, 0x2102
+    )
+    struct.pack_into("<H", data, optional, 0x10B)
+    struct.pack_into("<II", data, optional + 96, 0x1000, 0x120)
+    data[section : section + 8] = b".edata\0\0"
+    struct.pack_into("<IIII", data, section + 8, 0x300, 0x1000, 0x300, 0x200)
+    struct.pack_into(
+        "<IIHHIIIIIII",
+        data,
+        0x200,
+        0,
+        0,
+        0,
+        0,
+        0x1060,
+        1,
+        2,
+        2,
+        0x1040,
+        0x1048,
+        0x1050,
+    )
+    struct.pack_into("<II", data, 0x240, 0x1100, 0x1110)
+    struct.pack_into("<II", data, 0x248, 0x1080, 0x10A0)
+    struct.pack_into("<HH", data, 0x250, 0, 1)
+    data[0x260 : 0x260 + len(b"Fixture.dll\0")] = b"Fixture.dll\0"
+    data[0x280 : 0x280 + len(b"XenoPlugin_Query\0")] = b"XenoPlugin_Query\0"
+    data[0x2A0 : 0x2A0 + len(b"XenoPlugin_Initialize\0")] = b"XenoPlugin_Initialize\0"
+    return bytes(data)
 
 
 def _make_mod(
@@ -36,6 +78,34 @@ def _make_mod(
 
 
 class CompatibilityTests(unittest.TestCase):
+    def test_native_plugins_follow_effective_mod_order_without_executing_query(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            mods = base / "Mods"
+            native_mod = mods / "OtherMods" / "Native"
+            plain_mod = mods / "OtherMods" / "Plain"
+            _make_mod(native_mod, "Native", dependence="", priority=90)
+            _make_mod(plain_mod, "Plain", dependence="", priority=10)
+            native = native_mod / "Native"
+            native.mkdir()
+            (native / "Fixture.XenoPlugin.dll").write_bytes(_native_plugin_dll())
+            config = mods / "ModCFG.txt"
+            config.write_text(
+                "CurrentMod=OtherMods\\Native,OtherMods\\Plain\n",
+                encoding="cp1251",
+            )
+
+            report = analyze_modset(config, mods)
+            self.assertEqual([item["name"] for item in report.load_order], ["Plain", "Native"])
+            self.assertFalse(report.load_order[0]["native_loader"]["detected"])
+            self.assertEqual(report.load_order[1]["native_loader"]["plugins"], 1)
+            self.assertFalse(
+                report.load_order[1]["native_loader"]["runtime_query_executed"]
+            )
+            self.assertFalse(
+                report.load_order[1]["native_loader"]["static_validation_complete"]
+            )
+
     def test_modset_reports_cycles_and_classifies_overlays_without_a_winner(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             base = Path(name)
