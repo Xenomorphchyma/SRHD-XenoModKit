@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -13,6 +14,16 @@ from srhd_modkit.blockpar import BlockParError, load_blockpar, parse_blockpar
 from srhd_modkit.audit import AuditProfile, audit_mod
 from srhd_modkit.cli import _game_text_lint_target, cmd_dat_validate
 from srhd_modkit.toolchain import Toolchain, is_empty_rscript_lang_dat
+
+
+def find_workspace_root() -> Path | None:
+    configured = os.environ.get("SRHD_WORKSPACE_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "Tools" / "SRHDModKit" / "srhd.py").is_file():
+            return parent
+    return None
 
 
 SAMPLE = """Data ^{\r
@@ -92,7 +103,18 @@ class BlockParCliIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.chain = Toolchain()
-        cls.source = Path(r"D:\SRHD_Modding\Projects\ModWorkspaces\Kotyanka\Cat_PirateClan\CFG\Main.dat")
+        workspace_root = find_workspace_root()
+        cls.source = (
+            workspace_root
+            / "References"
+            / "ExternalMods"
+            / "Kotyanka"
+            / "Cat_PirateClan"
+            / "CFG"
+            / "Main.dat"
+            if workspace_root is not None
+            else Path("__missing_srhd_workspace__")
+        )
 
     def test_real_dat_text_dat_roundtrip_is_semantically_exact(self) -> None:
         if not self.chain.tools["blockpar"].path.is_file() or not self.source.is_file():
