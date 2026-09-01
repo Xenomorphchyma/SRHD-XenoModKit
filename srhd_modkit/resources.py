@@ -23,6 +23,8 @@ from .image_codec import (
 GAI_MAGIC = b"gai\0"
 GI_MAGIC = b"gi\0\0"
 HAI_MAGIC = 0x04210420
+PKG_GAME_CHUNK_SIZE = 64 * 1024
+PKG_ZLIB_LEVEL = 9
 
 
 class ResourceFormatError(ValueError):
@@ -388,7 +390,7 @@ class PkgInfo:
             raise ResourceFormatError(f"PKG: блок {entry.name} обрезан")
         return block
 
-    def decompress(self, entry: PkgEntry) -> bytes:
+    def _decode_entry(self, entry: PkgEntry) -> tuple[bytes, tuple[int, ...]]:
         block = self._block(entry)
         if entry.kind == 1:
             if len(block) < 4 or _u32(block, 0, "PKG raw block size") != len(block) - 4:
@@ -398,11 +400,12 @@ class PkgInfo:
                 raise ResourceFormatError(
                     f"PKG: {entry.name} содержит {len(payload)} байт вместо {entry.uncompressed_size}"
                 )
-            return payload
+            return payload, ()
         if len(block) < 14 or _u32(block, 0, "PKG block size") != len(block) - 4:
             raise ResourceFormatError(f"PKG: неверный размер блока {entry.name}")
         position = 4
         output = bytearray()
+        raw_chunk_sizes: list[int] = []
         while position < len(block):
             chunk_size = _u32(block, position, "PKG chunk size")
             chunk_start = position + 4
@@ -413,6 +416,7 @@ class PkgInfo:
             if chunk[:4] != b"ZL02":
                 raise ResourceFormatError(f"PKG: блок {entry.name}, отсутствует ZL02")
             expected = _u32(chunk, 4, "PKG raw chunk size")
+            raw_chunk_sizes.append(expected)
             decoder = zlib.decompressobj()
             try:
                 decoded = decoder.decompress(chunk[8:]) + decoder.flush()
@@ -430,12 +434,64 @@ class PkgInfo:
             raise ResourceFormatError(
                 f"PKG: {entry.name} распакован в {len(output)} байт вместо {entry.uncompressed_size}"
             )
-        return bytes(output)
+        return bytes(output), tuple(raw_chunk_sizes)
+
+    def decompress(self, entry: PkgEntry) -> bytes:
+        return self._decode_entry(entry)[0]
 
     def verify(self) -> dict[str, Any]:
+        nonstandard_entries: list[dict[str, Any]] = []
+        max_uncompressed_chunk_size = 0
         for entry in self.entries:
-            self.decompress(entry)
+            _, raw_chunk_sizes = self._decode_entry(entry)
+            entry_max = max(raw_chunk_sizes, default=0)
+            max_uncompressed_chunk_size = max(max_uncompressed_chunk_size, entry_max)
+            if entry_max > PKG_GAME_CHUNK_SIZE:
+                nonstandard_entries.append(
+                    {
+                        "entry": entry.relative_path.as_posix(),
+                        "max_uncompressed_chunk_size": entry_max,
+                    }
+                )
+        compatibility_issues: list[dict[str, Any]] = []
+        if nonstandard_entries:
+            examples = ", ".join(item["entry"] for item in nonstandard_entries[:3])
+            if len(nonstandard_entries) > 3:
+                examples += f", … (+{len(nonstandard_entries) - 3})"
+            compatibility_issues.append(
+                {
+                    "severity": "error",
+                    "code": "pkg-zl02-chunk-exceeds-game-compatible-size",
+                    "message": (
+                        f"PKG содержит {len(nonstandard_entries)} записей с ZL02-блоками "
+                        f"до {max_uncompressed_chunk_size} несжатых байт; штатные пакеты "
+                        f"SRHD 2.1.2500 используют не более {PKG_GAME_CHUNK_SIZE} байт. "
+                        "Более крупные блоки приводили к TFileEC.Read при потоковой загрузке GI"
+                    ),
+                    "evidence": (
+                        f"entries={examples}; max_uncompressed_chunk={max_uncompressed_chunk_size}; "
+                        f"observed_game_limit={PKG_GAME_CHUNK_SIZE}"
+                    ),
+                    "remediation": (
+                        "Пересоберите пакет штатными блоками ModKit по 64 КиБ либо "
+                        "опубликуйте ресурсы как loose-файлы"
+                    ),
+                }
+            )
         value = self.summary()
+        value["structurally_valid"] = True
+        value["decoded_valid"] = True
+        value["roundtrip_valid"] = None
+        value["game_runtime_compatibility"] = "not-proven"
+        value["game_streaming_layout"] = (
+            "nonstandard-zl02-chunk-size"
+            if compatibility_issues
+            else "matches-shipped-zl02-chunk-size"
+        )
+        value["recommended_max_uncompressed_chunk_size"] = PKG_GAME_CHUNK_SIZE
+        value["max_uncompressed_chunk_size"] = max_uncompressed_chunk_size
+        value["nonstandard_zl02_entries"] = nonstandard_entries
+        value["compatibility_issues"] = compatibility_issues
         value["verified_files"] = len(self.entries)
         value["verified_uncompressed_size"] = self.uncompressed_size
         return value
@@ -774,12 +830,12 @@ def _encode_pkg_block(source: Path, output: Path, chunk_size: int) -> tuple[int,
         target.write(bytes(4))
         while raw := input_stream.read(chunk_size):
             uncompressed += len(raw)
-            compressed = zlib.compress(raw, level=9)
+            compressed = zlib.compress(raw, level=PKG_ZLIB_LEVEL)
             chunk = b"ZL02" + struct.pack("<I", len(raw)) + compressed
             target.write(struct.pack("<I", len(chunk)))
             target.write(chunk)
         if uncompressed == 0:
-            compressed = zlib.compress(b"", level=9)
+            compressed = zlib.compress(b"", level=PKG_ZLIB_LEVEL)
             chunk = b"ZL02" + struct.pack("<I", 0) + compressed
             target.write(struct.pack("<I", len(chunk)))
             target.write(chunk)
@@ -795,7 +851,7 @@ def build_pkg(
     *,
     package_folders: Sequence[str] | None = None,
     template: str | Path | None = None,
-    chunk_size: int = 1024 * 1024,
+    chunk_size: int = PKG_GAME_CHUNK_SIZE,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     raw_source = Path(source_dir).absolute()
@@ -811,6 +867,12 @@ def build_pkg(
         raise FileExistsError(f"Результат уже существует: {output}")
     if chunk_size <= 0:
         raise ValueError("chunk_size должен быть положительным")
+    if chunk_size > PKG_GAME_CHUNK_SIZE:
+        raise ValueError(
+            "Размер ZL02-блока PKG не должен превышать 64 КиБ: штатные пакеты "
+            "SRHD 2.1.2500 используют максимум 65536 байт, а более крупные блоки "
+            "приводили к сбоям TFileEC.Read при потоковой загрузке GI"
+        )
 
     template_info = inspect_pkg(template) if template is not None else None
     folders = tuple(package_folders) if package_folders is not None else (
@@ -931,7 +993,9 @@ def build_pkg(
                         archive.write(chunk)
 
         rebuilt = inspect_pkg(staged)
-        rebuilt.verify()
+        verification = rebuilt.verify()
+        if verification["compatibility_issues"]:
+            raise ResourceFormatError("PKG: результат не соответствует игровой ZL02-разбивке")
         expected = {
             (Path(*folders) / path.relative_to(source_dir)).as_posix().casefold(): sha256_file(path)
             for path in source_files
@@ -953,6 +1017,13 @@ def build_pkg(
         "size": output.stat().st_size,
         "sha256": sha256_file(output),
         "verified": True,
+        "structurally_valid": True,
+        "roundtrip_valid": True,
+        "game_runtime_compatibility": "not-proven",
+        "game_streaming_layout": verification["game_streaming_layout"],
+        "max_uncompressed_chunk_size": verification["max_uncompressed_chunk_size"],
+        "recommended_max_uncompressed_chunk_size": PKG_GAME_CHUNK_SIZE,
+        "compatibility_issues": [],
     }
 
 

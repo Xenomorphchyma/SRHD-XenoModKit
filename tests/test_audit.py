@@ -4,6 +4,7 @@ import json
 import tempfile
 import struct
 import unittest
+import zlib
 from pathlib import Path
 
 from srhd_modkit.audit import AuditProfile, audit_mod
@@ -36,6 +37,25 @@ def _jpeg(width: int = 343, height: int = 394, components: int = 3) -> bytes:
     component_data = b"".join(bytes((index + 1, 0x11, 0)) for index in range(components))
     sof = bytes((8,)) + struct.pack(">HHB", height, width, components) + component_data
     return b"\xff\xd8\xff\xc0" + struct.pack(">H", len(sof) + 2) + sof + b"\xff\xd9"
+
+
+def _pkg_with_single_zl02_chunk(payload: bytes, name: str = "Frame.gi") -> bytes:
+    compressed = zlib.compress(payload, level=9)
+    chunk = b"ZL02" + struct.pack("<I", len(payload)) + compressed
+    block = struct.pack("<I", 4 + len(chunk)) + struct.pack("<I", len(chunk)) + chunk
+    data_offset = 344
+    data = bytearray(data_offset)
+    struct.pack_into("<I", data, 0, 0)
+    struct.pack_into("<III", data, 4, 170, 1, 158)
+    data[24:28] = b"MODS"
+    data[87:91] = b"Mods"
+    struct.pack_into("<II", data, 174, 170, 1)
+    name_offset = 194
+    struct.pack_into("<II", data, name_offset - 8, len(block), len(payload))
+    data[name_offset : name_offset + len(name)] = name.upper().encode("ascii")
+    data[name_offset + 63 : name_offset + 63 + len(name)] = name.encode("ascii")
+    struct.pack_into("<I", data, name_offset + 142, data_offset)
+    return bytes(data) + block
 
 
 def _quest() -> QuestDocument:
@@ -716,6 +736,25 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(issue.severity, "warning")
             self.assertFalse(any(item.code == "resource-invalid" for item in check.issues))
             self.assertNotIn(issue, report.blocking_issues())
+
+    def test_release_blocks_pkg_with_nonstandard_large_zl02_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            package = root / "DATA" / "unsafe.pkg"
+            package.write_bytes(_pkg_with_single_zl02_chunk(bytes(70_000)))
+
+            report = audit_mod(root, profile="release")
+            issue = next(
+                item
+                for item in report.issues
+                if item.code == "pkg-zl02-chunk-exceeds-game-compatible-size"
+            )
+
+            self.assertEqual(issue.severity, "error")
+            self.assertEqual(Path(issue.path), package.resolve())
+            self.assertIn("entries=Mods/Frame.gi", issue.evidence or "")
+            self.assertIn(issue, report.blocking_issues())
 
     def test_unknown_format_is_passthrough_but_coverage_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as name:

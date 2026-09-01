@@ -661,6 +661,16 @@ def _resource_integrity_check(context: AuditContext) -> AuditCheck:
         try:
             result = verify_resource(path)
             checked.append(str(path))
+            if path.suffix.casefold() == ".pkg":
+                issues.extend(
+                    AuditIssue.from_value(
+                        item,
+                        validator=name,
+                        mod=context.mod_name,
+                        path=path,
+                    )
+                    for item in result.get("compatibility_issues", ())
+                )
             if path.suffix.casefold() == ".gai" and result.get("empty_placeholder"):
                 issues.append(
                     _issue(

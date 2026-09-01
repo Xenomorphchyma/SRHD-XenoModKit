@@ -166,7 +166,9 @@ class ResourceTests(unittest.TestCase):
             self.assertEqual(info.folders, ("Mods",))
             self.assertEqual(info.entries[0].name, "Frame.gi")
             self.assertEqual(info.decompress(info.entries[0]), payload)
-            self.assertEqual(info.verify()["verified_files"], 1)
+            verification = info.verify()
+            self.assertEqual(verification["verified_files"], 1)
+            self.assertEqual(verification["compatibility_issues"], [])
             extract_resource(source, root / "unpacked")
             self.assertEqual((root / "unpacked" / "Mods" / "Frame.gi").read_bytes(), payload)
 
@@ -223,6 +225,49 @@ class ResourceTests(unittest.TestCase):
             self.assertEqual(output.stat().st_size, first_size)
             paths = {entry.relative_path.name for entry in inspect_pkg(output).entries}
             self.assertEqual(paths, {"payload.bin"})
+
+    def test_pkg_writer_uses_game_compatible_64k_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "source"
+            source.mkdir()
+            (source / "large.gi").write_bytes(_gi(2558, 1440) + bytes(160_000))
+            output = root / "output.pkg"
+
+            result = build_pkg(source, output, package_folders=("Mods", "Fixture"))
+            verification = inspect_pkg(output).verify()
+
+            self.assertTrue(result["roundtrip_valid"])
+            self.assertEqual(result["max_uncompressed_chunk_size"], 65_536)
+            self.assertEqual(verification["max_uncompressed_chunk_size"], 65_536)
+            self.assertEqual(verification["compatibility_issues"], [])
+            self.assertEqual(
+                verification["game_streaming_layout"],
+                "matches-shipped-zl02-chunk-size",
+            )
+
+            with self.assertRaisesRegex(ValueError, "64 КиБ"):
+                build_pkg(
+                    source,
+                    root / "unsafe.pkg",
+                    package_folders=("Mods", "Fixture"),
+                    chunk_size=65_537,
+                )
+
+    def test_pkg_verify_reports_old_oversized_zl02_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "old.pkg"
+            path.write_bytes(_pkg(_gi(2558, 1440) + bytes(70_000)))
+
+            result = verify_resource(path)
+
+            issue = result["compatibility_issues"][0]
+            self.assertEqual(
+                issue["code"],
+                "pkg-zl02-chunk-exceeds-game-compatible-size",
+            )
+            self.assertEqual(result["game_streaming_layout"], "nonstandard-zl02-chunk-size")
+            self.assertGreater(result["max_uncompressed_chunk_size"], 65_536)
 
 
 if __name__ == "__main__":

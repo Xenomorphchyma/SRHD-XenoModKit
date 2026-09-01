@@ -237,6 +237,13 @@ python -B srhd.py convert gi-png "<WORK>/Images" -o "<TEMP>/PNG"
 python -B srhd.py convert png-gi "<TEMP>/PNG" -o "<OUT>/Images" --mode 0_32
 ```
 
+`build-pkg` по умолчанию использует подтверждённые штатными пакетами ZL02-блоки
+по 64 КиБ и не принимает более крупные. `resource verify` возвращает ненулевой
+код и `pkg-zl02-chunk-exceeds-game-compatible-size`, если старый или сторонний
+PKG структурно распаковывается, но содержит неподтверждённую игровым reader
+разбивку. Это не переименовывается в повреждение данных: JSON отдельно хранит
+`structurally_valid`, `roundtrip_valid` и `game_runtime_compatibility`.
+
 Для назначения `<MOD>/DATA/ItemsUseless` использовать `--mode 2`, если редкий
 формат не подтверждён игровым тестом. Другой режим не блокируется, но
 `ConversionItem.recommendations` и CLI сообщат

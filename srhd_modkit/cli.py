@@ -22,7 +22,14 @@ from .toolchain import (
 )
 from .blockpar import BlockParDocument, BlockParNode, load_blockpar
 from .scripts import inspect_scr, load_rson
-from .resources import build_gai, build_pkg, extract_resource, inspect_resource, verify_resource
+from .resources import (
+    PKG_GAME_CHUNK_SIZE,
+    build_gai,
+    build_pkg,
+    extract_resource,
+    inspect_resource,
+    verify_resource,
+)
 from .quests import (
     build_quest_from_json,
     export_quest_json,
@@ -870,12 +877,23 @@ def cmd_resource_verify(args: argparse.Namespace) -> int:
         print_json(result)
     elif result["format"] == "resource package":
         print(
-            f"PKG корректен: распаковано и проверено {result['verified_files']} файлов, "
+            f"PKG структурно корректен: распаковано и проверено {result['verified_files']} файлов, "
             f"{human_size(result['verified_uncompressed_size'])}"
         )
+        print(
+            "ZL02-разбивка: "
+            + (
+                "НЕ соответствует штатным PKG SRHD"
+                if result["compatibility_issues"]
+                else "соответствует штатному пределу 64 КиБ"
+            )
+        )
+        for issue in result["compatibility_issues"]:
+            print(f"ERROR {issue['code']}: {issue['message']}")
+        print("Runtime в игре: не доказан структурной проверкой")
     else:
         print(f"{result['format']} корректен: структура и границы данных проверены.")
-    return 0
+    return 1 if result.get("compatibility_issues") else 0
 
 
 def cmd_resource_extract(args: argparse.Namespace) -> int:
@@ -3158,7 +3176,12 @@ def build_parser() -> argparse.ArgumentParser:
     resource_build_pkg.add_argument("output")
     resource_build_pkg.add_argument("--folder", dest="folders", action="append", help="Компонент пути внутри PKG; ключ повторяется")
     resource_build_pkg.add_argument("--template", help="Исходный PKG для сохранения корневого заголовка/пути")
-    resource_build_pkg.add_argument("--chunk-size", type=parse_size, default=1024 * 1024)
+    resource_build_pkg.add_argument(
+        "--chunk-size",
+        type=parse_size,
+        default=PKG_GAME_CHUNK_SIZE,
+        help="Размер несжатого ZL02-блока, не более 64 КиБ (штатный формат игры)",
+    )
     resource_build_pkg.add_argument("--overwrite", action="store_true")
     resource_build_pkg.add_argument("--json", action="store_true")
     resource_build_pkg.set_defaults(func=cmd_resource_build_pkg)
