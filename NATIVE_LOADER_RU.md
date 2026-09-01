@@ -1,6 +1,10 @@
 # XenoNativeLoader и SRHD ModKit
 
-Поддерживаемый контракт: **XenoNativeLoader 0.6.5**, C ABI Host API V1.
+Поддерживаемый контракт: **XenoNativeLoader 0.6.5+**, C ABI Host API V1;
+актуальная проверенная версия — **0.6.7**. Loader и готовые реальные примеры
+модов публикуются отдельно в
+**[XenoMods](https://github.com/Xenomorphchyma/XenoMods)** и не являются
+обязательной зависимостью самого ModKit.
 ModKit работает с нативной частью конкретного мода и не устанавливает общие
 `dsound.dll`, `XenoCore.dll` или `XenoNative.ini` рядом с `Rangers.exe`.
 
@@ -71,3 +75,12 @@ PE export, не загружая DLL.
 и проверку `Dependence`. Для каждой позиции отчёт показывает число найденных
 плагинов. Совпадения runtime ID и эксклюзивных capabilities статически не
 объявляются: для этого Loader должен безопасно вызвать Query при запуске игры.
+
+## Проверка совместимости 0.6.7
+
+Scaffold `native init` собран MSVC как настоящий x86 PE32, затем прошёл
+`native inspect`, `native validate` и `project build`. Теми же проверками без
+native/ImportedFunction-ошибок обработаны пять опубликованных примеров из
+XenoMods: XenoBigGalaxy, XenoCoalitionSupplyLines, XenoDomRangers,
+XenoEquipmentInflation и XenoHangarPaging. Это подтверждает файловый layout и
+Host API V1, но не заменяет вызов Query и установку хуков самим Loader в игре.

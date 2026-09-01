@@ -1,6 +1,6 @@
-# Аудит полноты SRHD ModKit 0.10.0
+# Аудит полноты SRHD ModKit 0.10.1
 
-Проверено 11 августа 2026 года без видимого GUI и без изменения файлов игры.
+Проверено 2 сентября 2026 года без видимого GUI и без изменения файлов игры.
 
 ## Универсальный контур
 
@@ -279,7 +279,7 @@
   `srhd-modkit-process-audit-v1`, `srhd-modkit-process-cleanup-v1` и
   `srhd-modkit-native-loader-v1`.
 - Проверка `native-loader` разбирает automatic/manifest discovery
-  XenoNativeLoader 0.6.5, INI и безопасные пути, затем статически доказывает
+  XenoNativeLoader Host API V1 (минимум 0.6.5, проверено 0.6.7), INI и безопасные пути, затем статически доказывает
   x86 PE32 и обязательные ABI exports. Она не вызывает `XenoPlugin_Query`,
   поэтому runtime ID, capabilities и установку хуков честно оставляет
   динамическому Loader/игре.

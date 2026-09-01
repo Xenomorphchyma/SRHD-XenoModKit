@@ -15,7 +15,11 @@ from .module_info import find_module_info, parse_module_info
 
 
 NATIVE_LOADER_SCHEMA = "srhd-modkit-native-loader-v1"
-NATIVE_LOADER_VERSION = "0.6.5"
+NATIVE_LOADER_MINIMUM_VERSION = "0.6.5"
+NATIVE_LOADER_TESTED_VERSION = "0.6.7"
+NATIVE_LOADER_SOURCE_URL = "https://github.com/Xenomorphchyma/XenoMods"
+# Public compatibility alias retained for callers that used the original API.
+NATIVE_LOADER_VERSION = NATIVE_LOADER_MINIMUM_VERSION
 NATIVE_HOST_API = 1
 _QUERY_EXPORT = "XenoPlugin_Query"
 _INITIALIZE_EXPORT = "XenoPlugin_Initialize"
@@ -104,6 +108,8 @@ class NativeLoaderReport:
             "root": str(self.root),
             "loader": {
                 "minimum_version": NATIVE_LOADER_VERSION,
+                "tested_version": NATIVE_LOADER_TESTED_VERSION,
+                "source": NATIVE_LOADER_SOURCE_URL,
                 "host_api": NATIVE_HOST_API,
                 "activation": "active-ModCFG-entry + ModuleInfo Priority/Dependence",
                 "runtime_query_executed": False,
@@ -220,7 +226,7 @@ def _decode_ini(path: Path) -> str:
     if data.startswith(b"\xff\xfe"):
         return data.decode("utf-16")
     if data.startswith(b"\xfe\xff"):
-        raise UnicodeError("XenoNativeLoader 0.6.5 поддерживает UTF-16LE BOM, но не UTF-16BE")
+        raise UnicodeError("XenoNativeLoader Host API V1 поддерживает UTF-16LE BOM, но не UTF-16BE")
     if data.startswith(b"\xef\xbb\xbf"):
         return data.decode("utf-8-sig")
     try:
@@ -583,7 +589,7 @@ def initialize_native_mod(
     capability: str = "none",
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Create a minimal, auditable XenoNativeLoader 0.6.5 plugin project."""
+    """Create a minimal, auditable Host API V1 plugin tested with Loader 0.6.7."""
 
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,62}", plugin_id) is None:
         raise ValueError("plugin id должен начинаться с латинской буквы и содержать до 63 ASCII-символов")
@@ -716,6 +722,8 @@ outputs = ["{relative_mod}/Native/{plugin_id}.XenoPlugin.dll"]
         "root": str(root),
         "plugin_id": plugin_id,
         "loader_minimum_version": NATIVE_LOADER_VERSION,
+        "loader_tested_version": NATIVE_LOADER_TESTED_VERSION,
+        "loader_source": NATIVE_LOADER_SOURCE_URL,
         "host_api": NATIVE_HOST_API,
         "files": [str(path) for path in generated],
         "next": [
@@ -728,7 +736,10 @@ outputs = ["{relative_mod}/Native/{plugin_id}.XenoPlugin.dll"]
 
 __all__ = [
     "NATIVE_HOST_API",
+    "NATIVE_LOADER_MINIMUM_VERSION",
     "NATIVE_LOADER_SCHEMA",
+    "NATIVE_LOADER_SOURCE_URL",
+    "NATIVE_LOADER_TESTED_VERSION",
     "NATIVE_LOADER_VERSION",
     "NativeLoaderIssue",
     "NativeLoaderReport",

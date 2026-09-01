@@ -241,7 +241,14 @@ class NativeLoaderTests(unittest.TestCase):
             self.assertTrue(report.detected)
             self.assertFalse(report.complete)
             self.assertEqual(report.plugins[0].source, "automatic")
-            self.assertTrue(validate_schema_document(report.as_dict())["valid"])
+            payload = report.as_dict()
+            self.assertEqual(payload["loader"]["minimum_version"], "0.6.5")
+            self.assertEqual(payload["loader"]["tested_version"], "0.6.7")
+            self.assertEqual(
+                payload["loader"]["source"],
+                "https://github.com/Xenomorphchyma/XenoMods",
+            )
+            self.assertTrue(validate_schema_document(payload)["valid"])
             audit = audit_mod(root, profile="dev")
             check = next(item for item in audit.checks if item.name == "native-loader")
             self.assertEqual(check.status, "passed")
@@ -280,6 +287,11 @@ class NativeLoaderTests(unittest.TestCase):
                 capability="galaxy-generator",
             )
             self.assertEqual(result["loader_minimum_version"], "0.6.5")
+            self.assertEqual(result["loader_tested_version"], "0.6.7")
+            self.assertEqual(
+                result["loader_source"],
+                "https://github.com/Xenomorphchyma/XenoMods",
+            )
             self.assertTrue((root / "SOURCE" / "Native" / "build.ps1").is_file())
             build_text = (root / "SOURCE" / "Native" / "build.ps1").read_text(
                 encoding="utf-8"

@@ -139,7 +139,10 @@ from .hidden_process import (
 )
 from .native_loader import (
     NATIVE_HOST_API,
+    NATIVE_LOADER_MINIMUM_VERSION,
     NATIVE_LOADER_SCHEMA,
+    NATIVE_LOADER_SOURCE_URL,
+    NATIVE_LOADER_TESTED_VERSION,
     NATIVE_LOADER_VERSION,
     NativeLoaderIssue,
     NativeLoaderReport,
@@ -310,7 +313,10 @@ __all__ = [
     "inspect_hidden_processes",
     "terminate_hidden_processes",
     "NATIVE_HOST_API",
+    "NATIVE_LOADER_MINIMUM_VERSION",
     "NATIVE_LOADER_SCHEMA",
+    "NATIVE_LOADER_SOURCE_URL",
+    "NATIVE_LOADER_TESTED_VERSION",
     "NATIVE_LOADER_VERSION",
     "NativeLoaderIssue",
     "NativeLoaderReport",
@@ -341,4 +347,4 @@ __all__ = [
     "build_quest_from_json",
 ]
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"

@@ -1,4 +1,4 @@
-# Команды SRHD ModKit 0.10.0
+# Команды SRHD ModKit 0.10.1
 
 Все команды выполнять из `<MODKIT_ROOT>` — корня репозитория с `srhd.py`. Пути с пробелами заключать в кавычки. Добавлять `--json` для машинного разбора: код `0` означает успех, `2` — найденные блокирующие проблемы, `3` — не выполнившуюся audit-проверку, `1` — прочую операционную ошибку.
 
@@ -77,7 +77,7 @@ python -B srhd.py project clean --json
 сборку и может обновить `.srhd-build`/`.srhd-cache`. `project clean` без
 `--apply` является только dry-run; `--build` и `--cache` включаются явно.
 
-## XenoNativeLoader 0.6.5
+## XenoNativeLoader Host API V1 (0.6.5+, проверено 0.6.7)
 
 ```powershell
 python -B srhd.py native init "<WORK>/MyNativeMod" --id MyNativeRuntime --json
@@ -85,6 +85,10 @@ powershell -File "<WORK>/MyNativeMod/SOURCE/Native/build.ps1"
 python -B srhd.py native inspect "<WORK>/MyNativeMod/Native/MyNativeRuntime.XenoPlugin.dll" --json
 python -B srhd.py native validate "<WORK>/MyNativeMod" --json
 ```
+
+Loader необязателен и не включён в ModKit. Проверенная версия 0.6.7 и реальные
+примеры automatic/manifest-плагинов доступны в
+`https://github.com/Xenomorphchyma/XenoMods`.
 
 Проверка не загружает DLL: доказываются discovery, INI, безопасные пути, x86
 PE32 и ABI exports. Runtime ID, capabilities и хуки оставлять Loader/игре.

@@ -1,4 +1,4 @@
-# SRHD ModKit 0.10.0
+# SRHD ModKit 0.10.1
 
 Публичная GitHub-версия называется **SRHD XenoModKit**. Внутренние имена
 каталога, Python-пакета и CLI не переименованы. Автор и сопровождающий:
@@ -22,18 +22,15 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 описания внешних зависимостей начните с [основного README](README.md) и
 [THIRD_PARTY_TOOLS_RU.md](THIRD_PARTY_TOOLS_RU.md).
 
-## Новое в 0.10.0
+## Новое в 0.10.1
 
-- Исправлен внутренний `NameError` в `script audit-mod` при сопоставлении готового SCR с точной регистрацией в `CFG/Main.dat`; добавлен регрессионный тест этой ветки.
-- `project init` создаёт проверяемый черновик без догадок при неоднозначных соответствиях; найденные C++/C# проекты, DLL и launcher требуют явного подтверждения `external_builds` до выпуска.
-- `project plan`, `project doctor` и `project clean` показывают кэш, пересборки, итоговый состав, инструменты и служебный мусор; очистка по умолчанию является dry-run.
-- `release upgrade-check` сводит проверки обновления ModuleInfo, скриптов, persistent-хранилища, SAV-кэша, конфигурации и удалённых ресурсов.
-- `lang extract/build/diff/coverage` упрощают работу с несколькими игровыми языками и обнаруживают пропущенные ключи и кодовые заглушки.
-- В пакет включены JSON Schema для основных машинных отчётов и команды `schema list/show/validate`.
-- Новые команды переиспользуют существующие audit, BlockPar, compare и project API и не создают отдельную параллельную систему сборки.
-- `doctor processes` отличает краткий след уже завершившегося Windows desktop от реально работающего helper-процесса.
-- Публикация связанных SCR/Lang и ZIP/manifest/audit стала единой транзакцией; ZIP/manifest, кэш, variant overlay, rollback и deploy cleanup проверяют обход путей, дубли, устаревшие outputs и неопределённый PID до удаления данных.
-- `project plan` остаётся полностью пассивным, а `project deploy --dry-run` честно помечает, что ради точного состава может обновить только служебные build/cache, но не папку игры.
+- Добавлен необязательный workflow XenoNativeLoader Host API V1: `native init`, `native inspect` и `native validate` создают MSVC x86-проект, проверяют PE32, discovery, INI и ABI exports без загрузки DLL. Минимум — 0.6.5, совместимость сверена с XenoNativeLoader 0.6.7 из [XenoMods](https://github.com/Xenomorphchyma/XenoMods).
+- `project init/build` распознаёт нативные outputs консервативно: готовые DLL публикуются только как явно объявленный `external_builds`, а `dsound.dll`, `XenoCore.dll` и общий `XenoNative.ini` не попадают внутрь обычного мода.
+- Вызовы `ImportedFunction` теперь сопоставляются с `Data/ScriptLibs`, привязкой ScriptName, сигнатурой и числом аргументов; при локальной DLL также проверяется точный PE-экспорт.
+- Runtime-lint больше не считает `obj && Consumer(obj)` и `!obj || Consumer(obj)` безопасным null-guard для объектных handles: RScript не гарантирует short-circuit.
+- PKG writer повторяет штатную ZL02-разбивку по 64 КиБ. Старые блоки по 1 МиБ остаются извлекаемыми, но `resource verify` и релизный аудит блокируют их из-за подтверждённого риска `TFileEC.Read`.
+- JSON и документация честно разделяют структурную проверку native/PKG и фактический runtime в Loader или игре.
+- Регрессия выпуска: 389 тестов, 2 штатных пропуска и 30 подтестов успешно.
 
 ## Поддержка форматов
 
@@ -49,7 +46,7 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 | `.scr` | версия, строки и фрагменты кода, настоящий CLI SCR→RSON и сборка | собственный анализатор + RScript 4.15f |
 | `.rson`, `.rsm` | граф/модули, экспорт, сборка и смысловой runtime-lint | Python + RScript 4.15f + rsmc |
 | `.svr` | legacy-конвертация RSON↔SVR | совместимый RScript 4.10f из setup |
-| `.XenoPlugin.dll`, `.XenoManifest.ini` | PE32/x86, ABI exports, manifest/config discovery и безопасные пути XenoNativeLoader 0.6.5 | собственный статический инспектор; DLL не исполняется |
+| `.XenoPlugin.dll`, `.XenoManifest.ini` | PE32/x86, ABI exports, manifest/config discovery и безопасные пути XenoNativeLoader Host API V1 (проверено 0.6.7) | собственный статический инспектор; DLL не исполняется |
 | `.txt`, `.ini`, `.cfg`, `.json` | обычная текстовая обработка | Python |
 | `.wav`, `.dds`, `.webm`, `.psd`, `.jpg`, `.bmp`, `.vdo`, архивы, неизвестные | проверка известных сигнатур и точное копирование | standard/passthrough |
 
@@ -122,7 +119,7 @@ python srhd.py formats D:\SRHD_Modding\Projects\ModWorkspaces
 python srhd.py formats D:\path\file.dat --hash
 ```
 
-## XenoNativeLoader 0.6.5
+## XenoNativeLoader Host API V1
 
 ```powershell
 python -B srhd.py native init D:\Work\MyNativeMod --id MyNativeRuntime --json
@@ -139,7 +136,10 @@ x86 PE32 и точные ABI exports `XenoPlugin_Query` / `XenoPlugin_Initialize
 вызывает `XenoPlugin_Query`: уникальный runtime ID, `exclusiveCapabilities`,
 сигнатуры EXE и хуки окончательно проверяет Loader/игра. `dsound.dll`,
 `XenoCore.dll` и общий `XenoNative.ini` не входят в обычный мод. Подробнее:
-[NATIVE_LOADER_RU.md](NATIVE_LOADER_RU.md).
+[NATIVE_LOADER_RU.md](NATIVE_LOADER_RU.md). Сам Loader не обязателен для
+обычных модов и не входит в ModKit; актуальная проверенная версия 0.6.7 и
+реальные примеры модов публикуются в
+[XenoMods](https://github.com/Xenomorphchyma/XenoMods).
 
 При использовании `ImportedFunction` аудит также проверяет регистрацию
 `Data/ScriptLibs`, привязку `ScriptName`, сигнатуру callable и PE-экспорт.

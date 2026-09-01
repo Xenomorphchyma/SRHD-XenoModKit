@@ -12,6 +12,8 @@
       "required": ["minimum_version", "host_api", "activation", "runtime_query_executed"],
       "properties": {
         "minimum_version": {"type": "string"},
+        "tested_version": {"type": "string"},
+        "source": {"type": "string"},
         "host_api": {"type": "integer", "minimum": 1},
         "activation": {"type": "string"},
         "runtime_query_executed": {"const": false}

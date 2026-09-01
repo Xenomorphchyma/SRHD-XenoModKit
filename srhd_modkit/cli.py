@@ -2725,7 +2725,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srhd", description="Инструменты для модов Space Rangers HD")
-    parser.add_argument("--version", action="version", version="SRHD ModKit 0.10.0")
+    parser.add_argument("--version", action="version", version="SRHD ModKit 0.10.1")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Найти и описать моды")
@@ -3014,7 +3014,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     native = sub.add_parser(
         "native",
-        help="Создать и проверить плагины XenoNativeLoader 0.6.5 без исполнения DLL",
+        help="Создать и проверить Host API V1 плагины XenoNativeLoader 0.6.5+ (проверено 0.6.7) без исполнения DLL",
     )
     native_sub = native.add_subparsers(dest="native_command", required=True)
     native_init = native_sub.add_parser(

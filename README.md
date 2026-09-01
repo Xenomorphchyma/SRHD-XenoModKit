@@ -1,4 +1,4 @@
-# SRHD XenoModKit 0.10.0
+# SRHD XenoModKit 0.10.1
 
 Headless modding toolkit for **Space Rangers HD: A War Apart** / **Космические рейнджеры HD: Революция**.
 
@@ -20,24 +20,22 @@ Headless modding toolkit for **Space Rangers HD: A War Apart** / **Космич�
 - нативно читать, проверять, редактировать через JSON и собирать текстовые квесты `QM/QMM` без TGE;
 - анализировать зависимости и конфликты активного набора модов;
 - собирать варианты проекта, кэшировать дорогие компиляции и публиковать папку/ZIP из одного `srhd-modkit.toml`;
-- создавать и статически проверять x86-плагины XenoNativeLoader 0.6.5, не исполняя недоверенную DLL;
+- создавать и статически проверять Host API V1 x86-плагины XenoNativeLoader 0.6.5+ (проверено с 0.6.7 из [XenoMods](https://github.com/Xenomorphchyma/XenoMods)), не исполняя недоверенную DLL;
 - сохранять неизвестные форматы побайтно и отмечать неполное покрытие.
 
 ModKit разворачивает мод в игру только по явной `release deploy`,
 `project deploy` либо настроенной `project publish`, не изменяет `ModCFG.txt`
 и не требует GUI.
 
-### Что изменилось в 0.10.0
+### Что изменилось в 0.10.1
 
-- Исправлен внутренний `NameError` в `script audit-mod` при сопоставлении готового SCR с точной регистрацией в `CFG/Main.dat`; добавлен регрессионный тест этой ветки.
-- `project init` создаёт консервативный черновик `srhd-modkit.toml`; неоднозначные связи не угадываются, а найденные C++/C# проекты, DLL и launcher блокируют выпуск до явного подтверждения `external_builds`.
-- `project plan`, `project doctor` и безопасный `project clean` показывают пересборки, причины cache miss, итоговый игровой состав, инструменты, размер кэша и оставшиеся `.srhd-*`; удаление выполняется только с `--apply`.
-- `release upgrade-check OLD NEW` объединяет изменения ModuleInfo, persistent-схемы, runtime-имён/SAV-кэша, SCR, Main/CacheData/Lang и удалённых ресурсов. Глубокий SCR round-trip включается отдельно.
-- Команды `lang extract/build/diff/coverage` дают короткий workflow для нескольких языков, отсутствующих ключей, пустых значений и RScript code stubs.
-- Реальные JSON Schema для audit, release, project и modset поставляются внутри Python-пакета; `schema list/show/validate` доступны без сторонних зависимостей.
-- `project plan` и диагностика не компилируют мод. `project deploy --dry-run` не меняет игру, но ради точного состава выполняет сборку и может обновить служебные build/cache; это явно отражено в JSON.
-- Диагностика скрытых legacy-процессов отфильтровывает уже завершившиеся Windows desktop, но сохраняет видимость реально работающего помощника и его PID.
-- Связанные SCR/Lang и ZIP/manifest/audit публикуются транзакционно; ZIP/manifest, кэш, variant overlay, rollback и cleanup deploy-транзакций проверяют обход путей, дубли, устаревшие outputs и неопределённый PID до удаления данных.
+- Добавлены необязательные `native init/inspect/validate` для XenoNativeLoader Host API V1: воспроизводимый MSVC x86 scaffold, PE32/ABI/discovery/INI-проверки без исполнения DLL. Минимум — 0.6.5, проверенная версия — 0.6.7 из [XenoMods](https://github.com/Xenomorphchyma/XenoMods).
+- Нативные outputs подключаются к project workflow только через явный `external_builds`; общие файлы Loader не упаковываются внутрь обычного мода.
+- `ImportedFunction` проверяется как полная цепочка RSON → ScriptLibs → ScriptName → signature/arity → DLL export.
+- Усилен null-handle анализ RScript: объектный consumer справа от `&&`/`||` не считается защищённым из-за отсутствия гарантированного short-circuit.
+- PKG writer переведён с несовместимых ZL02-блоков 1 МиБ на штатные 64 КиБ; старые пакеты читаются, но блокируются release-аудитом при опасной потоковой разметке.
+- Машинные отчёты отдельно показывают статическую/структурную проверку и недоказанный runtime в игре.
+- Полный набор: 389 тестов, 2 штатных пропуска и 30 подтестов успешно.
 
 ## Быстрый старт
 
