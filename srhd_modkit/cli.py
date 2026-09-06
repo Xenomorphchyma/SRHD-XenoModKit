@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .discovery import discover_mods, load_mod
+from .diagnostics import runtime_issue_rows
 from .files import build_manifest, compare_trees, find_collisions, find_duplicates, iter_files, pack_mod, sha256_file, stage_tree
 from .formats import format_catalog, inspect_file, scan_formats
 from .modcfg import parse_modcfg, validate_modcfg
@@ -2247,6 +2248,7 @@ def _game_text_lint_target(
 def cmd_script_build(args: argparse.Namespace) -> int:
     source = Path(args.source).resolve()
     mod_root = _find_mod_root(source)
+    allow = tuple(getattr(args, "allow", ()))
     preflight: dict[str, Any] | None = None
     artifact_preflight: dict[str, Any] | None = None
     text_preflight: dict[str, Any] | None = None
@@ -2274,7 +2276,8 @@ def cmd_script_build(args: argparse.Namespace) -> int:
 
     if mod_root is not None:
         preflight = _runtime_lint_target(mod_root, tools_root=args.tools_root)
-        runtime_errors = [issue for issue in preflight["issues"] if issue["severity"] == "error"]
+        preflight["issues"] = runtime_issue_rows(preflight["issues"], mod_root, allow)
+        runtime_errors = [issue for issue in preflight["issues"] if issue["severity"] == "error" and not issue.get("suppressed")]
         if runtime_errors:
             first = runtime_errors[0]
             stop_before_compiler(
@@ -2315,10 +2318,12 @@ def cmd_script_build(args: argparse.Namespace) -> int:
             overwrite=args.overwrite,
             timeout=getattr(args, "timeout", None),
             check_custom_factions=preflight is None,
+            allow=allow,
+            allow_root=mod_root or source.parent,
         )
     except ScriptBuildFailure as exc:
         report = dict(exc.as_dict())
-        report["preflight_passed"] = True
+        report.setdefault("preflight_passed", True)
         if preflight is not None:
             report["runtime_preflight"] = preflight
         if artifact_preflight is not None:
@@ -2374,6 +2379,9 @@ def cmd_script_build(args: argparse.Namespace) -> int:
             )
         for warning in language.get("warnings", []):
             print(f"WARNING {warning['code']}: {warning['message']}")
+        for issue in result.get("runtime_issues", []):
+            if issue.get("suppressed"):
+                print(f"SUPPRESSED {issue['code']}: {issue['message']}")
     return 0
 
 
@@ -3465,6 +3473,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Общий лимит RScript; по умолчанию от 600 с и 60 с без прогресса с адаптацией для крупных проектов, 0 отключает оба",
     )
     script_build.add_argument("--tools-root")
+    script_build.add_argument("--allow", action="append", default=[], help="Точечное исключение runtime CODE или CODE:GLOB, сохраняемое в отчёте")
     script_build.add_argument("--json", action="store_true")
     script_build.set_defaults(func=cmd_script_build)
 

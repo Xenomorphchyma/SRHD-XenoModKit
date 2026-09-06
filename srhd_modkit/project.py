@@ -790,10 +790,12 @@ def _artifact_cache_key(
     input_rows: list[dict[str, Any]] = []
     for path in inputs:
         try:
-            label = path.relative_to(project.root).as_posix()
+            # Staging is nested under project.root. Match the narrower root
+            # first, otherwise its random directory name invalidates every hit.
+            label = f"mod:{path.relative_to(full_mod).as_posix()}"
         except ValueError:
             try:
-                label = f"mod:{path.relative_to(full_mod).as_posix()}"
+                label = path.relative_to(project.root).as_posix()
             except ValueError:
                 label = str(path)
         input_rows.append({"path": label, "size": path.stat().st_size, "sha256": sha256_file(path)})
@@ -1204,6 +1206,7 @@ def _build_artifact(
     cache: ArtifactCache,
     *,
     use_cache: bool,
+    allow: Sequence[str] = (),
 ) -> dict[str, Any]:
     identifier = str(artifact["id"])
     kind = str(artifact["kind"]).casefold()
@@ -1212,7 +1215,8 @@ def _build_artifact(
     output = full_mod / Path(*output_rel.parts)
     inputs = _artifact_inputs(project, artifact, source, full_mod)
     tools = _tool_fingerprints(toolchain, _artifact_tool_names(artifact))
-    key, fingerprint = _artifact_cache_key(project, variant, artifact, inputs, tools, full_mod)
+    cache_artifact = {**artifact, "runtime_allow": list(allow)} if allow else artifact
+    key, fingerprint = _artifact_cache_key(project, variant, cache_artifact, inputs, tools, full_mod)
     restored = cache.restore(key, full_mod) if use_cache else None
     if restored is not None:
         for restored_output in restored:
@@ -1266,6 +1270,8 @@ def _build_artifact(
             overwrite=True,
             timeout=float(artifact["timeout"]) if artifact.get("timeout") is not None else None,
             check_custom_factions=bool(artifact.get("check_custom_factions", True)),
+            allow=allow,
+            allow_root=full_mod,
         )
     elif kind == "rsm":
         lang_txt_value = artifact.get("lang_txt")
@@ -1534,6 +1540,7 @@ def build_project(
                 chain,
                 cache,
                 use_cache=use_cache,
+                allow=audit_allow,
             )
             artifact_result["audit_sources"] = _stage_artifact_audit_source(
                 project,

@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .blockpar import BlockParDocument, load_blockpar
 from .discovery import discover_mods, load_mod
+from .diagnostics import matching_allowance
 from .files import iter_files
 from .formats import get_format_spec, inspect_file
 from .game_text import (
@@ -1788,21 +1789,9 @@ def _apply_allowances(report: AuditReport, rules: Sequence[str]) -> AuditReport:
     target = Path(report.target)
 
     def suppress(issue: AuditIssue) -> AuditIssue:
-        for raw_rule in rules:
-            code, separator, pattern = raw_rule.partition(":")
-            if issue.code != code:
-                continue
-            if separator:
-                if not issue.path:
-                    continue
-                path = Path(issue.path)
-                try:
-                    candidate = path.relative_to(target).as_posix()
-                except ValueError:
-                    candidate = path.as_posix()
-                if not fnmatch.fnmatch(candidate.casefold(), pattern.replace("\\", "/").casefold()):
-                    continue
-            return replace(issue, suppressed=True, suppression=raw_rule)
+        rule = matching_allowance(issue.code, issue.path, target, rules)
+        if rule is not None:
+            return replace(issue, suppressed=True, suppression=rule)
         return issue
 
     checks = tuple(

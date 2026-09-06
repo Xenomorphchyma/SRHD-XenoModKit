@@ -267,6 +267,36 @@ class BlockParCliIntegrationTests(unittest.TestCase):
                     self.assertTrue(built["verified"])
                     self.assertEqual(load_blockpar(decoded).canonical_semantic(), expected)
 
+    def test_cachedata_encodings_and_names_roundtrip_across_19_and_21(self) -> None:
+        legacy = self.chain.tools_root / "BlockParEditor19"
+        if self.chain.tools["blockpar"].version != "2.1" or not (legacy / "BlockParEditor.dll").is_file():
+            self.skipTest("BlockParEditor 2.1 и сохранённая версия 1.9 нужны для перекрёстной проверки")
+        text = (
+            "Script ^{\n    Mod_Probe=Mods\\OtherMods\\Probe\\DATA\\Script\\Mod_Probe.scr\n}\n"
+            "Bm ^{\n    Probe ^{\n        Image=Mods\\OtherMods\\Probe\\DATA\\Изображение.gi\n    }\n}\n"
+        )
+        expected = parse_blockpar(text).canonical_semantic()
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            tool_dir = root / "tools" / "BlockParEditor"
+            tool_dir.mkdir(parents=True)
+            for filename in ("BlockParEditor.exe", "BlockParEditor.dll"):
+                shutil.copy2(legacy / filename, tool_dir / filename)
+            old = Toolchain(tool_dir.parent)
+            for writer in (self.chain, old):
+                for encoding in ("utf-8", "cp1251", "utf-16"):
+                    for input_name in ("CacheData", "CacheData.generated"):
+                        with self.subTest(writer=writer.tools["blockpar"].version, encoding=encoding, source=input_name):
+                            source = root / f"{input_name}.txt"
+                            source.write_bytes(text.encode(encoding))
+                            target = root / "CacheData.dat"
+                            built = writer.convert_dat(source, target, overwrite=True)
+                            self.assertTrue(built["verified"])
+                            for reader in (self.chain, old):
+                                decoded = root / "checked.txt"
+                                reader.convert_dat(target, decoded, overwrite=True)
+                                self.assertEqual(load_blockpar(decoded).canonical_semantic(), expected)
+
     def test_unrepresentable_game_text_is_rejected_before_dat_conversion(self) -> None:
         if not self.chain.tools["blockpar"].path.is_file():
             self.skipTest("BlockPar codec не найден")

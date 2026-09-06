@@ -63,6 +63,14 @@ XenoNativeLoader при старте игры. `DllMain`/Query должны бы
 эффектов, а Initialize на неподдерживаемом EXE должен вернуть ошибку до частичной
 мутации, чтобы Loader мог безопасно выбрать следующий capability-owner/fallback.
 
+Регрессионный тест `test_native_scaffold_build_cache_and_release_with_real_msvc`
+при наличии MSVC x86 и BlockPar создаёт новый scaffold, проверяет отказ при
+отсутствующей DLL, собирает её и выполняет две проектные сборки с DAT-артефактом.
+Он также проверяет cache hit, состав без исходников и одинаковый SHA-256 двух ZIP.
+Кэш относится к DAT/SCR; нативная DLL остаётся явно подготовленным prebuilt-входом.
+Без MSVC этот интеграционный тест пропускается, а статические PE/manifest-тесты
+остаются доступными.
+
 Если RScript обращается к плагину через `ImportedFunction`, native discovery и
 PE-экспорт сами по себе недостаточны. В `CFG/Main.dat` нужны узел
 `Data/ScriptLibs/<Library>`, `Path`, сигнатура каждой функции и параметр

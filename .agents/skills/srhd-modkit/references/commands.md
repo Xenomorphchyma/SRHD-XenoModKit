@@ -162,6 +162,13 @@ SCR и язык даже при exit code RScript 0.
 `script build` дополнительно требует проверенный `SCR → RSON → SCR` и совпадение
 структуры с исходным RSON; provisional output без этого не публикуется.
 
+`script build --allow CODE[:GLOB]` подавляет только точный runtime-код и
+сохраняет его в JSON как `suppressed`; общего выключателя lint нет. В проекте
+существующее `allow` применяется и к RSON-компиляции, и к release-аудиту.
+`TVar` с `Var.Type="Array"` создаёт массив без повторного `newarray`.
+Явное удаление служебного элемента через `ArrayDelete(array, 0)` позволяет
+обход с нуля до следующего сброса; это не доказывает непустоту массива.
+
 `--fallback-without-lang` использовать только осознанно после диагностики ошибки
 импорта: RSON будет проверен round-trip, но текст диалогов из Lang.dat потерян,
 а fallback останется в JSON. `script validate` блокирует неправильную форму
@@ -186,14 +193,14 @@ Lint также сверяет имена вызовов с API SRHD 2.1.2500, T
 группы. Дополнительно блокируются `ShipStar` до доказательства normal-space и
 завершённого взлёта, разыменование raw handle из `ShipGetBad`, вызов
 `ShipIsTakeoff` для элемента `StarShips` без `ShipTypeN < t_RC`, persistent
-`Array*` без `newarray`, разреженные ID объектов RSON и повторные локальные
+`Array*` без `newarray` или графового `Var.Type="Array"`, разреженные ID объектов RSON и повторные локальные
 объявления в одном runtime scope. Объектные вызовы за `&&`/`||` не считаются
 защищёнными; guard нужно закончить отдельным оператором. Сравнение SCR включает
 persistent-схему сохранения и смысловую карту диалогов. Предупреждения
 `runtime-cleanup-without-turn-gate` и `runtime-stale-shipgetbad-follow` являются
 intent-sensitive и блокируют только при `--strict`/`--warnings-as-errors`.
-Результаты `GalaxyStar` и `StarRuins` требуют отдельного null-guard перед
-`Star*`, `Ship*`, `Id` и `RelationToRanger`; повторный `ShipTypeN` после
+Для `StarRuins` и произвольного индекса `GalaxyStar` требуется null-guard.
+Прямой обход `0 <= i < GalaxyStars()` без изменения `i` поддержан внутри цикла; повторный `ShipTypeN` после
 типизированного `StarRuins(star, 'TYPE')` не нужен.
 
 Для fixed `newarray(N)` допустимы индексы `0..N-1`; запасной слот не является

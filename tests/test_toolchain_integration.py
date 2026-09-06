@@ -6,6 +6,7 @@ import unittest
 import os
 import errno
 import time
+import subprocess
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -14,6 +15,8 @@ from srhd_modkit.cli import main
 from srhd_modkit.formats import inspect_file
 from srhd_modkit.image_codec import RgbaImage, read_png, write_png
 from srhd_modkit.project import build_project
+from srhd_modkit.project import publish_project, ProjectConfigError
+from srhd_modkit.native_loader import initialize_native_mod, validate_native_mod
 from srhd_modkit.scripts import inspect_scr, load_rson
 from srhd_modkit.toolchain import Toolchain, _replace_cross_device_safe
 
@@ -22,6 +25,48 @@ class ToolchainIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.chain = Toolchain()
+
+    def test_native_scaffold_build_cache_and_release_with_real_msvc(self) -> None:
+        vswhere = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
+        if os.name != "nt" or not vswhere.is_file() or not self.chain.tools["blockpar"].path.is_file():
+            self.skipTest("Windows MSVC и BlockPar нужны для настоящей сборки нативного мода")
+        available = subprocess.run(
+            [str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=30,
+        )
+        if not available.stdout.strip():
+            self.skipTest("MSVC x86 Build Tools отсутствует")
+        with tempfile.TemporaryDirectory(prefix="srhd-native-test-") as name:
+            root = Path(name)
+            mod = root / "NativeFixture"
+            initialize_native_mod(mod, plugin_id="NativeFixture")
+            with self.assertRaisesRegex(ProjectConfigError, "Runtime output"):
+                build_project(root)
+            compiled = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(mod / "SOURCE/Native/build.ps1")],
+                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=120,
+            )
+            self.assertEqual(compiled.returncode, 0, repr(compiled.stdout + compiled.stderr))
+            native = validate_native_mod(mod)
+            self.assertTrue(native.valid)
+            self.assertEqual(native.plugins[0].pe.architecture, "x86")
+            settings = mod / "SOURCE/Settings.txt"
+            settings.write_text("Review ^{\n  Value=42\n}\n", encoding="utf-8")
+            config = root / "srhd-modkit.toml"
+            config.write_text(config.read_text(encoding="utf-8") + '\n[[artifacts]]\nid="settings"\nkind="dat"\nsource="NativeFixture/SOURCE/Settings.txt"\noutput="CFG/Settings.dat"\n', encoding="utf-8")
+            first = build_project(root)
+            second = build_project(root)
+            self.assertEqual(first.cache_misses, 1)
+            self.assertEqual(second.cache_hits, 1)
+            self.assertTrue(second.deploy.verified)
+            self.assertEqual(
+                {str(p.relative_to(second.output).as_posix()) for p in second.output.rglob("*") if p.is_file()},
+                {"ModuleInfo.txt", "CFG/Settings.dat", "Native/NativeFixture.XenoPlugin.dll", "Native/NativeFixture.XenoPlugin.ini"},
+            )
+            first_release = publish_project(root, output=root / "native.zip")
+            second_release = publish_project(root, output=root / "native.zip")
+            self.assertTrue(second_release["release"]["verified"])
+            self.assertEqual(first_release["release"]["sha256"], second_release["release"]["sha256"])
 
     def test_argb8888_png_gi_png_roundtrip_is_pixel_exact(self) -> None:
         with tempfile.TemporaryDirectory() as name:

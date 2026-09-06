@@ -558,6 +558,7 @@ class _NullableHandleOrigin:
     line_offset: int
     type_selector: str | None = None
     proven_nonzero: bool = False
+    bounded_until: int | None = None
 
 
 def _iter_parsed_calls(text: str, function_name: str) -> Iterable[tuple[int, list[str], int]]:
@@ -1037,7 +1038,7 @@ def _lint_object_api_behind_boolean_guard(
                         line_number,
                         variable,
                         nonnull_predicates=nonnull_predicates,
-                    ):
+                    ) or _has_bounded_star_origin(block, line_number, variable):
                         continue
                     key = (line_number, call, variable)
                     if key in reported:
@@ -1094,6 +1095,90 @@ def _argument_contains_nullable_producer(argument: str, kinds: frozenset[str]) -
     )
 
 
+def _bounded_galaxy_star_end(block: FunctionBlock, line_offset: int, expression: str) -> int | None:
+    """Recognize an in-range lookup in a live, zero-based GalaxyStars loop.
+
+    Stored IDs, snapshot counts and an inclusive upper bound are deliberately
+    not accepted. The proof expires at the loop boundary.
+    """
+    lookup = re.fullmatch(r"\s*GalaxyStar\s*\(\s*([A-Za-z_]\w*)\s*\)\s*", expression, re.IGNORECASE)
+    if not lookup:
+        return None
+    cursor = lookup.group(1).casefold()
+    loop_re = re.compile(
+        rf"\bfor\s*\(\s*(?:int\s+|dword\s+)?{cursor}\s*=\s*\d+\s*;\s*"
+        rf"{cursor}\s*<\s*GalaxyStars\s*\(\s*\)\s*;\s*"
+        rf"(?:{cursor}\s*=\s*{cursor}\s*\+\s*1|{cursor}\s*\+\+|\+\+\s*{cursor})\s*\)",
+        re.IGNORECASE,
+    )
+    for header in range(1, line_offset):
+        if not loop_re.search(_mask_non_code(block.lines[header])):
+            continue
+        body = _statement_body_range(block.lines, header)
+        if body is None or not body[0] <= line_offset <= body[1]:
+            continue
+        prefix = _mask_non_code("\n".join(block.lines[header + 1:line_offset + 1]))
+        if re.search(rf"\b{cursor}\s*(?:=(?!=)|\+=|-=|\+\+|--)|(?:\+\+|--)\s*\b{cursor}\b", prefix):
+            continue
+        # Passing the iterator to a user helper may mutate it by reference.
+        if any(
+            call not in RSCRIPT_RUNTIME_CALLS and any(_simple_identifier(arg) == cursor for arg in args)
+            for _position, call, args in _line_call_sites(prefix)
+        ):
+            continue
+        return body[1]
+    return None
+
+
+def _has_bounded_star_origin(block: FunctionBlock, before: int, variable: str) -> bool:
+    assignment = re.compile(rf"\b{re.escape(variable)}\s*=(?!=)\s*([^;]+)", re.IGNORECASE)
+    for index in range(before - 1, 0, -1):
+        matches = list(assignment.finditer(_mask_non_code(block.lines[index])))
+        if not matches:
+            continue
+        end = _bounded_galaxy_star_end(block, index, matches[-1].group(1))
+        return _bounded_star_proof_live(block, index, before, variable, end)
+    return False
+
+
+def _has_unbraced_control_prefix(lines: tuple[str, ...], index: int) -> bool:
+    for line in reversed(lines[:index]):
+        prior = _mask_non_code(line).strip()
+        if prior:
+            return prior.casefold() in {"else", "do"} or (prior.endswith(")") and "{" not in prior)
+    return False
+
+
+def _bounded_star_proof_live(
+    block: FunctionBlock, assigned: int, before: int, variable: str, end: int | None,
+) -> bool:
+    if end is None or before > end or _has_unbraced_control_prefix(block.lines, assigned):
+        return False
+    # A conditional assignment does not prove that a later use took that branch.
+    if not re.fullmatch(
+        rf"\s*(?:(?:dword|int)\s+)?{re.escape(variable)}\s*=(?!=)[^;]+;\s*",
+        _mask_non_code(block.lines[assigned]), re.IGNORECASE,
+    ):
+        return False
+    depth = 0
+    for line in block.lines[assigned + 1:before + 1]:
+        masked = _mask_non_code(line)
+        for char in masked:
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth < 0:
+                    return False
+        if any(
+            call not in RSCRIPT_RUNTIME_CALLS
+            and any(_simple_identifier(arg) == variable for arg in arguments)
+            for _position, call, arguments in _line_call_sites(masked)
+        ):
+            return False
+    return True
+
+
 def _lint_nullable_handle_dereferences(
     project: RsonProject,
     functions: dict[str, FunctionBlock],
@@ -1131,6 +1216,7 @@ def _lint_nullable_handle_dereferences(
                         producer = origin.producer
                         guarded = (
                             origin.proven_nonzero
+                            or _bounded_star_proof_live(block, origin.line_offset, line_offset, variable, origin.bounded_until)
                             or _same_line_positive_control_guard(masked, position, variable)
                             or _has_explicit_object_guard(
                                 block,
@@ -1142,6 +1228,8 @@ def _lint_nullable_handle_dereferences(
                         )
                     elif variable is None:
                         producer = _argument_contains_nullable_producer(argument, kinds)
+                        if producer == "galaxystar":
+                            guarded = _bounded_galaxy_star_end(block, line_offset, argument) is not None
 
                     origin_key = (
                         variable,
@@ -1209,6 +1297,10 @@ def _lint_nullable_handle_dereferences(
                         producer_name,
                         line_offset,
                         selector,
+                        bounded_until=(
+                            _bounded_galaxy_star_end(block, line_offset, expression)
+                            if producer_name == "galaxystar" else None
+                        ),
                     )
                     continue
                 alias = _simple_identifier(expression)
@@ -1227,6 +1319,9 @@ def _lint_nullable_handle_dereferences(
                             after_line=source.line_offset,
                             nonnull_predicates=nonnull_predicates,
                         ),
+                        source.bounded_until if _bounded_star_proof_live(
+                            block, source.line_offset, line_offset, alias, source.bounded_until,
+                        ) else None,
                     )
                 else:
                     origins.pop(target, None)
@@ -1344,7 +1439,10 @@ def _rscript_array_names(project: RsonProject) -> set[str]:
     for item in project.iter_objects():
         if str(item.get("Type", "")).casefold() == "tvar":
             init = str(item.get("Init", ""))
-            if re.search(r"\bnewarray\s*\(\s*1\s*\)", init, re.IGNORECASE):
+            if re.search(r"\bnewarray\s*\(\s*1\s*\)", init, re.IGNORECASE) or (
+                str(item.get("Var.Type", "")).casefold() == "array"
+                and init.strip() == "1"
+            ):
                 name = str(item.get("Name", "")).strip()
                 if name:
                     names.add(name.casefold())
@@ -1379,7 +1477,7 @@ _RSCRIPT_ARRAY_CALLS = {
 def _newarray_initialized_names(project: RsonProject) -> set[str]:
     """Return variables that are initialized as arrays somewhere in the project."""
 
-    result: set[str] = set()
+    result = _declared_newarray_names(project)
     assignment = re.compile(
         r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*newarray\s*\(",
         re.IGNORECASE,
@@ -1413,7 +1511,10 @@ def _declared_newarray_names(project: RsonProject) -> set[str]:
         for item in project.iter_objects()
         if str(item.get("Type", "")).casefold() == "tvar"
         and str(item.get("Name", "")).strip()
-        and re.search(r"\bnewarray\s*\(", str(item.get("Init", "")), re.IGNORECASE)
+        and (
+            str(item.get("Var.Type", "")).casefold() == "array"
+            or re.search(r"\bnewarray\s*\(", str(item.get("Init", "")), re.IGNORECASE)
+        )
     }
 
 
@@ -1568,6 +1669,8 @@ def _numeric_variable_bounds(project: RsonProject) -> dict[str, tuple[int, int]]
         if str(item.get("Type", "")).casefold() != "tvar":
             continue
         name = str(item.get("Name", "")).strip()
+        if str(item.get("Var.Type", "")).casefold() == "array":
+            continue
         value = _constant_int(str(item.get("Init", "")))
         if name and value is not None:
             remember(name, value, value)
@@ -2147,8 +2250,53 @@ def _lint_duplicate_local_declarations(project: RsonProject) -> list[RuntimeIssu
     return issues
 
 
+def _array_zero_was_removed(lines: tuple[str, ...], before: int, name: str) -> bool:
+    """Prove a dominating, same-scope removal of the initial unknown slot.
+
+    ArrayDelete shifts elements: after deleting slot 0, a populated array is
+    zero-based. Do not borrow that fact from a sibling branch/helper or past
+    ArrayClear/free/reallocation. Unknown calls receiving the array invalidate
+    the proof because RScript arrays can be mutated by reference.
+    """
+    stack: list[int] = []
+    scopes: list[tuple[int, ...]] = []
+    for index, line in enumerate(lines):
+        scopes.append(tuple(stack))
+        for char in _mask_non_code(line):
+            if char == "{":
+                stack.append(index)
+            elif char == "}" and stack:
+                stack.pop()
+    use_scope = scopes[before]
+    candidate = None
+    for index in range(before):
+        masked = _mask_non_code(lines[index])
+        if re.fullmatch(
+            rf"\s*ArrayDelete\s*\(\s*{re.escape(name)}\s*,\s*0\s*\)\s*;\s*",
+            masked, re.IGNORECASE,
+        ) and use_scope[:len(scopes[index])] == scopes[index] and not _has_unbraced_control_prefix(lines, index):
+            candidate = index
+    if candidate is None:
+        return False
+    # Include the rest of enclosing loops: a reset after this iteration's read
+    # would invalidate zero-based access on the following iteration.
+    end = before
+    for header in (*use_scope, before):
+        if header > candidate and re.search(r"\b(?:for|while)\s*\(", _mask_non_code(lines[header])):
+            end = max(end, _brace_block_end(lines, header))
+    harmless = {"arrayadd", "arraydelete", "arraydim", "arrayrandomize", "arraysort", "arrayfind", "arrayfindinsorted"}
+    for line in lines[candidate + 1:end + 1]:
+        masked = _mask_non_code(line)
+        if re.search(rf"\b{re.escape(name)}\s*=(?!=)", masked, re.IGNORECASE):
+            return False
+        for _position, call, arguments in _line_call_sites(masked):
+            if call not in harmless and any(_simple_identifier(arg) == name for arg in arguments):
+                return False
+    return True
+
+
 def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
-    """Enforce the one-based data ABI of RScript dynamic arrays."""
+    """Check dynamic arrays while accounting for explicit removal of slot 0."""
 
     arrays = _rscript_array_names(project)
     initialized_arrays = _newarray_initialized_names(project)
@@ -2220,7 +2368,9 @@ def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
                 )
 
             for match in direct_zero.finditer(masked):
-                if match.group(1).casefold() not in arrays:
+                if match.group(1).casefold() not in arrays or _array_zero_was_removed(
+                    container.lines, index, match.group(1).casefold()
+                ):
                     continue
                 report(
                     container,
@@ -2235,7 +2385,7 @@ def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
                 name, operator, constant = match.group(1).casefold(), match.group(2), match.group(3)
                 unsafe = constant == "0" and operator in {">", "<=", "==", "!=", "<"}
                 unsafe |= constant == "1" and operator == ">="
-                if name in arrays and unsafe:
+                if name in arrays and unsafe and not _array_zero_was_removed(container.lines, index, name):
                     report(
                         container,
                         index + 1,
@@ -2251,7 +2401,7 @@ def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
                 normalized = reverse[operator]
                 unsafe = constant == "0" and normalized in {">", "<=", "==", "!=", "<"}
                 unsafe |= constant == "1" and normalized == ">="
-                if name in arrays and unsafe:
+                if name in arrays and unsafe and not _array_zero_was_removed(container.lines, index, name):
                     report(
                         container,
                         index + 1,
@@ -2261,7 +2411,9 @@ def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
                         line,
                     )
             for match in boolean_dim.finditer(masked):
-                if match.group(1).casefold() in arrays:
+                if match.group(1).casefold() in arrays and not _array_zero_was_removed(
+                    container.lines, index, match.group(1).casefold()
+                ):
                     report(
                         container,
                         index + 1,
@@ -2298,7 +2450,11 @@ def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
                 )
             }
             indexed &= arrays
-            if indexed and (
+            service_indexed = {
+                name for name in indexed
+                if not _array_zero_was_removed(container.lines, index, name)
+            }
+            if service_indexed and (
                 initial in {"0", "+0"}
                 or re.search(rf"\b{re.escape(iterator)}>=0\b", condition)
                 or re.search(rf"\b{re.escape(iterator)}>-1\b", condition)
@@ -2308,7 +2464,7 @@ def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
                     index + 1,
                     "runtime-rscript-array-service-index",
                     "error",
-                    f"Цикл разыменовывает {', '.join(sorted(indexed))}[{iterator}] и допускает служебный индекс 0; начните прямой обход с 1, а обратный завершайте на >= 1",
+                    f"Цикл разыменовывает {', '.join(sorted(service_indexed))}[{iterator}] и допускает служебный индекс 0; начните прямой обход с 1, а обратный завершайте на >= 1",
                     line,
                 )
 

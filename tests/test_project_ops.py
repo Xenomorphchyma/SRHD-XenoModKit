@@ -44,6 +44,43 @@ output = "DATA/worker.cmap"
 
 
 class ProjectOperationsTests(unittest.TestCase):
+    def test_staged_source_cache_key_is_stable_and_content_sensitive(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            mod = _copy_project(root)
+            source = mod / "SOURCE" / "worker.cmap"
+            source.parent.mkdir()
+            source.write_bytes(b"first")
+            config = root / "srhd-modkit.toml"
+            config.write_text(config.read_text(encoding="utf-8").replace(
+                'source = "assets/worker.cmap"', 'source = "RuntimeMod/SOURCE/worker.cmap"',
+            ), encoding="utf-8")
+            first = build_project(root)
+            self.assertEqual(first.cache_misses, 1)
+            self.assertEqual(plan_project(root)["artifacts"][0]["cache"], "hit")
+            second = build_project(root)
+            self.assertEqual(second.cache_hits, 1)
+            self.assertEqual(first.artifacts[0]["cache_key"], second.artifacts[0]["cache_key"])
+            source.write_bytes(b"changed")
+            self.assertEqual(plan_project(root)["artifacts"][0]["cache"], "miss")
+            changed = build_project(root)
+            self.assertEqual(changed.cache_misses, 1)
+            self.assertEqual((changed.output / "DATA" / "worker.cmap").read_bytes(), b"changed")
+
+    def test_plan_and_build_share_allowance_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            _copy_project(root)
+            config = root / "srhd-modkit.toml"
+            original = config.read_text(encoding="utf-8")
+            config.write_text('allow = ["runtime-reviewed-example"]\n' + original, encoding="utf-8")
+            build_project(config)
+            planned = plan_project(config)
+            self.assertEqual(planned["artifacts"][0]["cache"], "hit")
+            config.write_text(original, encoding="utf-8")
+            changed = plan_project(config)
+            self.assertEqual(changed["artifacts"][0]["cache"], "miss")
+
     def test_init_discovers_dat_source_without_guessing_unknown_files(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

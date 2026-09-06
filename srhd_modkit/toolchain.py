@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .files import iter_files, sha256_file
+from .diagnostics import runtime_issue_rows
 from .formats import inspect_file
 from .image_codec import read_gi, read_png, write_gi, write_png
 from .blockpar import (
@@ -1391,6 +1392,8 @@ class Toolchain:
         overwrite: bool = False,
         timeout: float | None = None,
         check_custom_factions: bool = True,
+        allow: Iterable[str] = (),
+        allow_root: str | Path | None = None,
     ) -> dict[str, Any]:
         source = Path(source).resolve()
         scr_output = Path(scr_output).resolve()
@@ -1421,12 +1424,21 @@ class Toolchain:
             project,
             check_custom_factions=check_custom_factions,
         )
-        runtime_errors = [issue for issue in runtime_issues if issue.severity == "error"]
+        allow = tuple(allow)
+        runtime_rows = runtime_issue_rows(runtime_issues, Path(allow_root) if allow_root else source.parent, allow)
+        runtime_errors = [row for row in runtime_rows if row["severity"] == "error" and not row.get("suppressed")]
         if runtime_errors:
-            raise ValueError(
-                "RSON не прошёл runtime-lint: "
-                + "; ".join(f"{issue.code}: {issue.message}" for issue in runtime_errors[:5])
+            message = "RSON не прошёл runtime-lint: " + "; ".join(
+                f"{row['code']}: {row['message']}" for row in runtime_errors[:5]
             )
+            raise ScriptBuildFailure(message, {
+                "schema": "srhd-modkit-script-build-v1", "status": "failed",
+                "source": str(source), "preflight_passed": False,
+                "compiler_started": False, "compiler_output_created": False,
+                "language_output_created": False, "published_outputs": False,
+                "runtime_issues": runtime_rows, "allow": list(allow),
+                "failure": {"code": "script-build-runtime-preflight-failed", "message": message},
+            })
         destinations = [scr_output]
         if fragment_output is not None:
             destinations.append(fragment_output)
@@ -1648,6 +1660,8 @@ class Toolchain:
             ),
             "compiler_timeout": timeout_policy,
             "forced_output_audit": forced_output_audit,
+            "runtime_issues": runtime_rows,
+            "allow": list(allow),
             "runtime_warnings": [
                 issue.as_dict() for issue in runtime_issues if issue.severity == "warning"
             ],

@@ -20,6 +20,7 @@ from .project import (
     ProjectConfigError,
     _apply_variant_files,
     _artifact_cache_key,
+    _audit_allow,
     _artifact_inputs,
     _artifact_tool_names,
     _expand,
@@ -648,10 +649,12 @@ def plan_project(
                     if toolchain is not None
                     else []
                 )
+                planned_allow = _audit_allow(project, variant_config, ())
+                cache_artifact = {**artifact, "runtime_allow": list(planned_allow)} if planned_allow else artifact
                 key, fingerprint = _artifact_cache_key(
                     project,
                     variant_name,
-                    artifact,
+                    cache_artifact,
                     inputs,
                     tools,
                     full_mod,
