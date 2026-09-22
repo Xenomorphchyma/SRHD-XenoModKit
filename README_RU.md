@@ -14,7 +14,8 @@ Space Rangers HD. Запускается на Python 3.12+ и не требуе�
 
 Для проекта из существующего мода используйте `project init`, затем безопасные
 `project plan` и `project doctor`. Сравнение выпусков выполняет
-`release upgrade-check`, языки — `lang coverage`, а машинные отчёты можно
+`release upgrade-check`, языки — `lang coverage` и `lang remap` (перенос языков на новую
+нумерацию ключей `Script.<имя>.<n>` после пересборки скрипта), а машинные отчёты можно
 проверить через `schema validate`. Полный синтаксис приведён в
 [PROJECTS_RU.md](PROJECTS_RU.md) и выводе `srhd.py --help`.
 

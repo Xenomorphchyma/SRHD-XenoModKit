@@ -152,6 +152,7 @@ python -B srhd.py project publish --variant release --json
 ```powershell
 python -B srhd.py release upgrade-check C:\Work\MyMod-old C:\Work\MyMod-new --json
 python -B srhd.py lang coverage C:\Work\MyMod-new --base Rus --json
+python -B srhd.py lang remap --truth C:\Work\MyMod\CFG\Rus\Lang.dat --onto C:\Work\rebuilt.fragment.txt --script Mod_MyMod --language C:\Work\MyMod\CFG\Eng\Lang.dat --out-dir C:\Work\remapped --json
 python -B srhd.py schema validate C:\Work\MyMod-new.audit.json --json
 python -B srhd.py native init C:\Work\MyNativeMod --id MyNativeRuntime --json
 python -B srhd.py native validate C:\Work\MyNativeMod --json

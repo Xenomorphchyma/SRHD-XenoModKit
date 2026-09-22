@@ -76,7 +76,13 @@ from .release import (
 from .project import build_project, deploy_project, load_project, publish_project
 from .project_ops import clean_project, doctor_project, initialize_project, plan_project
 from .upgrade import check_upgrade
-from .language import build_language, diff_languages, extract_language, language_coverage
+from .language import (
+    build_language,
+    diff_languages,
+    extract_language,
+    language_coverage,
+    remap_languages,
+)
 from .schemas import list_schemas, load_schema, validate_schema_document
 from .compat import analyze_modset
 from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
@@ -640,6 +646,35 @@ def cmd_lang_coverage(args: argparse.Namespace) -> int:
         for issue in result["issues"]:
             print(f"{issue['severity'].upper():7} {issue['code']}: {issue['message']}")
     return 0 if result["valid"] else 2
+
+
+def cmd_lang_remap(args: argparse.Namespace) -> int:
+    """Move every --language onto the numbering the rebuilt script uses."""
+
+    result = remap_languages(
+        args.truth,
+        args.onto,
+        args.language,
+        out_dir=args.out_dir,
+        script=args.script,
+        placeholder_tokens=[item for item in (args.placeholder_tokens or "").split(",") if item],
+        tools_root=args.tools_root,
+        overwrite=args.overwrite,
+    )
+    if args.json:
+        print_json(result)
+    else:
+        for item in result["scripts"]:
+            print(f"Скрипт {item['script']}: сопоставлено ключей {item['mapped']}")
+            if item["normalized"]:
+                print(f"   из них по словам-заполнителям: {len(item['normalized'])}")
+        for item in result["languages"]:
+            print(
+                f"{item['path']} -> {item['output']} "
+                f"(перенесено {item['mapped']}, оставлено {item['kept']}, "
+                f"отброшено {item['dropped']}, без пары {item['unmatched']})"
+            )
+    return 0 if result["valid"] else 1
 
 
 def cmd_schema_list(args: argparse.Namespace) -> int:
@@ -3021,6 +3056,54 @@ def build_parser() -> argparse.ArgumentParser:
     lang_coverage.add_argument("--tools-root")
     lang_coverage.add_argument("--json", action="store_true")
     lang_coverage.set_defaults(func=cmd_lang_coverage)
+
+    lang_remap = lang_sub.add_parser(
+        "remap",
+        help="Перенести языки на новую нумерацию ключей Script.<имя>.<n> по текстам языка-эталона",
+        description=(
+            "Пересборка скрипта перенумеровывает ключи Script.<имя>.<n>, которыми "
+            "CFG/<язык>/Lang.dat переопределяет тексты диалогов: Lang от прежнего SCR "
+            "перестаёт их переопределять, и игра показывает текст, вшитый в сам SCR. "
+            "Команда переносит языки на новую нумерацию, сопоставляя ключи по текстам "
+            "языка-эталона: --truth — эталон в старой нумерации, --onto — он же в новой "
+            "(Lang.dat/TXT или фрагмент number=value, который пишет script build --lang), "
+            "--language — языки, которые надо согласовать с эталоном."
+        ),
+        epilog=(
+            "Пример:\n"
+            "  srhd.py lang remap --truth CFG/Rus/Lang.dat --onto rebuilt.fragment.txt --script Mod_MyMod --language CFG/Eng/Lang.dat --out-dir remapped --json\n"
+            "Эталоном может быть любой язык: англоязычный мод подаёт в --truth английский (и его "
+            "фрагмент), а русский и остальные идут в --language. Дубли текстов разводятся по "
+            "порядку ключей; ключ без пары остаётся на месте и попадает в отчёт."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    lang_remap.add_argument(
+        "--truth", required=True, help="Язык-эталон в старой нумерации (Lang.dat или Lang.txt)"
+    )
+    lang_remap.add_argument(
+        "--onto",
+        required=True,
+        help="Тот же язык в новой нумерации: Lang.dat/TXT или фрагмент RScript (number=value)",
+    )
+    lang_remap.add_argument(
+        "--script", help="Имя скрипта; обязательно, когда --onto — фрагмент RScript"
+    )
+    lang_remap.add_argument(
+        "--placeholder-tokens",
+        help="Слова-заполнители через запятую (planet,star,name), равнозначные <0>/<1> при сопоставлении",
+    )
+    lang_remap.add_argument(
+        "--language",
+        action="append",
+        default=[],
+        help="Согласуемый язык в старой нумерации; повторяйте для каждого языка",
+    )
+    lang_remap.add_argument("--out-dir", required=True, help="Куда положить перенесённые языки")
+    lang_remap.add_argument("--overwrite", action="store_true")
+    lang_remap.add_argument("--tools-root")
+    lang_remap.add_argument("--json", action="store_true")
+    lang_remap.set_defaults(func=cmd_lang_remap)
 
     schema = sub.add_parser("schema", help="Показать и проверить машинные JSON Schema ModKit")
     schema_sub = schema.add_subparsers(dest="schema_command", required=True)
