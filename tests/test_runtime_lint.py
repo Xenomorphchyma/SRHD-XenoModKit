@@ -3892,6 +3892,223 @@ class RuntimeLintTests(unittest.TestCase):
         self.assertNotIn("runtime-dialog-msg-eager-array-index", safe_codes)
         self.assertNotIn("runtime-dialog-msg-eager-mutable-value", safe_codes)
 
+    def test_answer_caption_is_checked_against_its_parent_message(self) -> None:
+        """An answer carries AMsg.Num; its caption is resolved with the parent message's build."""
+
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "label", "Init": "''", "Parent": -1, "#": 20}
+        ]
+        group["Dialogs"] = [
+            {"Type": "TDialog", "Name": "Shop", "Parent": -1, "#": 10},
+            {
+                "Type": "TDialogMsg",
+                "Name": "Confirm",
+                "Parent": -1,
+                "#": 11,
+                "DMsg.Num": "13",
+                "Msg": "Confirm purchase",
+            },
+            {
+                "Type": "TDialogAnswer",
+                "Name": "",
+                "Parent": -1,
+                "#": 12,
+                "AMsg.Num": "7",
+                "Msg": "<label>",
+            },
+        ]
+        group["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "PrepareConfirm",
+                "Parent": 10,
+                "#": 13,
+                "Code.Type": "Turn",
+                "Code": ["DAdd(7);", "label = 'Buy';", "DChange(13);"],
+            }
+        )
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 11, "End": 13, "Nom": 0, "Arrow": True}
+        ]
+        prepared = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("answer-parent.rson")))
+        }
+        self.assertNotIn("runtime-dialog-msg-eager-mutable-value", prepared)
+
+        # A sibling assignment after it must not hide that the caption was prepared earlier.
+        group["Operations"][-1]["Code"] = [
+            "DAdd(7);",
+            "label = 'Buy';",
+            "other = 1;",
+            "DChange(13);",
+        ]
+        sibling = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("answer-parent-sibling.rson")))
+        }
+        self.assertNotIn("runtime-dialog-msg-eager-mutable-value", sibling)
+
+        # The same answer without the caption prepared before the transition keeps warning.
+        group["Operations"][-1]["Code"] = ["DAdd(7);", "DChange(13);", "label = 'Buy';"]
+        unprepared = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("answer-parent-late.rson")))
+        }
+        self.assertIn("runtime-dialog-msg-eager-mutable-value", unprepared)
+
+        # An assignment which is only taken on one path must not be treated as a guarantee
+        # for a transition after that branch.  The previous PR implementation collected every
+        # lexical assignment before DChange and would incorrectly suppress this warning.
+        group["Operations"][-1]["Code"] = [
+            "DAdd(7);",
+            "if (panel_initialized)",
+            "{",
+            "    label = 'Buy';",
+            "}",
+            "DChange(13);",
+        ]
+        conditional = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("answer-parent-conditional.rson")))
+        }
+        self.assertIn("runtime-dialog-msg-eager-mutable-value", conditional)
+
+        # The same assignment is safe when the transition itself is inside that branch.
+        group["Operations"][-1]["Code"] = [
+            "DAdd(7);",
+            "if (panel_initialized)",
+            "{",
+            "    label = 'Buy';",
+            "    DChange(13);",
+            "}",
+        ]
+        same_branch = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("answer-parent-same-branch.rson")))
+        }
+        self.assertNotIn("runtime-dialog-msg-eager-mutable-value", same_branch)
+
+    def test_click_handler_inherits_the_parent_message_captions(self) -> None:
+        """A node entered only from an answer runs on a click; the captions are the parent's."""
+
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "label", "Init": "''", "Parent": -1, "#": 20}
+        ]
+        group["Dialogs"] = [
+            {"Type": "TDialog", "Name": "Shop", "Parent": -1, "#": 10},
+            {
+                "Type": "TDialogMsg",
+                "Name": "Menu",
+                "Parent": -1,
+                "#": 11,
+                "DMsg.Num": "20",
+                "Msg": "Pick an action",
+            },
+            {
+                "Type": "TDialogMsg",
+                "Name": "Result",
+                "Parent": -1,
+                "#": 14,
+                "DMsg.Num": "21",
+                "Msg": "<label>",
+            },
+            {
+                "Type": "TDialogAnswer",
+                "Name": "",
+                "Parent": -1,
+                "#": 12,
+                "AMsg.Num": "7",
+                "Msg": "Go",
+            },
+        ]
+        group["Operations"].extend(
+            [
+                {
+                    "Type": "Top",
+                    "Name": "PrepareMenu",
+                    "Parent": 10,
+                    "#": 13,
+                    "Code.Type": "Turn",
+                    "Code": ["DAdd(7);", "label = 'Buy';", "DChange(20);"],
+                },
+                {
+                    "Type": "Top",
+                    "Name": "OnClick",
+                    "Parent": 10,
+                    "#": 15,
+                    "Code.Type": "Turn",
+                    "Code": ["DChange(21);"],
+                },
+            ]
+        )
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 11, "End": 13, "Nom": 0, "Arrow": True},
+            {"Type": "TGraphLink", "Begin": 12, "End": 15, "Nom": 0, "Arrow": True},
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("click-inherit.rson")))
+        }
+        self.assertNotIn("runtime-dialog-msg-eager-mutable-value", codes)
+
+    def test_return_to_the_message_that_injected_the_answers_is_a_refresh(self) -> None:
+        """If a dialog's answers come from message M's code, returning to M only re-displays it."""
+
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "label", "Init": "''", "Parent": -1, "#": 20}
+        ]
+        group["Dialogs"] = [
+            {"Type": "TDialog", "Name": "Menu", "Parent": -1, "#": 10},
+            {
+                "Type": "TDialogMsg",
+                "Name": "",
+                "Parent": -1,
+                "#": 11,
+                "DMsg.Num": "20",
+                "Msg": "<label>",
+            },
+        ]
+        group["Operations"].extend(
+            [
+                {
+                    "Type": "Top",
+                    "Name": "ShowMenu",
+                    "Parent": 10,
+                    "#": 13,
+                    "Code.Type": "Turn",
+                    "Code": [
+                        "label = 'Buy';",
+                        "InjectAnswer('Menu', 'item', 1);",
+                        "DChange(20);",
+                    ],
+                },
+                {
+                    "Type": "Top",
+                    "Name": "MenuHandler",
+                    "Parent": 10,
+                    "#": 14,
+                    "Code.Type": "Turn",
+                    "Code": ["DChange(20);"],
+                },
+            ]
+        )
+        data["Visual.Links"] = [
+            {"Type": "TGraphLink", "Begin": 11, "End": 13, "Nom": 0, "Arrow": True},
+            {"Type": "TGraphLink", "Begin": 10, "End": 14, "Nom": 0, "Arrow": True},
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("refresh-menu.rson")))
+        }
+        self.assertNotIn("runtime-dialog-msg-eager-mutable-value", codes)
+
     def test_linked_dtext_warns_when_dialog_message_already_has_text(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]

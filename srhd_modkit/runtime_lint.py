@@ -3694,6 +3694,75 @@ def _dialog_code_object_ids(project: RsonProject) -> set[int]:
     return result
 
 
+_DIALOG_CONTROL_HEADER_RE = re.compile(
+    r"^\s*(?:if|for|while|switch|else|do)\b|^\s*}\s*else\b",
+    re.IGNORECASE,
+)
+
+
+def _dialog_control_ranges(lines: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
+    """Return conservative source ranges for control statements in a dialog handler.
+
+    The eager-message rule must not treat an assignment in a conditional branch as a
+    must-assignment for a later transition outside that branch.  This intentionally uses
+    the existing statement-body parser and remains conservative for syntax it cannot
+    classify; a false positive is preferable to hiding a real uninitialised caption.
+    """
+
+    ranges: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        if not _DIALOG_CONTROL_HEADER_RE.search(_mask_non_code(line)):
+            continue
+        body = _statement_body_range(lines, index)
+        ranges.append((index, body[1] if body is not None else index))
+    return tuple(ranges)
+
+
+def _dialog_control_path(
+    ranges: tuple[tuple[int, int], ...], line_index: int,
+) -> frozenset[int]:
+    """Identify enclosing control headers for one source line."""
+
+    return frozenset(
+        header
+        for header, end in ranges
+        if header <= line_index <= end
+    )
+
+
+def _dialog_must_assignments_before(
+    lines: tuple[str, ...],
+    text: str,
+    position: int,
+    assignment: re.Pattern[str],
+) -> set[str]:
+    """Collect assignments that dominate a transition on all syntactic paths.
+
+    Assignments in a branch only prove a caption for transitions in that same branch (or a
+    nested branch).  A branch assignment is deliberately not propagated to a transition
+    after the branch, because RScript can execute the other path.  This is a lightweight
+    must-analysis, not a claim to emulate the whole language control flow.
+    """
+
+    line_index = text.count("\n", 0, position)
+    line_start = text.rfind("\n", 0, position) + 1
+    before_on_line = position - line_start
+    ranges = _dialog_control_ranges(lines)
+    transition_path = _dialog_control_path(ranges, line_index)
+    result: set[str] = set()
+    for index, line in enumerate(lines):
+        if index > line_index:
+            break
+        source = _mask_non_code(line)
+        if index == line_index:
+            source = source[:before_on_line]
+        for match in assignment.finditer(source):
+            assignment_path = _dialog_control_path(ranges, index)
+            if assignment_path.issubset(transition_path):
+                result.add(match.group(1).casefold())
+    return result
+
+
 def _lint_dialog_message_eager_expressions(project: RsonProject) -> list[RuntimeIssue]:
     """Check expressions evaluated from Msg before dialog action handlers."""
 
@@ -3712,27 +3781,145 @@ def _lint_dialog_message_eager_expressions(project: RsonProject) -> list[Runtime
         r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*[^;]+",
         re.IGNORECASE,
     )
-    for container in _iter_code_containers(project):
-        if container.object_id not in dialog_objects and container.code_type != "dialogbegin":
+    objects_by_id = {
+        item["#"]: item for item in project.iter_objects() if isinstance(item.get("#"), int)
+    }
+    links = project.data.get("Visual.Links", [])
+    outgoing: dict[int, set[int]] = {}
+    incoming: dict[int, set[int]] = {}
+    if isinstance(links, list):
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            begin, end = link.get("Begin"), link.get("End")
+            if begin in objects_by_id and end in objects_by_id:
+                outgoing.setdefault(begin, set()).add(end)
+                incoming.setdefault(end, set()).add(begin)
+
+    # A TDialogAnswer carries AMsg.Num, not DMsg.Num: it is not entered by DChange but shown as a
+    # child of its parent message, so the parent's incoming transitions are the ones that prepare
+    # its caption. The parent is the message whose code adds the answer, i.e. DAdd(<AMsg.Num>).
+    answer_numbers = {
+        item["#"]: str(item.get("AMsg.Num", "")).strip()
+        for item in project.iter_objects()
+        if str(item.get("Type", "")).casefold() == "tdialoganswer"
+        and isinstance(item.get("#"), int)
+    }
+    answer_parents: dict[str, set[int]] = {}
+    for object_id, item in objects_by_id.items():
+        if str(item.get("Type", "")).casefold() != "tdialogmsg":
             continue
+        number = _constant_int(str(item.get("DMsg.Num", "")))
+        if number is None:
+            continue
+        for target in outgoing.get(object_id, set()) | {object_id}:
+            code = objects_by_id.get(target, {}).get("Code")
+            if not isinstance(code, list):
+                continue
+            for line in code:
+                for _position, arguments, _end in _iter_parsed_calls(str(line), "DAdd"):
+                    if not arguments:
+                        continue
+                    key = arguments[0].strip().strip("\"'")
+                    if key:
+                        answer_parents.setdefault(key, set()).add(number)
+
+    # A node every link into which comes from an answer is a click handler: it runs when the player
+    # picks that answer of the message showing it, so the captions are the ones prepared when that
+    # message was built - the inherited set, not the node's own assignments.
+    click_answers: dict[int, set[str]] = {}
+    for object_id, sources in incoming.items():
+        if sources and all(source in answer_numbers for source in sources):
+            click_answers[object_id] = {answer_numbers[source] for source in sources}
+
+    # A dialog's answers can be injected by the code of a message (InjectAnswer('<Dialog>', ...)).
+    # That message is on screen while such an answer is clicked, so a handler of that dialog which
+    # returns to it only re-displays the message whose text is already shown.
+    injected_answer_source: dict[str, int] = {}
+    for object_id, item in objects_by_id.items():
+        if str(item.get("Type", "")).casefold() != "tdialogmsg":
+            continue
+        number = _constant_int(str(item.get("DMsg.Num", "")))
+        if number is None:
+            continue
+        for target in outgoing.get(object_id, set()) | {object_id}:
+            code = objects_by_id.get(target, {}).get("Code")
+            if not isinstance(code, list):
+                continue
+            for line in code:
+                for _position, arguments, _end in _iter_parsed_calls(str(line), "InjectAnswer"):
+                    if not arguments:
+                        continue
+                    dialog_name = arguments[0].strip().strip("\"'")
+                    if dialog_name:
+                        injected_answer_source.setdefault(dialog_name, number)
+
+    refresh_pairs: set[tuple[int, int]] = set()
+    for object_id, item in objects_by_id.items():
+        if str(item.get("Type", "")).casefold() != "tdialog":
+            continue
+        dialog_name = str(item.get("Name", "")).strip()
+        source = injected_answer_source.get(dialog_name)
+        if source is None:
+            continue
+        for target in outgoing.get(object_id, set()):
+            refresh_pairs.add((target, source))
+
+    containers = list(_iter_code_containers(project))
+    dialog_containers = [
+        container
+        for container in containers
+        if container.object_id in dialog_objects or container.code_type == "dialogbegin"
+    ]
+    for container in dialog_containers:
         for line in container.lines:
             dialog_assignments.update(
                 match.group(1).casefold()
                 for match in assignment.finditer(_mask_non_code(line))
             )
+    for container in dialog_containers:
+        if container.object_id in click_answers:
+            continue
         text = "\n".join(container.lines)
         for position, arguments, _end in _iter_parsed_calls(text, "DChange"):
             if not arguments or (number := _constant_int(arguments[0])) is None:
                 continue
-            prefix = _mask_non_code(text[:position])
-            immediate = re.search(
-                r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*[^;{}]*;\s*$",
-                prefix,
-                re.IGNORECASE,
-            )
+            if (container.object_id, number) in refresh_pairs:
+                continue
+            # The message text is resolved when the dialog is built, so every assignment earlier in
+            # this container has already happened - not only the statement right before the call.
+            # A must-analysis is used here so a conditional assignment is not mistaken for a
+            # guarantee on a path that skips the branch.
             transition_preassignments.setdefault(number, []).append(
-                {immediate.group(1).casefold()} if immediate else set()
+                _dialog_must_assignments_before(container.lines, text, position, assignment)
             )
+    for container in dialog_containers:
+        answer_keys = click_answers.get(container.object_id)
+        if not answer_keys:
+            continue
+        text = "\n".join(container.lines)
+        for position, arguments, _end in _iter_parsed_calls(text, "DChange"):
+            if not arguments or (number := _constant_int(arguments[0])) is None:
+                continue
+            # A click handler may prepare the caption itself as well - then that is the stronger
+            # guarantee, and both sources are acceptable at this transition.
+            prepared_here = _dialog_must_assignments_before(
+                container.lines, text, position, assignment
+            )
+            parents_of_clicked = {
+                parent
+                for answer_key in answer_keys
+                for parent in answer_parents.get(answer_key, set())
+            }
+            if number in parents_of_clicked:
+                # The handler opens the message that is already on screen - a return/refresh, not a
+                # new message. Its caption is the one being displayed, so nothing has to be prepared.
+                continue
+            inherited: set[str] = set()
+            for parent in parents_of_clicked:
+                for prepared in transition_preassignments.get(parent, []):
+                    inherited |= prepared
+            transition_preassignments.setdefault(number, []).append(prepared_here | inherited)
 
     template_expression = re.compile(r"<([^<>]+)>")
     indexed = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([^]]+)\s*\]")
@@ -3790,7 +3977,21 @@ def _lint_dialog_message_eager_expressions(project: RsonProject) -> list[Runtime
             ):
                 continue
             message_number = _constant_int(str(item.get("DMsg.Num", "")))
-            transitions = transition_preassignments.get(message_number, [])
+            if message_number is None:
+                if str(item.get("Type", "")).casefold() != "tdialoganswer":
+                    continue
+                parents = answer_parents.get(str(item.get("AMsg.Num", "")).strip(), set())
+                if not parents:
+                    # Without a proven parent the rule is unsatisfiable: an answer is never entered
+                    # by DChange, so its own number has no transitions at all.
+                    continue
+                transitions = [
+                    names
+                    for number in sorted(parents)
+                    for names in transition_preassignments.get(number, [])
+                ]
+            else:
+                transitions = transition_preassignments.get(message_number, [])
             if transitions and all(simple in names for names in transitions):
                 continue
             key = (object_id, "scalar", simple)
