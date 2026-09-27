@@ -195,6 +195,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
             target,
             profile=args.profile,
             tools_root=args.tools_root,
+            source_root=args.sources,
             allow=args.allow,
         )
     else:
@@ -2771,6 +2772,12 @@ def build_parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit", help="Универсально проверить мод или коллекцию")
     audit.add_argument("target")
     audit.add_argument("--profile", choices=("dev", "release"), default="dev")
+    audit.add_argument(
+        "--sources",
+        help="Каталог с читаемыми исходниками мода (например src рядом с папкой мода); "
+        "его RSON подключаются к проверке, чтобы SCR сверялся с исходником, а не "
+        "проверялся только бинарно",
+    )
     audit.add_argument("--allow", action="append", default=[], help="Подавить CODE или CODE:GLOB с записью в отчёт")
     audit.add_argument("--warnings-as-errors", action="store_true")
     audit.add_argument(

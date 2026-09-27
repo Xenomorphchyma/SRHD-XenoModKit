@@ -8435,6 +8435,11 @@ def _literal_string(expression: str) -> str | None:
     value = expression.strip()
     if len(value) < 2 or value[0] not in {"'", '"'} or value[-1] != value[0]:
         return None
+    # A concatenation is not a literal, but it also starts and ends with a quote:
+    # `'a.' + name + '.b'` would otherwise be read as the key `a.' + name + '.b`.
+    # Only an expression that is nothing but one quoted run qualifies.
+    if value.count(value[0]) != 2:
+        return None
     return value[1:-1]
 
 
@@ -10760,14 +10765,11 @@ def literal_ct_references(project: RsonProject) -> list[LiteralCTReference]:
     return result
 
 
-def _blockpar_text_key_index(document: BlockParDocument) -> tuple[set[str], set[str]]:
+def _blockpar_text_key_index(document: BlockParDocument) -> set[str]:
     keys: set[str] = set()
-    roots: set[str] = set()
     for node_path, key, _value in _node_parameters(document.roots):
-        dotted = ".".join((*node_path.split("/"), key)).casefold()
-        keys.add(dotted)
-        roots.add(node_path.split("/", 1)[0].casefold())
-    return keys, roots
+        keys.add(".".join((*node_path.split("/"), key)).casefold())
+    return keys
 
 
 def lint_literal_ct_keys(
@@ -10779,19 +10781,20 @@ def lint_literal_ct_keys(
 ) -> list[RuntimeIssue]:
     """Check mod-owned literal CT keys in every shipped language artifact.
 
-    Base-game keys are intentionally left alone.  A reference is considered
-    mod-owned when its root block is present in at least one supplied Lang
-    document, or the exact key exists in at least one language.
+    A key is mod-owned when the mod itself defines it in at least one supplied Lang
+    document. Ownership deliberately does not follow the root block: a mod that extends
+    a shared namespace — `FormRuins` of the base game, `Script` of a companion mod —
+    also *reads* keys of that namespace that it never defines, and those are not its to
+    provide. What this catches is the asymmetric case: a key the mod defines in one
+    language but forgot in another.
     """
 
     artifacts: list[tuple[str, str, set[str]]] = []
-    local_roots: set[str] = set()
     local_keys: set[str] = set()
     for language, documents in language_documents.items():
         for source, document in documents:
-            keys, roots = _blockpar_text_key_index(document)
+            keys = _blockpar_text_key_index(document)
             artifacts.append((language, str(Path(source).resolve()), keys))
-            local_roots.update(roots)
             local_keys.update(keys)
     if not artifacts:
         return []
@@ -10801,8 +10804,7 @@ def lint_literal_ct_keys(
     spelling: dict[str, str] = {}
     for reference in references:
         folded = reference.key.casefold()
-        root = folded.split(".", 1)[0]
-        if folded not in local_keys and root not in local_roots:
+        if folded not in local_keys:
             continue
         grouped.setdefault(folded, []).append(reference)
         spelling.setdefault(folded, reference.key)

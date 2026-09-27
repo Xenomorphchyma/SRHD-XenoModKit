@@ -150,6 +150,53 @@ class AuditTests(unittest.TestCase):
             report = audit_mod(root, profile="release")
             self.assertTrue(any(item.code == "scr-unregistered" for item in report.issues))
 
+    def test_source_root_pairs_a_shipped_script_with_its_rson(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "AuditFixture"
+            _mod(root)
+            script = root / "DATA" / "Script" / "Mod_AuditFixture.scr"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(struct.pack("<I", 8))
+
+            # the sources live beside the mod, not inside it
+            sources = base / "src"
+            sources.mkdir()
+            (sources / "Mod_AuditFixture.rson").write_text(
+                json.dumps(
+                    {
+                        "FileID": RSON_FILE_ID,
+                        "FileVersion": RSON_FILE_VERSION,
+                        "ScriptName": "Mod_AuditFixture",
+                        "Visual.Objects": [
+                            {
+                                "Operations": [
+                                    {
+                                        "Type": "Top",
+                                        "Name": "Turn",
+                                        "Parent": -1,
+                                        "#": 1,
+                                        "Code.Type": "Turn",
+                                        "Code": ["int value = 1;"],
+                                    }
+                                ]
+                            }
+                        ],
+                        "Visual.Links": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            without = {item.code for item in audit_mod(root, profile="dev").issues}
+            self.assertIn("scr-semantic-analysis-unavailable", without)
+
+            with_sources = {
+                item.code
+                for item in audit_mod(root, profile="dev", source_root=sources).issues
+            }
+            self.assertNotIn("scr-semantic-analysis-unavailable", with_sources)
+
     def test_release_blocks_imported_function_missing_from_scriptlibs(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"

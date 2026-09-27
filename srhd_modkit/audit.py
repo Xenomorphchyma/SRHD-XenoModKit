@@ -201,6 +201,7 @@ class AuditContext:
     tools: Toolchain
     temp: Path
     install_subpath: str | None = None
+    source_root: Path | None = None
     mod_name: str = ""
     dat_documents: dict[Path, BlockParDocument | None] = field(default_factory=dict)
     dat_failures: dict[Path, Exception] = field(default_factory=dict)
@@ -1413,6 +1414,17 @@ def _script_check(context: AuditContext) -> AuditCheck:
         and path.relative_to(context.root).as_posix().casefold().startswith("data/script/")
     ]
     rsons = [path for path in files if path.suffix.casefold() == ".rson"]
+    if context.source_root is not None:
+        # Readable sources may live beside the mod folder instead of inside it, so the
+        # RSON of a script the mod ships is not among `root`'s files. Adding them here is
+        # what lets the dialog and language checks compare the SCR with the source it was
+        # built from instead of trusting the binary alone.
+        known = {path.resolve() for path in rsons}
+        rsons.extend(
+            path
+            for path in iter_files(context.source_root)
+            if path.suffix.casefold() == ".rson" and path.resolve() not in known
+        )
     if not scripts and not rsons:
         return AuditCheck(name, "skipped", details={"reason": "SCR/RSON не найдены"})
 
@@ -1814,6 +1826,7 @@ def audit_mod(
     profile: str | AuditProfile = AuditProfile.DEV,
     tools_root: str | Path | None = None,
     install_subpath: str | Path | None = None,
+    source_root: str | Path | None = None,
     allow: Sequence[str] = (),
     registry: AuditRegistry | None = None,
 ) -> AuditReport:
@@ -1828,6 +1841,7 @@ def audit_mod(
             Toolchain(tools_root),
             Path(temp_name),
             str(install_subpath) if install_subpath is not None else None,
+            Path(source_root).resolve() if source_root is not None else None,
         )
         checks = (registry or default_registry()).run(context)
     return _apply_allowances(

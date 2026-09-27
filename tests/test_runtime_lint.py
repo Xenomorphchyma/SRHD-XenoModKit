@@ -3106,6 +3106,42 @@ class RuntimeLintTests(unittest.TestCase):
             [],
         )
 
+    def test_owning_a_root_does_not_claim_every_key_under_it(self) -> None:
+        # A mod that extends `FormRuins` also reads vanilla answers of that namespace;
+        # those are the base game's to provide, not the mod's.
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "AddDialogBlock(CT('FormRuins.RC.AboutNod.PlayerSend'), 2);",
+            "AddDialogBlock(CT('FormRuins.RC.OwnKey.PlayerSend'), 2);",
+        ]
+        project = RsonProject(data, Path("shared-root.rson"))
+        russian = parse_blockpar(
+            "FormRuins ^{\n    RC ^{\n        OwnKey ^{\n            PlayerSend=Своё\n        }\n    }\n}\n"
+        )
+        english = parse_blockpar(
+            "FormRuins ^{\n    RC ^{\n        OwnKey ^{\n            PlayerSend=Own\n        }\n    }\n}\n"
+        )
+        issues = lint_literal_ct_keys(
+            [project],
+            {
+                "rus": [(Path("Lang_Rus.txt"), russian)],
+                "eng": [(Path("Lang_Eng.txt"), english)],
+            },
+        )
+        self.assertEqual([issue for issue in issues if issue.code == "runtime-ct-key-missing"], [])
+        self.assertNotIn("AboutNod", "\n".join(issue.message for issue in issues))
+
+    def test_a_key_built_by_concatenation_is_not_a_literal(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "int n = 1;",
+            "result = CT('MicroModuls.' + n + '.UniqueMM');",
+        ]
+        project = RsonProject(data, Path("concatenated-key.rson"))
+        russian = parse_blockpar("MicroModuls ^{\n    One ^{\n        UniqueMM=1\n    }\n}\n")
+        issues = lint_literal_ct_keys([project], {"rus": [(Path("Lang_Rus.txt"), russian)]})
+        self.assertEqual([issue for issue in issues if issue.code == "runtime-ct-key-missing"], [])
+
     def test_nested_localization_wrappers_are_rejected_without_cross_wrapper_noise(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]
