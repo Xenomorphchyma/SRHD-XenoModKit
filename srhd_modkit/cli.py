@@ -195,6 +195,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
             target,
             profile=args.profile,
             tools_root=args.tools_root,
+            install_subpath=args.prefix,
             allow=args.allow,
         )
     else:
@@ -2771,6 +2772,11 @@ def build_parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit", help="Универсально проверить мод или коллекцию")
     audit.add_argument("target")
     audit.add_argument("--profile", choices=("dev", "release"), default="dev")
+    audit.add_argument(
+        "--prefix",
+        help="Точный путь мода внутри Mods, например Miscellaneous/ExpRC; без него "
+        "путь установки из CacheData проверить нельзя и выдаётся предупреждение",
+    )
     audit.add_argument("--allow", action="append", default=[], help="Подавить CODE или CODE:GLOB с записью в отчёт")
     audit.add_argument("--warnings-as-errors", action="store_true")
     audit.add_argument(
