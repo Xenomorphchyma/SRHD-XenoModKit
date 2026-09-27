@@ -62,7 +62,11 @@ class BlockParNode:
         return [entry for entry in self.entries if isinstance(entry, BlockParParameter)]
 
     def render_lines(self, *, include_raw: bool = True) -> list[str]:
-        opening = self.opening_line if self.opening_line is not None else f"{self.indent}{self.name} {self.operator}{{"
+        if self.opening_line is not None:
+            opening = self.opening_line
+        else:
+            name = f"{self.name} " if self.name else ""
+            opening = f"{self.indent}{name}{self.operator}{{"
         closing = self.closing_line if self.closing_line is not None else f"{self.indent}}}"
         lines = [opening]
         for entry in self.entries:
@@ -337,7 +341,7 @@ class BlockParDocument:
         return results
 
 
-_OPEN_RE = re.compile(r"^(?P<indent>\s*)(?P<name>.*?)\s+(?P<operator>[\^~])\{\s*$")
+_OPEN_RE = re.compile(r"^(?P<indent>\s*)(?:(?P<name>.*?)\s+)?(?P<operator>[\^~])\{\s*$")
 _CLOSE_RE = re.compile(r"^\s*}\s*$")
 
 
@@ -351,9 +355,10 @@ def parse_blockpar(text: str, *, encoding: str = "utf-8", had_bom: bool = False)
     for number, line in enumerate(lines, start=1):
         opening = _OPEN_RE.match(line)
         if opening:
-            name = opening.group("name").rstrip()
-            if not name:
-                raise BlockParError(f"Пустое имя блока, строка {number}")
+            # A block may carry no name at all: ``~{`` straight after a line is how a mod
+            # declares a function body in a Lang script, and the game accepts it, so the
+            # parser keeps such a node with an empty name instead of refusing the file.
+            name = (opening.group("name") or "").rstrip()
             node = BlockParNode(
                 name=name,
                 operator=opening.group("operator"),
@@ -403,3 +408,27 @@ def parse_blockpar(text: str, *, encoding: str = "utf-8", had_bom: bool = False)
 def load_blockpar(path: str | Path) -> BlockParDocument:
     decoded: DecodedText = read_text(path)
     return parse_blockpar(decoded.text, encoding=decoded.encoding, had_bom=decoded.had_bom)
+
+
+def empty_named_blocks(document: BlockParDocument) -> list[tuple[str, str]]:
+    """``(parent path, opening line)`` of every block that carries no name.
+
+    The game accepts such a block — it is how a mod writes a function body in a Lang
+    script — so the parser keeps it; but for a reader and an editor the record is
+    ambiguous, so callers report it as a note rather than a defect.
+    """
+
+    found: list[tuple[str, str]] = []
+
+    def walk(entries: Iterable[Any], prefix: str) -> None:
+        for entry in entries:
+            if not isinstance(entry, BlockParNode):
+                continue
+            if entry.name:
+                walk(entry.entries, f"{prefix}/{entry.name}" if prefix else entry.name)
+            else:
+                found.append((prefix or "(root)", (entry.opening_line or "").strip()))
+                walk(entry.entries, prefix)
+
+    walk(document.entries, "")
+    return found

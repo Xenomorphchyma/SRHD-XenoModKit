@@ -10,7 +10,7 @@ from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
-from srhd_modkit.blockpar import BlockParError, load_blockpar, parse_blockpar
+from srhd_modkit.blockpar import BlockParError, empty_named_blocks, load_blockpar, parse_blockpar
 from srhd_modkit.audit import AuditProfile, audit_mod
 from srhd_modkit.cli import _game_text_lint_target, cmd_dat_validate
 from srhd_modkit.toolchain import Toolchain, is_empty_rscript_lang_dat
@@ -48,6 +48,24 @@ class BlockParParserTests(unittest.TestCase):
         self.assertEqual(document.find_node("Data/SE/Ship").parameters_named("Cost")[0].value, "10")
         self.assertEqual(document.find_node("Data/SE/Ship[2]").parameters_named("Cost")[0].value, "20")
         self.assertEqual(document.find_node("Data/SE/Ship").operator, "~")
+
+    def test_parses_and_round_trips_a_block_without_a_name(self) -> None:
+        """A bare ``~{`` (a function body in a Lang script) is a block, not a parse error."""
+
+        text = (
+            "Repro ~{\n"
+            "    Test ~{\n"
+            "        =\n"
+            "        =function SetDword(ptr, value)\n"
+            "         ~{\n"
+            "            =result = 1;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        document = parse_blockpar(text)
+        self.assertEqual(document.to_text(), text)
+        self.assertEqual(empty_named_blocks(document), [("Repro/Test", "~{")])
 
     def test_set_and_create_parameter(self) -> None:
         document = parse_blockpar(SAMPLE)
@@ -233,6 +251,30 @@ class BlockParCliIntegrationTests(unittest.TestCase):
             report = audit_mod(root, profile=AuditProfile.DEV)
             audit_codes = {issue.code for issue in report.issues}
             self.assertNotIn("game-text-wrong-encoding", audit_codes)
+
+    def test_audit_notes_a_nameless_block_as_info(self) -> None:
+        """The block is accepted, but the audit flags the ambiguous record as a note."""
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "SOURCE" / "CFG" / "Rus" / "Lang.txt"
+            target = root / "CFG" / "Rus" / "Lang.dat"
+            source.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            source.write_text(
+                "Repro ~{\n    Test ~{\n        =\n        =function SetDword(ptr, value)\n"
+                "         ~{\n            =result = 1;\n        }\n    }\n}\n",
+                encoding="utf-8",
+            )
+            (root / "ModuleInfo.txt").write_text(
+                "Name=NamelessBlockMod\nLanguages=Rus\nSmallDescription=Nameless block probe\n",
+                encoding="utf-16",
+            )
+            self.chain.convert_dat(source, target)
+            report = audit_mod(root, profile=AuditProfile.DEV)
+            notes = [item for item in report.issues if item.code == "blockpar-empty-block-name"]
+            self.assertEqual(len(notes), 1)
+            self.assertEqual(notes[0].severity, "info")
 
     def test_real_blockpar_19_accepts_utf8_cp1251_and_utf16_sources(self) -> None:
         legacy_root = self.chain.tools_root / "BlockParEditor19"

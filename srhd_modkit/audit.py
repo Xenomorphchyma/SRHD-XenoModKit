@@ -10,7 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .blockpar import BlockParDocument, load_blockpar
+from .blockpar import BlockParDocument, empty_named_blocks, load_blockpar
 from .discovery import discover_mods, load_mod
 from .diagnostics import matching_allowance
 from .files import iter_files
@@ -490,10 +490,25 @@ def _dat_check(context: AuditContext) -> AuditCheck:
     checked: list[str] = []
     for path in candidates:
         try:
-            _load_dat(context, path)
+            document = _load_dat(context, path)
             checked.append(str(path))
         except Exception as exc:
             issues.append(_issue(context, name, "error", "dat-invalid", str(exc), path))
+            continue
+        if document is not None:
+            for parent, opening in empty_named_blocks(document):
+                issues.append(
+                    _issue(
+                        context,
+                        name,
+                        "info",
+                        "blockpar-empty-block-name",
+                        "Блок без имени: игра его принимает, но читать и править такую запись "
+                        "неоднозначно — дайте блоку имя",
+                        path,
+                        evidence=f"родитель: {parent}; строка: {opening!r}",
+                    )
+                )
 
     if context.profile is AuditProfile.RELEASE:
         cfg = context.root / "CFG"
