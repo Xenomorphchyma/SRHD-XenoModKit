@@ -514,11 +514,65 @@ class RsonTests(unittest.TestCase):
                 project.delete_object(2)
             removed = project.delete_object(2, detach_references=True)
             self.assertEqual(removed["removed_links"], 2)
-            issues = project.validate()
+            self.assertEqual(project.validate(), [])
+
+    def test_delete_object_renumbers_the_object_ids_densely(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            project.clone_object(2, name="Turn copy")  # #3
+            project.add_link(1, 3, nom=1, arrow=False)
+            removed = project.delete_object(2, detach_references=True)
+            # the deleted object sat in the middle, so the surviving #3 shifts down;
+            # the sample is 1-based and the base is kept
+            self.assertEqual(removed["renumbered"]["objects"], 1)
+            self.assertEqual(sorted(item["#"] for item in project.iter_objects()), [1, 2])
+            # the deleted object's links are gone, the survivor is repointed 1 -> 1, 3 -> 2
             self.assertEqual(
-                {issue.code for issue in issues},
-                {"rson-object-id-range"},
+                project.data["Visual.Links"],
+                [{"Type": "TGraphLink", "Begin": 1, "End": 2, "Nom": 1, "Arrow": False}],
             )
+            self.assertEqual(project.validate(), [])
+
+    def test_compact_ids_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            project = self._project(Path(name))
+            self.assertEqual(project.compact_ids(), {"objects": 0, "answers": 0, "messages": 0})
+            self.assertEqual(project.validate(), [])
+
+    def test_delete_object_compacts_dialog_numbers_and_their_constants(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0]["DialogAnswers"] = [
+            {"Type": "TDialogAnswer", "Name": "", "Parent": -1, "#": 3, "Msg": "a", "AMsg.Num": "0"},
+            {"Type": "TDialogAnswer", "Name": "", "Parent": -1, "#": 4, "Msg": "b", "AMsg.Num": "1"},
+            {"Type": "TDialogAnswer", "Name": "", "Parent": -1, "#": 5, "Msg": "c", "AMsg.Num": "2"},
+        ]
+        data["Visual.Objects"][0]["DialogMessages"] = [
+            {"Type": "TDialogMsg", "Name": "", "Parent": -1, "#": 6, "Msg": "m0", "DMsg.Num": "0"},
+            {"Type": "TDialogMsg", "Name": "", "Parent": -1, "#": 7, "Msg": "m1", "DMsg.Num": "1"},
+        ]
+        data["Visual.Objects"][0]["Operations"].append(
+            {
+                "Type": "Top",
+                "Name": "Menu",
+                "Parent": -1,
+                "#": 8,
+                "Code": ["DAdd(0);", "DAdd(2);", "DChange(1);"],
+            }
+        )
+        project = RsonProject(data, Path("dialog.rson"))
+        self.assertEqual(project.validate(), [])
+
+        # delete the middle answer: its AMsg.Num 1 disappears and 2 must become 1
+        # everywhere, including the DAdd(2) constant that names it
+        removed = project.delete_object(4, detach_references=True)
+        self.assertEqual(removed["renumbered"]["answers"], 1)
+        self.assertEqual(
+            sorted(int(item["AMsg.Num"]) for item in project.iter_objects() if "AMsg.Num" in item),
+            [0, 1],
+        )
+        menu = next(item for item in project.iter_objects() if item.get("Name") == "Menu")
+        self.assertEqual(menu["Code"], ["DAdd(0);", "DAdd(1);", "DChange(1);"])
+        self.assertEqual(project.validate(), [])
 
     def test_sparse_object_ids_are_rejected_before_rscript_hangs(self) -> None:
         data = deepcopy(SAMPLE)

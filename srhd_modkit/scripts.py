@@ -296,10 +296,111 @@ class RsonProject:
                 if not (isinstance(link, dict) and object_id in (link.get("Begin"), link.get("End")))
             ]
         container.pop(index)
+        renumbered = self.compact_ids()
         return {
             "object": item,
             "detached_children": children if detach_references else [],
             "removed_links": len(link_indexes) if detach_references else 0,
+            "renumbered": renumbered,
+        }
+
+    # code-bearing fields a `DAdd(...)`/`DChange(...)` constant can hide in
+    CODE_LIST_FIELDS = ("Code", "ActCode", "LinkCode")
+
+    def _iter_code_fields(self) -> Iterable[tuple[dict[str, Any], str, list[str]]]:
+        """Every code list that may hold dialog constants, with its object and field."""
+        for item in self.iter_objects():
+            for field, value in item.items():
+                if field in self.CODE_LIST_FIELDS and isinstance(value, list):
+                    yield item, field, value
+
+    def _compact_number_field(self, field: str) -> dict[int, int]:
+        """Renumber a sparse `AMsg.Num`/`DMsg.Num` field densely, ascending.
+
+        RScript compacts such a numbering itself but does not rewrite the
+        `DAdd(...)`/`DChange(...)` constants that reference it, so every answer
+        after a deleted dialog element would silently re-point. Doing it here keeps
+        the constants and the fields in step.
+        """
+        entries: list[tuple[int, dict[str, Any]]] = []
+        for item in self.iter_objects():
+            value = item.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                entries.append((value, item))
+            elif isinstance(value, str) and value.strip().lstrip("-").isdigit():
+                entries.append((int(value), item))
+        mapping = {old: new for new, (old, _) in enumerate(sorted(entries, key=lambda pair: pair[0]))}
+        for old, item in entries:
+            if mapping[old] != old:
+                item[field] = str(mapping[old])
+        return mapping
+
+    def _rewrite_dialog_calls(self, call: str, mapping: dict[int, int]) -> int:
+        """Rewrite `call(n)` constants through `mapping`; returns the rewrite count."""
+        pattern = re.compile(rf"\b{re.escape(call)}\(\s*(\d+)\s*\)")
+        rewritten = 0
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal rewritten
+            old = int(match.group(1))
+            new = mapping.get(old)
+            if new is None or new == old:
+                return match.group(0)
+            rewritten += 1
+            return f"{call}({new})"
+
+        for _item, _field, lines in self._iter_code_fields():
+            for index, line in enumerate(lines):
+                if call in line:
+                    lines[index] = pattern.sub(replace, line)
+        return rewritten
+
+    def compact_ids(self) -> dict[str, int]:
+        """Make every RSON numbering dense again and rewrite what references it.
+
+        RScript indexes objects by `#` and requires them dense from 0 (or 1) --
+        a sparse id makes the compiler run out of bounds -- so deleting an object
+        from the middle of the list must shift every higher id down and repoint the
+        graph links and parents. The dialog numberings (`AMsg.Num` for answers,
+        `DMsg.Num` for messages) are compacted with them, together with the
+        `DAdd(...)`/`DChange(...)` constants that name them.
+
+        The object numbering keeps its existing base (0 or 1, both of which the
+        compiler accepts), while the dialog numberings are normalised to the
+        canonical 0-based form the compiler expects. Already dense input is
+        returned unchanged, so calling this on a valid project is a no-op.
+        """
+        objects = [
+            item
+            for item in self.iter_objects()
+            if isinstance(item.get("#"), int) and not isinstance(item.get("#"), bool)
+        ]
+        # RScript accepts a 0- or a 1-based object numbering, so the lowest surviving
+        # id stays the base: an already dense project is returned untouched
+        identifiers = sorted(item["#"] for item in objects)
+        base = identifiers[0] if identifiers else 0
+        object_map = {old: base + position for position, old in enumerate(identifiers)}
+        for item in objects:
+            item["#"] = object_map[item["#"]]
+            parent = item.get("Parent")
+            if isinstance(parent, int) and not isinstance(parent, bool) and parent in object_map:
+                item["Parent"] = object_map[parent]
+        links = self.data.get("Visual.Links")
+        if isinstance(links, list):
+            for link in links:
+                if not isinstance(link, dict):
+                    continue
+                for key in ("Begin", "End"):
+                    value = link.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value in object_map:
+                        link[key] = object_map[value]
+
+        answers = self._compact_number_field("AMsg.Num")
+        messages = self._compact_number_field("DMsg.Num")
+        return {
+            "objects": sum(1 for old, new in object_map.items() if old != new),
+            "answers": self._rewrite_dialog_calls("DAdd", answers),
+            "messages": self._rewrite_dialog_calls("DChange", messages),
         }
 
     def validate(self, *, rscript_profile: str = "legacy-cli") -> list[ScriptIssue]:

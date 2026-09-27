@@ -1909,7 +1909,8 @@ def cmd_script_delete_object(args: argparse.Namespace) -> int:
     else:
         print(
             f"Объект #{args.id} удалён; связей удалено: {removed['removed_links']}; "
-            f"детей отвязано: {len(removed['detached_children'])}"
+            f"детей отвязано: {len(removed['detached_children'])}; "
+            f"перенумеровано объектов: {removed['renumbered']['objects']}"
         )
         print(f"RSON: {output}")
     return 0
