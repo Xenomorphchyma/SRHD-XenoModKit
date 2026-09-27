@@ -4277,11 +4277,34 @@ def _persistent_item_parameter_sinks(
     return result
 
 
+def _outermost_call_name(expression: str) -> str | None:
+    """Name of the call the expression evaluates to, if it is a call at all.
+
+    Only the outer call decides what the value *is*: ``ItemCost(IdToItem(...))``
+    evaluates to a number, so the nested ``IdToItem`` says nothing about what the
+    assignment stores.
+    """
+    text = _mask_non_code(expression).casefold()
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            if depth == 0:
+                start = index
+                while start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_."):
+                    start -= 1
+                return text[start:index] or None
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+    return None
+
+
 def _raw_item_expression(expression: str, tainted: set[str]) -> bool:
     folded = _mask_non_code(expression).casefold()
-    if re.search(r"\bid\s*\(", folded):
+    outer = _outermost_call_name(expression)
+    if outer == "id":
         return False
-    if re.search(r"\b(?:createquestitem|idtoitem)\s*\(", folded):
+    if outer in {"createquestitem", "idtoitem"}:
         return True
     return any(re.search(rf"\b{re.escape(value)}\b", folded) for value in tainted)
 

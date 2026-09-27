@@ -1321,6 +1321,26 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-persistent-raw-item-handle", codes)
 
+    def test_resolved_item_read_for_a_value_is_not_a_stored_handle(self) -> None:
+        # ItemCost(IdToItem(...)) evaluates to a number: resolving an id in order to
+        # read a value from it is the recommended pattern, so neither the integer it
+        # lands in nor a string built from that integer may be reported.
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "int1", "Parent": -1, "#": 10},
+            {"Type": "TVar", "Name": "LStorageMsg", "Parent": -1, "#": 11},
+        ]
+        group["Operations"][0]["Code"].extend(
+            [
+                "int1 = ItemCost(IdToItem(stored_item_id));",
+                "LStorageMsg = LStorageMsg + int1;",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("stored-cost.rson")))
+        matching = [issue for issue in issues if issue.code == "runtime-persistent-raw-item-handle"]
+        self.assertEqual(matching, [])
+
     def test_persistent_planet_reference_requires_stable_id_restore(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]
