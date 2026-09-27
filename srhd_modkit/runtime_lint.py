@@ -4882,7 +4882,6 @@ def _direct_detached_item_free_sites(
 ) -> list[tuple[int, int, str]]:
     """Return FreeItem sites for items detached and unlinked in this call."""
 
-    parameters = _function_parameters(block)
     origins: dict[str, str] = {}
     released: set[str] = set()
     result: list[tuple[int, int, str]] = []
@@ -10679,7 +10678,10 @@ def dialog_semantic_map(project: RsonProject) -> dict[str, Any]:
             answers.append({**common, "number": _constant_int(str(item.get("AMsg.Num", "")))})
         elif item.get("Type") == "TDialog":
             dialogs.append(common)
-    key = lambda value: (value.get("object_id") is None, value.get("object_id"), value.get("name", ""))
+
+    def key(value: dict) -> tuple:
+        return (value.get("object_id") is None, value.get("object_id"), value.get("name", ""))
+
     return {
         "messages": sorted(messages, key=key),
         "answers": sorted(answers, key=key),

@@ -24,3 +24,16 @@ include = ["srhd_modkit*"]
 
 [tool.setuptools.package-data]
 srhd_modkit = ["schemas/*.json"]
+
+[tool.ruff]
+# Ruff is a lint complement to the test suite, not a formatter: it catches the
+# cheap, mechanical defects the tests cannot see — a dead import, an unused
+# assignment, an unreachable branch — in a second, without running anything.
+# Run it with `python -m ruff check .` (install with `pip install ruff`).
+target-version = "py312"
+
+[tool.ruff.lint]
+# The default pycodestyle/pyflakes families, pinned explicitly so the behaviour
+# does not drift with a ruff release. E4=imports, E7=statements, E9=runtime,
+# F=pyflakes (unused imports/variables, undefined names).
+select = ["E4", "E7", "E9", "F"]
