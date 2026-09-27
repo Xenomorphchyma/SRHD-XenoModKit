@@ -71,6 +71,10 @@ class LanguageWorkflowTests(unittest.TestCase):
             result = remap_languages(truth, onto, [overlay], out_dir=root / "out", script="ModX")
             self.assertEqual(result["summary"]["mapped"], 3)
             self.assertEqual(result["summary"]["dropped"], 2)
+            # the two identical "Same" texts are paired by order: a guess, so the run is not valid
+            self.assertEqual(result["summary"]["ambiguous"], 2)
+            self.assertFalse(result["valid"])
+            self.assertTrue(result["scripts"][0]["duplicate_text_groups"][0]["ambiguous"])
             text = (root / "out" / "overlay.txt").read_text(encoding="utf-8")
             self.assertIn("1=A", text)
             self.assertIn("2=B", text)
@@ -104,6 +108,8 @@ class LanguageWorkflowTests(unittest.TestCase):
                 placeholder_tokens=("planet", "star"),
             )
             self.assertEqual(result["summary"]["mapped"], 1)
+            self.assertEqual(result["summary"]["normalized"], 1)
+            self.assertFalse(result["valid"])
             self.assertEqual(result["scripts"][0]["normalized"], [{"old": "10", "new": "4"}])
             text = (root / "out" / "overlay.txt").read_text(encoding="utf-8")
             self.assertIn("4=Colonization of planet planet (star system)", text)
@@ -181,6 +187,70 @@ class LanguageWorkflowTests(unittest.TestCase):
             text = (root / "out.txt").read_text(encoding="utf-16")
             self.assertIn("3=A", text)
             self.assertIn("9=B", text)
+
+    def test_remap_mirrors_input_folders_so_two_lang_dat_do_not_collide(self) -> None:
+        """Two Lang.txt under one root keep their folders in --out-dir."""
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            rig = root / "CFG" / "Rus"
+            eng = root / "CFG" / "Eng"
+            rig.mkdir(parents=True)
+            eng.mkdir(parents=True)
+            (root / "truth.txt").write_text(
+                "Script ^{\n    ModX ^{\n        10=Alpha\n    }\n}\n", encoding="utf-8"
+            )
+            (root / "fragment.txt").write_text("1=Alpha\n", encoding="utf-8")
+            (rig / "Lang.txt").write_text(
+                "Script ^{\n    ModX ^{\n        10=Ру\n    }\n}\n", encoding="utf-8"
+            )
+            (eng / "Lang.txt").write_text(
+                "Script ^{\n    ModX ^{\n        10=En\n    }\n}\n", encoding="utf-8"
+            )
+            remap_languages(
+                root / "truth.txt",
+                root / "fragment.txt",
+                [rig / "Lang.txt", eng / "Lang.txt"],
+                out_dir=root / "out",
+                script="ModX",
+            )
+            self.assertTrue((root / "out" / "Rus" / "Lang.txt").is_file())
+            self.assertTrue((root / "out" / "Eng" / "Lang.txt").is_file())
+            self.assertIn("1=Ру", (root / "out" / "Rus" / "Lang.txt").read_text(encoding="utf-8"))
+            self.assertIn("1=En", (root / "out" / "Eng" / "Lang.txt").read_text(encoding="utf-8"))
+
+    def test_remap_writes_nothing_when_any_target_already_exists(self) -> None:
+        """The output is settled for every language before the first file is written."""
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            rig = root / "CFG" / "Rus"
+            eng = root / "CFG" / "Eng"
+            rig.mkdir(parents=True)
+            eng.mkdir(parents=True)
+            (root / "truth.txt").write_text(
+                "Script ^{\n    ModX ^{\n        10=Alpha\n    }\n}\n", encoding="utf-8"
+            )
+            (root / "fragment.txt").write_text("1=Alpha\n", encoding="utf-8")
+            (rig / "Lang.txt").write_text(
+                "Script ^{\n    ModX ^{\n        10=A\n    }\n}\n", encoding="utf-8"
+            )
+            (eng / "Lang.txt").write_text(
+                "Script ^{\n    ModX ^{\n        10=B\n    }\n}\n", encoding="utf-8"
+            )
+            out = root / "out"
+            (out / "Eng").mkdir(parents=True)
+            (out / "Eng" / "Lang.txt").write_text("EXISTING", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                remap_languages(
+                    root / "truth.txt",
+                    root / "fragment.txt",
+                    [rig / "Lang.txt", eng / "Lang.txt"],
+                    out_dir=out,
+                    script="ModX",
+                )
+            # the first language must not have been written before the second was refused
+            self.assertFalse((out / "Rus" / "Lang.txt").exists())
 
     def test_coverage_finds_missing_keys_and_rscript_code_stubs(self) -> None:
         with tempfile.TemporaryDirectory() as name:

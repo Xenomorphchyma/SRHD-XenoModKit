@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any, Iterable
 from .blockpar import BlockParDocument, BlockParNode, BlockParParameter, load_blockpar
 from .files import iter_files, sha256_file
 from .module_info import find_module_info, parse_module_info
+from .safe_io import atomic_write_text
 from .toolchain import Toolchain
 
 
@@ -396,7 +398,9 @@ def _pair_keys_by_text(
 
     A pair whose texts differ only in placeholder style (``planet``/``star`` against ``<0>``/``<1>``)
     still carries the same message, so ``tokens`` lists the word placeholders to treat as equal; such
-    pairs are returned separately for the report.
+    pairs are returned separately for the report. A text that appears more than once is paired by key
+    order and always reported as ambiguous — however many copies each side has — because that order
+    is not proof of anything.
     """
 
     old_by_text: dict[str, list[str]] = {}
@@ -413,11 +417,22 @@ def _pair_keys_by_text(
             continue
         old_keys = sorted(old_keys, key=int)
         new_keys = sorted(new_keys, key=int)
-        for index, old_key in enumerate(old_keys):
-            if index < len(new_keys):
-                mapping[old_key] = new_keys[index]
-        if len(old_keys) != len(new_keys):
-            groups.append({"text": value, "old": old_keys, "new": new_keys})
+        paired = list(zip(old_keys, new_keys))
+        for old_key, new_key in paired:
+            mapping[old_key] = new_key
+        if len(old_keys) > 1 or len(new_keys) > 1:
+            # Identical texts are paired by key order, which is only a guess: report
+            # it even when the two counts match, so ``valid`` can say the result is
+            # not verified.
+            groups.append(
+                {
+                    "text": value,
+                    "old": old_keys,
+                    "new": new_keys,
+                    "ambiguous": True,
+                    "paired": [[old_key, new_key] for old_key, new_key in paired],
+                }
+            )
 
     normalized: list[dict[str, str]] = []
     if tokens:
@@ -497,6 +512,33 @@ def _rewrite_script_keys(
     return "\n".join(out), stats
 
 
+def _common_parent(paths: list[Path]) -> Path | None:
+    """The deepest directory holding every language file, or None across roots/drives."""
+
+    try:
+        return Path(os.path.commonpath([str(item.parent) for item in paths]))
+    except ValueError:  # e.g. different drives on Windows
+        return None
+
+
+def _remap_output_path(out_dir: Path, item: Path, common_root: Path | None) -> Path:
+    """Mirror the input's folder under ``out_dir`` so two ``Lang.dat`` cannot collide.
+
+    ``CFG/Rus/Lang.dat`` and ``CFG/Eng/Lang.dat`` become ``<out>/Rus/Lang.dat`` and
+    ``<out>/Eng/Lang.dat``; a lone file keeps its own name. Falls back to the parent
+    folder's name when the inputs have no common root.
+    """
+
+    if common_root is not None:
+        try:
+            relative = item.relative_to(common_root)
+        except ValueError:
+            relative = None
+        if relative and relative.parts:
+            return out_dir / relative
+    return out_dir / item.parent.name / item.name if item.parent.name else out_dir / item.name
+
+
 def remap_languages(
     truth: str | Path,
     onto: str | Path,
@@ -557,28 +599,50 @@ def remap_languages(
         if not any(mappings.values()):
             raise ValueError("--truth и --onto не дали ни одного соответствия по текстам")
 
+        # Preliminary pass: read and decode every language once, and settle every
+        # output path, before anything is written.
+        common_root = _common_parent(language_paths)
+        prepared: list[tuple[Path, str, Path]] = []
+        targets: dict[str, Path] = {}
+        for item in language_paths:
+            target = _remap_output_path(out_path, item, common_root)
+            key = str(target).casefold()
+            if key in targets:
+                raise ValueError(
+                    "Два языка дают один и тот же путь результата: "
+                    f"{targets[key]} и {item} -> {target}"
+                )
+            targets[key] = item
+            if target.exists() and not overwrite:
+                raise FileExistsError(f"Результат уже существует: {target}")
+            prepared.append((item, _language_text(item, chain, temp), target))
+
         results: list[dict[str, Any]] = []
         occupied = {
             name.casefold(): set(keys) for name, keys in onto_scripts.items()
         }
-        for item in language_paths:
-            rewritten, stats = _rewrite_script_keys(
-                _language_text(item, chain, temp), mappings, truth_scripts, occupied
-            )
+        for item, text, target in prepared:
+            rewritten, stats = _rewrite_script_keys(text, mappings, truth_scripts, occupied)
             if item.suffix.casefold() == ".dat":
-                staged = temp / f"{item.stem}.txt"
+                staged = temp / f"out-{item.stem}.txt"
                 staged.write_text(rewritten, encoding="utf-16", newline="")
-                target = out_path / item.name
-                if target.exists() and not overwrite:
-                    raise FileExistsError(f"Результат уже существует: {target}")
+                # convert_dat stages and os.replace()s, so the destination is never half-written.
                 chain.convert_dat(staged, target, overwrite=True, verify=True)
             else:
-                target = out_path / item.name
-                if target.exists() and not overwrite:
-                    raise FileExistsError(f"Результат уже существует: {target}")
-                encoding = "utf-16" if item.read_bytes().startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8"
-                target.write_text(rewritten, encoding=encoding, newline="")
+                encoding = (
+                    "utf-16"
+                    if item.read_bytes().startswith((b"\xff\xfe", b"\xfe\xff"))
+                    else "utf-8"
+                )
+                atomic_write_text(target, rewritten, encoding=encoding)
             results.append({"path": str(item), "output": str(target), **stats})
+
+    ambiguous = sum(
+        min(len(group["old"]), len(group["new"]))
+        for script_groups in groups.values()
+        for group in script_groups
+    )
+    normalized_count = sum(len(items) for items in normalized.values())
     return {
         "schema": LANG_SCHEMA,
         "operation": "remap",
@@ -588,18 +652,32 @@ def remap_languages(
             {
                 "script": name,
                 "mapped": len(mapping),
+                "ambiguous": sum(
+                    min(len(group["old"]), len(group["new"]))
+                    for group in groups.get(name, [])
+                ),
                 "normalized": normalized.get(name, []),
                 "duplicate_text_groups": groups.get(name, []),
             }
             for name, mapping in sorted(mappings.items())
         ],
         "languages": results,
-        "valid": all(item["unmatched"] == 0 for item in results),
+        # ``valid`` means the whole remap is exact: nothing left behind, nothing
+        # dropped for a collision, and no match that is only a guess — the
+        # order-paired duplicates (ambiguous) or the placeholder-style pairs
+        # (normalized) all make it False, however far the run got.
+        "valid": (
+            ambiguous == 0
+            and normalized_count == 0
+            and all(item["unmatched"] == 0 and item["dropped"] == 0 for item in results)
+        ),
         "summary": {
             "languages": len(results),
             "mapped": sum(item["mapped"] for item in results),
             "unmatched": sum(item["unmatched"] for item in results),
             "dropped": sum(item["dropped"] for item in results),
+            "ambiguous": ambiguous,
+            "normalized": normalized_count,
         },
     }
 
