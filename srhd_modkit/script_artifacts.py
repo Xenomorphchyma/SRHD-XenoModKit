@@ -584,6 +584,7 @@ def lint_script_cache(
     cache_documents: Sequence[tuple[str | Path, BlockParDocument]],
     *,
     install_subpath: str | Path | None = None,
+    mod_name: str | None = None,
 ) -> list[ScriptArtifactIssue]:
     """Cross-check local SCR files, Main registrations and CacheData mappings.
 
@@ -642,7 +643,12 @@ def lint_script_cache(
                 )
                 continue
 
-            expected_tail = [root.name.casefold(), "data", "script", filename.casefold()]
+            # The folder the CacheData path should carry: the exact install
+            # folder when known, else the ModuleInfo Name, and only as a last
+            # resort the audited folder's own name. A working copy is often
+            # just ``mod``, which is not the folder the mod is deployed under.
+            expected_folder = (mod_name or "").strip() or root.name
+            expected_tail = [expected_folder.casefold(), "data", "script", filename.casefold()]
             for key, value in mappings:
                 parts = _path_parts(value)
                 basename = parts[-1] if parts else ""
@@ -683,7 +689,7 @@ def lint_script_cache(
                             )
                         )
                 elif not folded_parts or folded_parts[0] != "mods" or folded_tail != expected_tail:
-                    expected = f"Mods\\<путь установки>\\{root.name}\\DATA\\Script\\{filename}"
+                    expected = f"Mods\\<путь установки>\\{expected_folder}\\DATA\\Script\\{filename}"
                     issues.append(
                         ScriptArtifactIssue(
                             "error",

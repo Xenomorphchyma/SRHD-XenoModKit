@@ -612,9 +612,18 @@ def _text_check(context: AuditContext) -> AuditCheck:
                     require_cp1251_representable=not (final_cfg and russian),
                     check_display_compatibility=False,
                 )
-                values.extend(
-                    lint_key_value_display_text(decoded.text, path)
-                )
+                # A cfg *.txt is BlockPar text, so parse it and lint block-aware:
+                # the flat reader cannot tell a script code block from display
+                # text. Fall back to the flat reader when it does not parse.
+                blockpar_document = None
+                try:
+                    blockpar_document = load_blockpar(path)
+                except Exception:
+                    blockpar_document = None
+                if blockpar_document is not None:
+                    values.extend(lint_blockpar_display_text(blockpar_document, path))
+                else:
+                    values.extend(lint_key_value_display_text(decoded.text, path))
                 issues.extend(AuditIssue.from_value(item, validator=name, mod=context.mod_name) for item in values)
                 checked.append(str(path))
             except Exception as exc:
@@ -1640,6 +1649,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
             registrations,
             cache_documents,
             install_subpath=context.install_subpath,
+            mod_name=context.mod_name or None,
         )
     )
     issues.extend(

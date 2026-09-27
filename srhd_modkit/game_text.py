@@ -208,6 +208,18 @@ def lint_game_display_text(
     return issues
 
 
+def _is_code_block(name: str) -> bool:
+    """Whether a BlockPar node/parameter holds script code, not display text.
+
+    SRHD keeps script in the language tree — ``OnUseCode``, ``OnUseCodeTypes``,
+    ``OnActCode``, ``ItemOnUseCode``, ``OnUseCodeBlackHole`` … — and those values
+    are executed, never drawn, so the display-text rules must not read them. Every
+    such name carries ``code``; real text blocks (``Data``, ``Text``, dialog
+    blocks) do not.
+    """
+    return "code" in name.casefold()
+
+
 def lint_blockpar_display_text(
     document: BlockParDocument,
     path: str | Path | None = None,
@@ -222,6 +234,8 @@ def lint_blockpar_display_text(
     ) -> None:
         for entry in entries:
             if isinstance(entry, BlockParParameter):
+                if _is_code_block(entry.key):
+                    continue
                 issues.extend(
                     lint_game_display_text(
                         entry.value,
@@ -230,6 +244,8 @@ def lint_blockpar_display_text(
                     )
                 )
             elif isinstance(entry, BlockParNode):
+                if _is_code_block(entry.name):
+                    continue
                 walk(entry.entries, f"{prefix}/{entry.name}")
 
     walk(document.entries)

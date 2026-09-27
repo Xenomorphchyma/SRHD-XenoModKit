@@ -148,6 +148,30 @@ class GameTextTests(unittest.TestCase):
         self.assertEqual(len(flat_issues), 1)
         self.assertNotIn("20–30", flat_issues[0].evidence or "")
 
+    def test_blockpar_code_values_are_not_display_text(self) -> None:
+        # SRHD keeps script in the language tree; the display rules must not read
+        # an OnUseCode value (a slash inside code is not a progress notation).
+        document = parse_blockpar(
+            "UselessItems ^{\n"
+            "    Usl_Creditka ^{\n"
+            "        OnUseCode ^{\n"
+            "            01=temp_dwd = round(temp_dwd * 102 / 100);\n"
+            "        }\n"
+            "    }\n"
+            "    Usl_Other ^{\n"
+            "        Description=Этап 3/48\n"
+            "    }\n"
+            "}\n"
+        )
+        issues = lint_blockpar_display_text(document, "Lang_Rus.txt")
+        self.assertNotIn(
+            "OnUseCode",
+            " ".join(issue.location or "" for issue in issues),
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertIn("Usl_Other", issues[0].location or "")
+        self.assertEqual(issues[0].code, "game-text-numeric-slash-notation")
+
     def test_script_validate_reports_display_compatibility_warning(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             source = Path(name) / "display.rson"
