@@ -172,6 +172,19 @@ class GameTextTests(unittest.TestCase):
         self.assertIn("Usl_Other", issues[0].location or "")
         self.assertEqual(issues[0].code, "game-text-numeric-slash-notation")
 
+    def test_display_key_containing_code_is_not_silently_skipped(self) -> None:
+        document = parse_blockpar(
+            "Data ^{\n"
+            "    Decode=Этап 3/48\n"
+            "    OnPressCode ^{\n"
+            "        01=value = 3 / 48;\n"
+            "    }\n"
+            "}\n"
+        )
+        issues = lint_blockpar_display_text(document, "Lang_Rus.txt")
+        self.assertEqual(len(issues), 1)
+        self.assertIn("Decode", issues[0].location or "")
+
     def test_script_validate_reports_display_compatibility_warning(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             source = Path(name) / "display.rson"

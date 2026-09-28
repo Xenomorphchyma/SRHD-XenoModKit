@@ -208,16 +208,32 @@ def lint_game_display_text(
     return issues
 
 
-def _is_code_block(name: str) -> bool:
-    """Whether a BlockPar node/parameter holds script code, not display text.
+_KNOWN_CODE_BLOCKS = frozenset(
+    {
+        "code",
+        "onactcode",
+        "onpresscode",
+        "onusecode",
+        "onusecodetypes",
+        "onusecodeblackhole",
+        "itemonactcode",
+        "itemonusecode",
+    }
+)
 
-    SRHD keeps script in the language tree — ``OnUseCode``, ``OnUseCodeTypes``,
-    ``OnActCode``, ``ItemOnUseCode``, ``OnUseCodeBlackHole`` … — and those values
-    are executed, never drawn, so the display-text rules must not read them. Every
-    such name carries ``code``; real text blocks (``Data``, ``Text``, dialog
-    blocks) do not.
+
+def _is_code_block(name: str) -> bool:
+    """Whether a known SRHD language node holds executable code.
+
+    Do not use a substring test here: a legitimate display key such as ``Decode``
+    must still be checked.  The explicit catalogue covers known engine nodes, while
+    the narrow suffix rule keeps compatibility with conventional ``On*Code`` and
+    ``Item*Code`` extensions without swallowing unrelated text fields.
     """
-    return "code" in name.casefold()
+    folded = name.strip().casefold()
+    if folded in _KNOWN_CODE_BLOCKS:
+        return True
+    return folded.endswith("code") and folded.startswith(("on", "item", "ship", "script"))
 
 
 def lint_blockpar_display_text(
