@@ -1679,6 +1679,55 @@ def _array_allocation_sizes(project: RsonProject) -> dict[str, set[int]]:
     return result
 
 
+def _paired_dynamic_array_mutations(
+    project: RsonProject,
+    left: str,
+    right: str,
+) -> bool:
+    """Prove a conservative lock-step invariant for two dynamic arrays.
+
+    The proof deliberately does not infer equality from naming or from a single
+    ``ArrayDim`` comparison.  Both arrays must be dynamic service-slot arrays and
+    every ArrayClear/ArrayAdd/ArrayDelete operation must occur in a container with
+    the same operation multiplicity for both names.  This covers the common
+    rebuild-both-arrays-then-DAdd pattern while retaining warnings for a pair that
+    is only accidentally synchronized on one path.
+    """
+
+    sizes = _array_allocation_sizes(project)
+    shared = _shared_tvars(project)
+    array_names = _rscript_array_names(project)
+    dynamic_names = {
+        name
+        for name in (left.casefold(), right.casefold())
+        if name in shared
+        and name in array_names
+        and all(value <= 1 for value in sizes.get(name, {1}))
+    }
+    if len(dynamic_names) != 2:
+        return False
+
+    operations_seen = False
+    for container in _iter_code_containers(project):
+        counts = {
+            left.casefold(): {"arrayclear": 0, "arrayadd": 0, "arraydelete": 0},
+            right.casefold(): {"arrayclear": 0, "arrayadd": 0, "arraydelete": 0},
+        }
+        for line in container.lines:
+            for _position, call, arguments in _line_call_sites(_mask_non_code(line)):
+                if call not in counts[left.casefold()] or not arguments:
+                    continue
+                name = _simple_identifier(arguments[0])
+                if name in counts:
+                    counts[name][call] += 1
+                    operations_seen = True
+        if any(counts[name][operation] != 0 for name in counts for operation in counts[name]):
+            if counts[left.casefold()] != counts[right.casefold()]:
+                return False
+
+    return operations_seen
+
+
 def _numeric_variable_bounds(project: RsonProject) -> dict[str, tuple[int, int]]:
     """Collect conservative literal/RndObject ranges used by loop contracts."""
 
@@ -2093,17 +2142,23 @@ def _lint_fixed_array_contracts(project: RsonProject) -> list[RuntimeIssue]:
 
 
 def _lint_persistent_array_dimension_drift(project: RsonProject) -> list[RuntimeIssue]:
-    """Warn about the save-sensitive dynamic persistent-array lifecycle."""
+    """Warn about the confirmed fixed-array lifecycle hazard.
+
+    ``newarray(1)`` is the normal dynamic RScript-array representation: ``ArrayClear``
+    keeps the service slot and ``ArrayAdd``/``ArrayDim`` operate on the exact saved
+    count.  The historical runtime failure concerned a fixed ``newarray(N)`` table,
+    so the diagnostic must not classify every growing queue as a save-corruption risk.
+    """
 
     sizes = _array_allocation_sizes(project)
     shared = _shared_tvars(project)
-    dynamic = {
+    fixed = {
         name for name, values in sizes.items()
-        if name in shared and 1 in values and not any(value > 1 for value in values)
+        if name in shared and any(value > 1 for value in values)
     }
-    if not dynamic:
+    if not fixed:
         return []
-    calls: dict[str, set[str]] = {name: set() for name in dynamic}
+    calls: dict[str, set[str]] = {name: set() for name in fixed}
     loops: dict[str, tuple[CodeContainer, int, str]] = {}
     for container in _iter_code_containers(project):
         for line_number, line in enumerate(container.lines, start=1):
@@ -2119,12 +2174,12 @@ def _lint_persistent_array_dimension_drift(project: RsonProject) -> list[Runtime
                 masked,
                 re.IGNORECASE,
             )
-            if match and match.group(1).casefold() in dynamic:
+            if match and match.group(1).casefold() in fixed:
                 loops.setdefault(match.group(1).casefold(), (container, line_number, line))
 
     path = str(project.path) if project.path else None
     issues: list[RuntimeIssue] = []
-    for name in sorted(dynamic):
+    for name in sorted(fixed):
         if calls[name] != {"arrayadd", "arrayclear"} or name not in loops:
             continue
         container, line_number, line = loops[name]
@@ -2132,7 +2187,7 @@ def _lint_persistent_array_dimension_drift(project: RsonProject) -> list[Runtime
             RuntimeIssue(
                 "warning",
                 "runtime-persistent-array-live-dimension-drift",
-                f"Persistent-массив {name} проходит цикл ArrayClear + ArrayAdd и затем обходится по живому ArrayDim. После сохранения движок способен рассинхронизировать размер и доступный последний индекс; для ограниченной таблицы используйте newarray(max + 1), явно типизируйте слоты и фиксируйте границы",
+                 f"Фиксированный persistent-массив {name}=newarray(N) проходит цикл ArrayClear + ArrayAdd и затем обходится по живому ArrayDim. Для fixed-таблицы сохраняйте явную границу и не смешивайте её с динамической очередью; динамический newarray(1) этим правилом не блокируется",
                 path,
                 f"{container.location}:{line_number}",
                 line.strip(),
@@ -2513,6 +2568,18 @@ def _lint_rscript_arrays(project: RsonProject) -> list[RuntimeIssue]:
                 for right in sorted(shared_indexed)[pos + 1 :]
                 if frozenset((left, right)) not in pairs
             ]
+            # A dynamic pair whose every mutation is performed together has a
+            # stronger invariant than a literal ArrayDim comparison.  This is
+            # intentionally limited to the service-slot representation
+            # (newarray(1)/Var.Type=Array) and requires matching operation counts
+            # in every code container, so a partially updated pair still warns.
+            paired_dynamic = {
+                frozenset((left, right))
+                for pos, left in enumerate(sorted(shared_indexed))
+                for right in sorted(shared_indexed)[pos + 1 :]
+                if _paired_dynamic_array_mutations(project, left, right)
+            }
+            missing = [pair for pair in missing if frozenset(pair) not in paired_dynamic]
             if missing:
                 left, right = missing[0]
                 report(
@@ -10355,12 +10422,66 @@ def _lint_synchronous_runtime_reentry(
     return issues
 
 
+def _lint_orphan_turn_duplicates(project: RsonProject) -> list[RuntimeIssue]:
+    """Report only high-confidence orphaned copy/paste Turn objects."""
+
+    path = str(project.path) if project.path else None
+    objects = {
+        item["#"]: item
+        for item in project.iter_objects()
+        if isinstance(item.get("#"), int)
+    }
+    turn_objects = {
+        object_id: item
+        for object_id, item in objects.items()
+        if str(item.get("Code.Type", "")).casefold() == "turn"
+        and isinstance(item.get("Code"), list)
+    }
+    incoming: dict[int, set[int]] = {object_id: set() for object_id in turn_objects}
+    links = project.data.get("Visual.Links", [])
+    if isinstance(links, list):
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            begin, end = link.get("Begin"), link.get("End")
+            if end in incoming and begin in objects:
+                incoming[end].add(begin)
+
+    by_code: dict[tuple[str, ...], list[int]] = {}
+    for object_id, item in turn_objects.items():
+        code = tuple(_mask_non_code(str(line)).strip() for line in item["Code"])
+        if code:
+            by_code.setdefault(code, []).append(object_id)
+
+    issues: list[RuntimeIssue] = []
+    for code, object_ids in by_code.items():
+        linked = [object_id for object_id in object_ids if incoming[object_id]]
+        if not linked:
+            continue
+        for object_id in object_ids:
+            item = turn_objects[object_id]
+            if incoming[object_id] or item.get("Parent") not in (-1, None):
+                continue
+            issues.append(
+                RuntimeIssue(
+                    "warning",
+                    "runtime-orphan-turn-object",
+                    f"Turn-объект #{object_id} не имеет входящей связи и повторяет связанный Turn #{linked[0]}; RScript всё равно исполняет его каждый ход. Удалите копию или добавьте намеренную связь",
+                    path,
+                    f"object #{object_id} Code",
+                    "\n".join(str(line) for line in item["Code"]),
+                )
+            )
+    return issues
+
+
 def lint_rson_runtime(
     project: RsonProject,
     *,
     main_documents: Sequence[BlockParDocument] | None = None,
     check_custom_factions: bool = True,
     native_root: str | Path | None = None,
+    launch_mode: str | None = None,
 ) -> list[RuntimeIssue]:
     path = str(project.path) if project.path else None
     functions, issues = _extract_functions(project)
@@ -10454,6 +10575,7 @@ def lint_rson_runtime(
     issues.extend(_lint_batch_ship_spawn_reentry(project, functions))
     issues.extend(_lint_fresh_ship_script_data_cross_transition(project, functions))
     issues.extend(_lint_synchronous_runtime_reentry(project, functions))
+    issues.extend(_lint_orphan_turn_duplicates(project))
     graph = _call_graph(functions)
     risky = _risky_functions(functions, graph)
 
@@ -10528,6 +10650,12 @@ def lint_rson_runtime(
         calls = {call.casefold() for call in _calls(text)}
         custom = calls & set(functions)
         turn_starts.update(custom)
+        # A template/world-launched script is entered after the game UI exists;
+        # startup-only readiness diagnostics would be false positives here.  Keep
+        # the conservative behaviour for unknown/standalone projects and retain
+        # all non-readiness runtime checks below.
+        if launch_mode == "world":
+            continue
         first_top_risk = _first_top_level_risky_line([str(line) for line in lines], risky)
         if first_top_risk is None:
             continue
@@ -11015,6 +11143,50 @@ def has_onstart_script_run(document: BlockParDocument) -> bool:
         if "onstart" in {part.casefold() for part in node_path.split("/")} and _script_run_calls(value):
             return True
     return False
+
+
+def script_launch_mode(
+    document: BlockParDocument,
+    script_name: str,
+) -> str | None:
+    """Classify an explicitly registered script as startup or world-launched.
+
+    A script mentioned by an ``OnStart`` ScriptRun needs the UI readiness barrier.
+    A script registered under ``Data/Script`` but not launched from OnStart is a
+    template/world entry (dialog, generator, or manual ScriptRun) and does not need
+    that startup-only warning.  Unknown/no Main.dat remains ``None`` so standalone
+    lint keeps its conservative diagnostics.
+    """
+
+    wanted = script_name.casefold()
+
+    def mentions_script(arguments: Sequence[str]) -> bool:
+        return any(
+            wanted in argument.strip(" '\"\t\r\n").casefold()
+            for argument in arguments
+        )
+
+    onstart = False
+    for node_path, _key, value in _node_parameters(document.roots):
+        if "onstart" not in {part.casefold() for part in node_path.split("/")}:
+            continue
+        for arguments, _call in _script_run_calls(value):
+            if mentions_script(arguments):
+                onstart = True
+                break
+        if onstart:
+            break
+    if onstart:
+        return "startup"
+
+    try:
+        node = document.find_node("Data/Script")
+    except KeyError:
+        return None
+    for parameter in node.parameters:
+        if wanted in f"{parameter.key} {parameter.value}".casefold():
+            return "world"
+    return None
 
 
 def lint_module_runtime(module: ModuleInfo) -> list[RuntimeIssue]:

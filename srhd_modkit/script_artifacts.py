@@ -522,6 +522,55 @@ def lint_script_dialog_language(
             ]
             if mismatched:
                 unpublished[str(path)] = sorted(mismatched, key=int)
+        # A key-set check cannot detect a shifted Script.<name>.<n> table: all
+        # numbers are present, but the value at each number belongs to its
+        # neighbour.  Compare the generated fragment record-by-record with each
+        # complete shipped language.  A translated-only project usually has zero
+        # exact source-text overlap and is deliberately left alone; a partial
+        # overlap plus mismatches is the high-confidence signature of a shift.
+        generated_visible = {
+            key: _dialog_message_value(value)
+            for key, value in fragment_entries
+            if key.isdecimal()
+            and value.strip()
+            and not _answer_value_is_code_stub(value)
+        }
+        if len(generated_visible) >= 3:
+            for path, parameters in nodes:
+                if not generated_visible.keys() <= parameters.keys():
+                    continue
+                matches = sum(
+                    _dialog_message_value(parameters[key]) == value
+                    for key, value in generated_visible.items()
+                )
+                mismatches = len(generated_visible) - matches
+                minimum_overlap = max(3, len(generated_visible) // 5)
+                generated_key_by_value = {
+                    value: key
+                    for key, value in generated_visible.items()
+                    if list(generated_visible.values()).count(value) == 1
+                }
+                shifted_hits = sum(
+                    _dialog_message_value(parameters[key]) in generated_key_by_value
+                    and generated_key_by_value[_dialog_message_value(parameters[key])] != key
+                    for key in generated_visible
+                )
+                if (
+                    matches < minimum_overlap
+                    or mismatches == 0
+                    or shifted_hits < 2
+                ):
+                    continue
+                issues.append(
+                    ScriptArtifactIssue(
+                        "error",
+                        "script-generated-lang-numbering-shift",
+                        f"{expected_path}: языковой файл {path.name} содержит все {len(generated_visible)} ключей, но только {matches} значений совпадают с фрагментом RScript; ещё {mismatches} записей выглядят сдвинутыми относительно Script.<name>.<n>",
+                        str(path),
+                        expected_path,
+                        f"fragment={fragment_path}; matched={matches}; mismatched={mismatches}; shifted_values={shifted_hits}",
+                    )
+                )
         if unpublished:
             evidence = "; ".join(
                 f"{path}: {','.join(keys)}"

@@ -430,6 +430,72 @@ class ScriptArtifactTests(unittest.TestCase):
             "  }\n"
             "}\n"
         )
+
+    def test_generated_language_fragment_detects_shifted_values(self) -> None:
+        project = _dialog_project()
+        # Use ordinary visible Msg values so the fragment represents the source
+        # language rather than DAnswer code stubs.
+        project.object_by_id(5)["Msg"] = "First answer"
+        project.object_by_id(6)["Msg"] = "Second answer"
+        generated = {
+            "Mod_Test": (
+                Path("Mod_Test.lang.txt"),
+                tuple((str(index), f"Answer {index}") for index in range(1, 6)),
+            )
+        }
+        shifted = parse_blockpar(
+            "Script ^{\n"
+            "  Mod_Test ~{\n"
+            "    1=Answer 1\n"
+            "    2=Answer 1\n"
+            "    3=Answer 3\n"
+            "    4=Answer 4\n"
+            "    5=Answer 2\n"
+            "  }\n"
+            "}\n"
+        )
+        issues = lint_script_dialog_language(
+            [project],
+            [(Path("CFG/Rus/Lang.dat"), shifted)],
+            generated,
+            checked_scripts=["Mod_Test"],
+        )
+        self.assertIn(
+            "script-generated-lang-numbering-shift",
+            {issue.code for issue in issues},
+        )
+
+    def test_translated_language_without_source_overlap_is_not_called_shift(self) -> None:
+        project = _dialog_project()
+        project.object_by_id(5)["Msg"] = "First answer"
+        project.object_by_id(6)["Msg"] = "Second answer"
+        generated = {
+            "Mod_Test": (
+                Path("Mod_Test.lang.txt"),
+                tuple((str(index), f"Answer {index}") for index in range(1, 6)),
+            )
+        }
+        translated = parse_blockpar(
+            "Script ^{\n"
+            "  Mod_Test ~{\n"
+            "    1=Ответ один\n"
+            "    2=Ответ два\n"
+            "    3=Ответ три\n"
+            "    4=Ответ четыре\n"
+            "    5=Ответ пять\n"
+            "  }\n"
+            "}\n"
+        )
+        issues = lint_script_dialog_language(
+            [project],
+            [(Path("CFG/Rus/Lang.dat"), translated)],
+            generated,
+            checked_scripts=["Mod_Test"],
+        )
+        self.assertNotIn(
+            "script-generated-lang-numbering-shift",
+            {issue.code for issue in issues},
+        )
         unrelated_compact = parse_blockpar("Script ^{\n  Other ~{\n  }\n}\n")
         self.assertEqual(
             lint_script_dialog_language(

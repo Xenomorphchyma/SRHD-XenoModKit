@@ -34,6 +34,7 @@ from .runtime_lint import (
     lint_module_runtime,
     lint_quest_item_images,
     lint_rson_runtime,
+    script_launch_mode,
 )
 from .script_artifacts import lint_script_cache, lint_script_dialog_language
 from .scripts import inspect_scr, load_rson
@@ -1576,6 +1577,11 @@ def _script_check(context: AuditContext) -> AuditCheck:
                     project,
                     check_custom_factions=False,
                     native_root=context.root,
+                    launch_mode=(
+                        script_launch_mode(main_document, project.name)
+                        if main_document is not None
+                        else None
+                    ),
                 )
                 runtime_values.extend(values)
                 issues.extend(
