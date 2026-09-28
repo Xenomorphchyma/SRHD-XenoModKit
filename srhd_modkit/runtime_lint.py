@@ -4299,12 +4299,16 @@ def _outermost_call_name(expression: str) -> str | None:
     return None
 
 
-def _raw_item_expression(expression: str, tainted: set[str]) -> bool:
+def _raw_item_expression(
+    expression: str,
+    tainted: set[str],
+    item_functions: set[str] = frozenset(),
+) -> bool:
     folded = _mask_non_code(expression).casefold()
     outer = _outermost_call_name(expression)
     if outer == "id":
         return False
-    if outer in {"createquestitem", "idtoitem"}:
+    if outer in {"createquestitem", "idtoitem"} or outer in item_functions:
         return True
     return any(re.search(rf"\b{re.escape(value)}\b", folded) for value in tainted)
 
@@ -4324,6 +4328,7 @@ def _lint_persistent_item_handles(
     if not shared:
         return []
     helper_sinks = _persistent_item_parameter_sinks(functions, shared)
+    item_functions = _item_returning_functions(functions)
     path = str(project.path) if project.path else None
     issues: list[RuntimeIssue] = []
     reported: set[tuple[str, int]] = set()
@@ -4361,7 +4366,7 @@ def _lint_persistent_item_handles(
             for match in matches:
                 target = match.group(1).casefold()
                 expression = match.group(2).strip()
-                raw = _raw_item_expression(expression, tainted)
+                raw = _raw_item_expression(expression, tainted, item_functions)
                 if target in shared and raw:
                     report(block, line_offset, target, line)
                 if raw:
@@ -4371,7 +4376,7 @@ def _lint_persistent_item_handles(
 
             for match in indexed_assignment.finditer(masked):
                 target = match.group(1).casefold()
-                if target in shared and _raw_item_expression(match.group(2), tainted):
+                if target in shared and _raw_item_expression(match.group(2), tainted, item_functions):
                     report(block, line_offset, target, line)
 
             for _position, arguments in _call_arguments(masked, "LinkItemToScript"):
@@ -4389,7 +4394,7 @@ def _lint_persistent_item_handles(
                 for _position, arguments in _call_arguments(masked, functions[helper_name].name):
                     for parameter_index, targets in sinks.items():
                         if parameter_index >= len(arguments) or not _raw_item_expression(
-                            arguments[parameter_index], tainted
+                            arguments[parameter_index], tainted, item_functions
                         ):
                             continue
                         for target in targets:

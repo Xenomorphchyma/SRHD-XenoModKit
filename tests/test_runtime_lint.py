@@ -1341,6 +1341,31 @@ class RuntimeLintTests(unittest.TestCase):
         matching = [issue for issue in issues if issue.code == "runtime-persistent-raw-item-handle"]
         self.assertEqual(matching, [])
 
+    def test_proven_item_returning_helper_is_still_tainted(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [
+            {"Type": "TVar", "Name": "cargo_registry", "Parent": -1, "#": 10},
+        ]
+        group["Operations"][0]["Code"].extend(
+            [
+                "function ReadCargo(dword ship, int slot)",
+                "{",
+                "    result = GetItemFromShip(ship, slot);",
+                "}",
+                "function StoreCargo(dword ship)",
+                "{",
+                "    dword cargo = ReadCargo(ship, 0);",
+                "    ArrayAdd(cargo_registry, cargo);",
+                "}",
+            ]
+        )
+        issues = lint_rson_runtime(RsonProject(data, Path("item-helper.rson")))
+        self.assertTrue(
+            any(issue.code == "runtime-persistent-raw-item-handle" for issue in issues),
+            issues,
+        )
+
     def test_persistent_planet_reference_requires_stable_id_restore(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]
