@@ -643,6 +643,11 @@ def remap_languages(
         for group in script_groups
     )
     normalized_count = sum(len(items) for items in normalized.values())
+    valid = (
+        ambiguous == 0
+        and normalized_count == 0
+        and all(item["unmatched"] == 0 and item["dropped"] == 0 for item in results)
+    )
     return {
         "schema": LANG_SCHEMA,
         "operation": "remap",
@@ -666,11 +671,9 @@ def remap_languages(
         # dropped for a collision, and no match that is only a guess — the
         # order-paired duplicates (ambiguous) or the placeholder-style pairs
         # (normalized) all make it False, however far the run got.
-        "valid": (
-            ambiguous == 0
-            and normalized_count == 0
-            and all(item["unmatched"] == 0 and item["dropped"] == 0 for item in results)
-        ),
+        "valid": valid,
+        "status": "verified" if valid else "provisional",
+        "provisional": not valid,
         "summary": {
             "languages": len(results),
             "mapped": sum(item["mapped"] for item in results),

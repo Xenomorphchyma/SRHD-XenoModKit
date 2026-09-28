@@ -41,6 +41,8 @@ class LanguageWorkflowTests(unittest.TestCase):
                 truth, onto, [overlay], out_dir=root / "out", script="ModX"
             )
             self.assertTrue(result["valid"])
+            self.assertEqual(result["status"], "verified")
+            self.assertFalse(result["provisional"])
             self.assertEqual(result["summary"]["mapped"], 3)
             self.assertEqual(result["summary"]["unmatched"], 0)
             text = (root / "out" / "overlay.txt").read_text(encoding="utf-8")
@@ -74,6 +76,8 @@ class LanguageWorkflowTests(unittest.TestCase):
             # the two identical "Same" texts are paired by order: a guess, so the run is not valid
             self.assertEqual(result["summary"]["ambiguous"], 2)
             self.assertFalse(result["valid"])
+            self.assertEqual(result["status"], "provisional")
+            self.assertTrue(result["provisional"])
             self.assertTrue(result["scripts"][0]["duplicate_text_groups"][0]["ambiguous"])
             text = (root / "out" / "overlay.txt").read_text(encoding="utf-8")
             self.assertIn("1=A", text)

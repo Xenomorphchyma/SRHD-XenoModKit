@@ -664,6 +664,8 @@ def cmd_lang_remap(args: argparse.Namespace) -> int:
     if args.json:
         print_json(result)
     else:
+        if result.get("provisional"):
+            print("Результат предварительный: сопоставление содержит неоднозначные или неполные ключи; в релиз его включать нельзя.")
         for item in result["scripts"]:
             print(f"Скрипт {item['script']}: сопоставлено ключей {item['mapped']}")
             if item["normalized"]:
