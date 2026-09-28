@@ -3895,6 +3895,65 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-dialog-inject-delayed-persistent-gate", safe_codes)
 
+    def test_cross_script_inject_target_is_not_checked_locally(self) -> None:
+        # `Script:Dialog` names a dialog of another script; the engine resolves it
+        # through FindScriptTemplateIndex and this project cannot see it.
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Operations"][0]["Code"].append(
+            "AddDialogInject('Another_Mod:KlissanInfo', 'text', 'Ask', 1);"
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("cross-script.rson")))
+        }
+        self.assertNotIn("dialog-inject-target-missing", codes)
+        self.assertIn("dialog-inject-cross-script-unverified", codes)
+
+    def test_blocked_injected_answer_does_not_need_a_jump_target(self) -> None:
+        # The dialog named by AddDialogInject is called only when its answer is picked,
+        # and an AddDialogBlock entry with mode >= 2 removes that answer outright.
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Operations"][0]["Code"].extend(
+            [
+                "AddDialogBlock('Anchor', 2);",
+                "AddDialogInject('Nowhere', 'text', 'Anchor', 0);",
+            ]
+        )
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("blocked-inject.rson")))
+        }
+        self.assertNotIn("dialog-inject-target-missing", codes)
+
+    def test_inject_answer_that_stays_visible_still_needs_its_target(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Operations"][0]["Code"].append("AddDialogInject('Nowhere', 'text', 'Ask', 0);")
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("live-inject.rson")))
+        }
+        self.assertIn("dialog-inject-target-missing", codes)
+
+        # A conditional block cannot globally prove that the answer is hidden.
+        group["Operations"][0]["Code"].insert(0, "if(flag) AddDialogBlock('Ask', 2);")
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("conditional-block.rson")))
+        }
+        self.assertIn("dialog-inject-target-missing", codes)
+
+        # mode 1 leaves the answer visible (only its callback is cleared), so the
+        # jump target is still required
+        group["Operations"][0]["Code"].insert(0, "AddDialogBlock('Ask', 1);")
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("disabled-inject.rson")))
+        }
+        self.assertIn("dialog-inject-target-missing", codes)
+
     def test_dialog_msg_rejects_eager_invalid_index_and_warns_about_late_value(self) -> None:
         data = deepcopy(SAFE_RSON)
         group = data["Visual.Objects"][0]

@@ -8475,6 +8475,42 @@ def _constant_int(expression: str) -> int | None:
     return int(value) if re.fullmatch(r"[+-]?\d+", value) else None
 
 
+def _answer_is_blocked(answer: str, blocked: set[str]) -> bool:
+    """True when an ``AddDialogBlock`` entry hides this injected answer.
+
+    ``TfRuinsTalk.AddChoice`` looks the answer text up in ``ScriptDialogBlocks``
+    (a substring match, the same as ``FindTextOffsetW``) and drops the choice
+    entirely when the entry's mode is >= 2.  The dialog named by ``AddDialogInject``
+    is only called when that answer is picked, so a hidden answer never reaches it.
+    """
+    candidates = {answer.casefold()}
+    if "~" in answer:
+        candidates.add(answer.split("~", 1)[1].casefold())
+    return any(block in candidate for block in blocked for candidate in candidates)
+
+
+def _call_is_unconditional(text: str, position: int) -> bool:
+    """Conservatively prove a call is not nested in an obvious branch.
+
+    A block collected from a conditional path must not globally suppress a missing
+    jump-target diagnostic: the condition may be false when the injection runs.
+    Unknown control-flow is therefore treated as *not proven*.
+    """
+    line_start = text.rfind("\n", 0, position) + 1
+    current = text[line_start:position]
+    if re.search(r"\b(?:if|else|for|while|switch|case)\b", current, re.IGNORECASE):
+        return False
+    previous = text[:line_start].splitlines()
+    for candidate in reversed(previous):
+        stripped = candidate.strip()
+        if not stripped:
+            continue
+        if re.search(r"\b(?:if|else|for|while|switch|case)\b", stripped, re.IGNORECASE):
+            return False
+        return True
+    return True
+
+
 def _dialog_graph_contexts(
     project: RsonProject,
 ) -> tuple[dict[int, set[str]], dict[int, set[int]], dict[str, dict[str, Any]]]:
@@ -8542,6 +8578,16 @@ def _lint_dialog_semantics(project: RsonProject) -> list[RuntimeIssue]:
 
     for container in _iter_code_containers(project):
         text = "\n".join(container.lines)
+        # Answers hidden by an unconditional AddDialogBlock(mode >= 2) are dropped
+        # before they can be picked. Keep this set local to the same code container:
+        # a conditional or unrelated handler must never suppress another warning.
+        blocked_answers: set[str] = set()
+        for position, block_arguments, _end in _iter_parsed_calls(text, "AddDialogBlock"):
+            if not block_arguments or (blocker := _literal_string(block_arguments[0])) is None:
+                continue
+            mode = _constant_int(block_arguments[1]) if len(block_arguments) > 1 else None
+            if blocker and mode is not None and mode >= 2 and _call_is_unconditional(text, position):
+                blocked_answers.add(blocker.casefold())
         context_id = container.object_id if container.object_id is not None else -1
         source_dialogs = contexts.get(context_id, set())
         for call, known_numbers in (("DChange", dmsg_numbers), ("DAdd", amsg_numbers)):
@@ -8562,7 +8608,7 @@ def _lint_dialog_semantics(project: RsonProject) -> list[RuntimeIssue]:
                     )
                 )
 
-        for call in ("AddDialogInject", "InjectAnswer"):
+        for call, answer_index in (("AddDialogInject", 2), ("InjectAnswer", 1)):
             for position, arguments, _end in _iter_parsed_calls(text, call):
                 if not arguments or (target := _literal_string(arguments[0])) is None:
                     continue
@@ -8571,6 +8617,27 @@ def _lint_dialog_semantics(project: RsonProject) -> list[RuntimeIssue]:
                 if not folded_target:
                     # Empty target is the documented callback/attached-code
                     # form of InjectAnswer, not a missing named TDialog.
+                    continue
+                if ":" in target:
+                    # The `Script:Dialog` form is resolved through FindScriptTemplateIndex
+                    # to another script's template, which this project cannot see.
+                    issues.append(
+                        RuntimeIssue(
+                            "info",
+                            "dialog-inject-cross-script-unverified",
+                            f"{call} ссылается на диалог другого скрипта {target}; локальная проверка цели невозможна",
+                            path,
+                            f"{container.location}:{line_number}",
+                            container.lines[line_number - 1].strip(),
+                        )
+                    )
+                    continue
+                answer = (
+                    _literal_string(arguments[answer_index])
+                    if len(arguments) > answer_index
+                    else None
+                )
+                if answer and _answer_is_blocked(answer, blocked_answers):
                     continue
                 if folded_target not in dialogs:
                     issues.append(
