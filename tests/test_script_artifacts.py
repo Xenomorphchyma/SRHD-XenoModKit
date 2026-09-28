@@ -430,6 +430,19 @@ class ScriptArtifactTests(unittest.TestCase):
             "  }\n"
             "}\n"
         )
+        unrelated_compact = parse_blockpar("Script ^{\n  Other ~{\n  }\n}\n")
+        self.assertEqual(
+            lint_script_dialog_language(
+                [_dialog_project()],
+                [
+                    (Path("DATA/Script/Lang.dat"), unrelated_compact),
+                    (Path("CFG/Rus/Lang.dat"), translated),
+                ],
+                _GENERATED_DIALOG,
+                checked_scripts=["Mod_Test"],
+            ),
+            [],
+        )
 
     def test_generated_language_fragment_detects_shifted_values(self) -> None:
         project = _dialog_project()
@@ -496,20 +509,6 @@ class ScriptArtifactTests(unittest.TestCase):
             "script-generated-lang-numbering-shift",
             {issue.code for issue in issues},
         )
-        unrelated_compact = parse_blockpar("Script ^{\n  Other ~{\n  }\n}\n")
-        self.assertEqual(
-            lint_script_dialog_language(
-                [_dialog_project()],
-                [
-                    (Path("DATA/Script/Lang.dat"), unrelated_compact),
-                    (Path("CFG/Rus/Lang.dat"), translated),
-                ],
-                _GENERATED_DIALOG,
-                checked_scripts=["Mod_Test"],
-            ),
-            [],
-        )
-
     def test_canonical_dialog_key_is_checked_without_generated_fragment(self) -> None:
         project = _dialog_project()
         answer = project.object_by_id(5)

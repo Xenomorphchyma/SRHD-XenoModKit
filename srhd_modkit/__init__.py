@@ -242,6 +242,7 @@ __all__ = [
     "lint_module_runtime",
     "lint_quest_item_images",
     "lint_rson_runtime",
+    "script_launch_mode",
     "ScriptArtifactIssue",
     "lint_script_cache",
     "lint_script_dialog_language",
@@ -355,4 +356,4 @@ __all__ = [
     "build_quest_from_json",
 ]
 
-__version__ = "0.10.3"
+__version__ = "0.10.4"
