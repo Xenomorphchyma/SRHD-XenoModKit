@@ -199,6 +199,8 @@ def cmd_audit(args: argparse.Namespace) -> int:
             allow=args.allow,
         )
     else:
+        if args.prefix is not None:
+            raise ValueError("--prefix применим только к одному моду; для audit коллекции укажите путь установки каждому моду отдельно")
         report = audit_collection(
             target,
             profile=args.profile,

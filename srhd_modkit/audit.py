@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from .blockpar import BlockParDocument, load_blockpar
 from .discovery import discover_mods, load_mod
 from .diagnostics import matching_allowance
-from .files import iter_files
+from .files import iter_files, safe_archive_name
 from .formats import get_format_spec, inspect_file
 from .game_text import (
     lint_blockpar_display_text,
@@ -1820,6 +1820,8 @@ def audit_mod(
     root = Path(path).resolve()
     if not root.is_dir():
         raise NotADirectoryError(root)
+    if install_subpath is not None:
+        safe_archive_name(str(install_subpath))
     parsed_profile = AuditProfile.parse(profile)
     with tempfile.TemporaryDirectory(prefix="srhd-audit-") as temp_name:
         context = AuditContext(

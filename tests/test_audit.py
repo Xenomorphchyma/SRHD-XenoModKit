@@ -268,6 +268,28 @@ class AuditTests(unittest.TestCase):
                 self.assertEqual(cmd_audit(args), 0)
             self.assertIsNone(audited.call_args.kwargs["install_subpath"])
 
+    def test_audit_rejects_unsafe_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            args = build_parser().parse_args(
+                ["audit", str(root), "--prefix", "../Outside"]
+            )
+            with self.assertRaises(ValueError):
+                cmd_audit(args)
+
+    def test_audit_collection_rejects_single_mod_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "Collection"
+            root.mkdir()
+            report = AuditReport(str(root), AuditProfile.DEV, ())
+            with patch("srhd_modkit.cli.audit_collection", return_value=report):
+                args = build_parser().parse_args(
+                    ["audit", str(root), "--prefix", "OtherMods/One"]
+                )
+                with self.assertRaises(ValueError):
+                    cmd_audit(args)
+
     def test_dev_accepts_sources_config_but_release_requires_packaged_main_dat(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"
