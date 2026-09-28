@@ -6,8 +6,10 @@ import struct
 import unittest
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
-from srhd_modkit.audit import AuditProfile, audit_mod
+from srhd_modkit.audit import AuditProfile, AuditReport, audit_mod
+from srhd_modkit.cli import build_parser, cmd_audit
 from srhd_modkit.image_codec import RgbaImage, encode_gi
 from srhd_modkit.quests import (
     HEADER_QMM_7,
@@ -150,6 +152,58 @@ class AuditTests(unittest.TestCase):
             report = audit_mod(root, profile="release")
             self.assertTrue(any(item.code == "scr-unregistered" for item in report.issues))
 
+    def test_source_root_pairs_a_shipped_script_with_its_rson(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "AuditFixture"
+            _mod(root)
+            script = root / "DATA" / "Script" / "Mod_AuditFixture.scr"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(struct.pack("<I", 8))
+
+            # the sources live beside the mod, not inside it
+            sources = base / "src"
+            sources.mkdir()
+            (sources / "Mod_AuditFixture.rson").write_text(
+                json.dumps(
+                    {
+                        "FileID": RSON_FILE_ID,
+                        "FileVersion": RSON_FILE_VERSION,
+                        "ScriptName": "Mod_AuditFixture",
+                        "Visual.Objects": [
+                            {
+                                "Operations": [
+                                    {
+                                        "Type": "Top",
+                                        "Name": "Turn",
+                                        "Parent": -1,
+                                        "#": 1,
+                                        "Code.Type": "Turn",
+                                        "Code": ["int value = 1;"],
+                                    }
+                                ]
+                            }
+                        ],
+                        "Visual.Links": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            without = {item.code for item in audit_mod(root, profile="dev").issues}
+            self.assertIn("scr-semantic-analysis-unavailable", without)
+
+            with_sources = {
+                item.code
+                for item in audit_mod(root, profile="dev", source_root=sources).issues
+            }
+            self.assertNotIn("scr-semantic-analysis-unavailable", with_sources)
+
+    def test_source_root_rejects_missing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            with self.assertRaises(NotADirectoryError):
+                audit_mod(Path(name), source_root=Path(name) / "missing")
+
     def test_release_blocks_imported_function_missing_from_scriptlibs(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"
@@ -243,6 +297,50 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(len(matching), 1)
             self.assertEqual(matching[0].severity, "error")
             self.assertIn("Source\\Config\\CacheData.txt", matching[0].path or "")
+
+    def test_cli_audit_passes_the_prefix_to_the_cache_check(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            report = AuditReport(str(root), AuditProfile.RELEASE, ())
+            with patch("srhd_modkit.cli.audit_mod", return_value=report) as audited:
+                args = build_parser().parse_args(
+                    ["audit", str(root), "--profile", "release", "--prefix", "Miscellaneous/ExpRC"]
+                )
+                self.assertEqual(cmd_audit(args), 0)
+            self.assertEqual(
+                audited.call_args.kwargs["install_subpath"],
+                "Miscellaneous/ExpRC",
+            )
+
+            # without the switch the exact install path stays unknown, which is what the
+            # warning `cache-script-install-path-unverified` reports
+            with patch("srhd_modkit.cli.audit_mod", return_value=report) as audited:
+                args = build_parser().parse_args(["audit", str(root)])
+                self.assertEqual(cmd_audit(args), 0)
+            self.assertIsNone(audited.call_args.kwargs["install_subpath"])
+
+    def test_audit_rejects_unsafe_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            args = build_parser().parse_args(
+                ["audit", str(root), "--prefix", "../Outside"]
+            )
+            with self.assertRaises(ValueError):
+                cmd_audit(args)
+
+    def test_audit_collection_rejects_single_mod_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "Collection"
+            root.mkdir()
+            report = AuditReport(str(root), AuditProfile.DEV, ())
+            with patch("srhd_modkit.cli.audit_collection", return_value=report):
+                args = build_parser().parse_args(
+                    ["audit", str(root), "--prefix", "OtherMods/One"]
+                )
+                with self.assertRaises(ValueError):
+                    cmd_audit(args)
 
     def test_dev_accepts_sources_config_but_release_requires_packaged_main_dat(self) -> None:
         with tempfile.TemporaryDirectory() as name:

@@ -38,7 +38,7 @@ from .textio import read_text
 from .rsm import RsmProject, inspect_rsm_project
 from .hidden_process import HiddenControlAction, HiddenProcessTimeout, run_on_hidden_desktop
 from .legacy_manifest import ensure_legacy_codepage_executable, legacy_codepage_identity
-from .executable_version import ExecutableVersion, detect_executable_version
+from .executable_version import detect_executable_version
 from .safe_io import atomic_write_bytes, atomic_write_text, publish_files_transactionally
 
 

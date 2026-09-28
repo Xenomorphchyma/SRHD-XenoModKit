@@ -564,7 +564,11 @@ def _decode_gi_type0(data: bytes, info: GiInfo) -> RgbaImage:
         decoder: Callable[[bytes], tuple[int, int, int, int]] | None = None
     elif (info.red_mask, info.green_mask, info.blue_mask) == (0xF800, 0x07E0, 0x001F) and not info.alpha_mask:
         pixel_size = 2
-        decoder = lambda raw: (*_rgb565_decode(raw), 255)
+
+        def decode_rgb565(raw: bytes) -> tuple[int, int, int, int]:
+            return (*_rgb565_decode(raw), 255)
+
+        decoder = decode_rgb565
     else:
         raise UnsupportedImageFormat(
             "GI type 0 использует неподдерживаемые маски "
@@ -886,8 +890,12 @@ def _encode_gi_type0(image: RgbaImage, mode: str) -> bytes:
 
 
 def _encode_gi_type2(image: RgbaImage) -> bytes:
-    opaque = lambda alpha: alpha == 255
-    translucent = lambda alpha: alpha not in {0, 255}
+    def opaque(alpha: int) -> bool:
+        return alpha == 255
+
+    def translucent(alpha: int) -> bool:
+        return alpha not in {0, 255}
+
     opaque_bounds = _bbox(image, opaque)
     translucent_bounds = _bbox(image, translucent)
 
