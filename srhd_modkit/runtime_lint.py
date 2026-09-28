@@ -4277,11 +4277,38 @@ def _persistent_item_parameter_sinks(
     return result
 
 
-def _raw_item_expression(expression: str, tainted: set[str]) -> bool:
+def _outermost_call_name(expression: str) -> str | None:
+    """Name of the call the expression evaluates to, if it is a call at all.
+
+    Only the outer call decides what the value *is*: ``ItemCost(IdToItem(...))``
+    evaluates to a number, so the nested ``IdToItem`` says nothing about what the
+    assignment stores.
+    """
+    text = _mask_non_code(expression).casefold()
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            if depth == 0:
+                start = index
+                while start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_."):
+                    start -= 1
+                return text[start:index] or None
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+    return None
+
+
+def _raw_item_expression(
+    expression: str,
+    tainted: set[str],
+    item_functions: set[str] = frozenset(),
+) -> bool:
     folded = _mask_non_code(expression).casefold()
-    if re.search(r"\bid\s*\(", folded):
+    outer = _outermost_call_name(expression)
+    if outer == "id":
         return False
-    if re.search(r"\b(?:createquestitem|idtoitem)\s*\(", folded):
+    if outer in {"createquestitem", "idtoitem"} or outer in item_functions:
         return True
     return any(re.search(rf"\b{re.escape(value)}\b", folded) for value in tainted)
 
@@ -4301,6 +4328,7 @@ def _lint_persistent_item_handles(
     if not shared:
         return []
     helper_sinks = _persistent_item_parameter_sinks(functions, shared)
+    item_functions = _item_returning_functions(functions)
     path = str(project.path) if project.path else None
     issues: list[RuntimeIssue] = []
     reported: set[tuple[str, int]] = set()
@@ -4338,7 +4366,7 @@ def _lint_persistent_item_handles(
             for match in matches:
                 target = match.group(1).casefold()
                 expression = match.group(2).strip()
-                raw = _raw_item_expression(expression, tainted)
+                raw = _raw_item_expression(expression, tainted, item_functions)
                 if target in shared and raw:
                     report(block, line_offset, target, line)
                 if raw:
@@ -4348,7 +4376,7 @@ def _lint_persistent_item_handles(
 
             for match in indexed_assignment.finditer(masked):
                 target = match.group(1).casefold()
-                if target in shared and _raw_item_expression(match.group(2), tainted):
+                if target in shared and _raw_item_expression(match.group(2), tainted, item_functions):
                     report(block, line_offset, target, line)
 
             for _position, arguments in _call_arguments(masked, "LinkItemToScript"):
@@ -4366,7 +4394,7 @@ def _lint_persistent_item_handles(
                 for _position, arguments in _call_arguments(masked, functions[helper_name].name):
                     for parameter_index, targets in sinks.items():
                         if parameter_index >= len(arguments) or not _raw_item_expression(
-                            arguments[parameter_index], tainted
+                            arguments[parameter_index], tainted, item_functions
                         ):
                             continue
                         for target in targets:
