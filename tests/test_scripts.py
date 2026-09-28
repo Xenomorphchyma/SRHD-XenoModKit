@@ -564,8 +564,17 @@ class RsonTests(unittest.TestCase):
 
         # delete the middle answer: its AMsg.Num 1 disappears and 2 must become 1
         # everywhere, including the DAdd(2) constant that names it
-        removed = project.delete_object(4, detach_references=True)
+        with self.assertRaises(ValueError):
+            project.delete_object(4, detach_references=True)
+        # The failed operation is transactional; the object and references remain.
+        self.assertIsNotNone(project.object_by_id(4))
+        removed = project.delete_object(
+            4,
+            detach_references=True,
+            allow_dialog_renumber=True,
+        )
         self.assertEqual(removed["renumbered"]["answers"], 1)
+        self.assertTrue(removed["dialog_language_remap_required"])
         self.assertEqual(
             sorted(int(item["AMsg.Num"]) for item in project.iter_objects() if "AMsg.Num" in item),
             [0, 1],
@@ -573,6 +582,20 @@ class RsonTests(unittest.TestCase):
         menu = next(item for item in project.iter_objects() if item.get("Name") == "Menu")
         self.assertEqual(menu["Code"], ["DAdd(0);", "DAdd(1);", "DChange(1);"])
         self.assertEqual(project.validate(), [])
+
+    def test_delete_object_rejects_dangling_dialog_constant_transactionally(self) -> None:
+        data = deepcopy(SAMPLE)
+        data["Visual.Objects"][0]["DialogAnswers"] = [
+            {"Type": "TDialogAnswer", "Name": "", "Parent": -1, "#": 3, "Msg": "a", "AMsg.Num": "0"},
+            {"Type": "TDialogAnswer", "Name": "", "Parent": -1, "#": 4, "Msg": "b", "AMsg.Num": "1"},
+        ]
+        data["Visual.Objects"][0]["Operations"].append(
+            {"Type": "Top", "Name": "Menu", "Parent": -1, "#": 8, "Code": ["DAdd(1);"]}
+        )
+        project = RsonProject(data, Path("dangling.rson"))
+        with self.assertRaisesRegex(ValueError, "удалённый или неизвестный"):
+            project.delete_object(4, detach_references=True, allow_dialog_renumber=True)
+        self.assertIsNotNone(project.object_by_id(4))
 
     def test_sparse_object_ids_are_rejected_before_rscript_hangs(self) -> None:
         data = deepcopy(SAMPLE)
