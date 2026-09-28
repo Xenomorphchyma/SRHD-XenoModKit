@@ -4277,11 +4277,38 @@ def _persistent_item_parameter_sinks(
     return result
 
 
-def _raw_item_expression(expression: str, tainted: set[str]) -> bool:
+def _outermost_call_name(expression: str) -> str | None:
+    """Name of the call the expression evaluates to, if it is a call at all.
+
+    Only the outer call decides what the value *is*: ``ItemCost(IdToItem(...))``
+    evaluates to a number, so the nested ``IdToItem`` says nothing about what the
+    assignment stores.
+    """
+    text = _mask_non_code(expression).casefold()
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            if depth == 0:
+                start = index
+                while start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_."):
+                    start -= 1
+                return text[start:index] or None
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+    return None
+
+
+def _raw_item_expression(
+    expression: str,
+    tainted: set[str],
+    item_functions: set[str] = frozenset(),
+) -> bool:
     folded = _mask_non_code(expression).casefold()
-    if re.search(r"\bid\s*\(", folded):
+    outer = _outermost_call_name(expression)
+    if outer == "id":
         return False
-    if re.search(r"\b(?:createquestitem|idtoitem)\s*\(", folded):
+    if outer in {"createquestitem", "idtoitem"} or outer in item_functions:
         return True
     return any(re.search(rf"\b{re.escape(value)}\b", folded) for value in tainted)
 
@@ -4301,6 +4328,7 @@ def _lint_persistent_item_handles(
     if not shared:
         return []
     helper_sinks = _persistent_item_parameter_sinks(functions, shared)
+    item_functions = _item_returning_functions(functions)
     path = str(project.path) if project.path else None
     issues: list[RuntimeIssue] = []
     reported: set[tuple[str, int]] = set()
@@ -4338,7 +4366,7 @@ def _lint_persistent_item_handles(
             for match in matches:
                 target = match.group(1).casefold()
                 expression = match.group(2).strip()
-                raw = _raw_item_expression(expression, tainted)
+                raw = _raw_item_expression(expression, tainted, item_functions)
                 if target in shared and raw:
                     report(block, line_offset, target, line)
                 if raw:
@@ -4348,7 +4376,7 @@ def _lint_persistent_item_handles(
 
             for match in indexed_assignment.finditer(masked):
                 target = match.group(1).casefold()
-                if target in shared and _raw_item_expression(match.group(2), tainted):
+                if target in shared and _raw_item_expression(match.group(2), tainted, item_functions):
                     report(block, line_offset, target, line)
 
             for _position, arguments in _call_arguments(masked, "LinkItemToScript"):
@@ -4366,7 +4394,7 @@ def _lint_persistent_item_handles(
                 for _position, arguments in _call_arguments(masked, functions[helper_name].name):
                     for parameter_index, targets in sinks.items():
                         if parameter_index >= len(arguments) or not _raw_item_expression(
-                            arguments[parameter_index], tainted
+                            arguments[parameter_index], tainted, item_functions
                         ):
                             continue
                         for target in targets:
@@ -4882,7 +4910,6 @@ def _direct_detached_item_free_sites(
 ) -> list[tuple[int, int, str]]:
     """Return FreeItem sites for items detached and unlinked in this call."""
 
-    parameters = _function_parameters(block)
     origins: dict[str, str] = {}
     released: set[str] = set()
     result: list[tuple[int, int, str]] = []
@@ -8435,12 +8462,53 @@ def _literal_string(expression: str) -> str | None:
     value = expression.strip()
     if len(value) < 2 or value[0] not in {"'", '"'} or value[-1] != value[0]:
         return None
+    # A concatenation is not a literal, but it also starts and ends with a quote:
+    # `'a.' + name + '.b'` would otherwise be read as the key `a.' + name + '.b`.
+    # Only an expression that is nothing but one quoted run qualifies.
+    if value.count(value[0]) != 2:
+        return None
     return value[1:-1]
 
 
 def _constant_int(expression: str) -> int | None:
     value = expression.strip()
     return int(value) if re.fullmatch(r"[+-]?\d+", value) else None
+
+
+def _answer_is_blocked(answer: str, blocked: set[str]) -> bool:
+    """True when an ``AddDialogBlock`` entry hides this injected answer.
+
+    ``TfRuinsTalk.AddChoice`` looks the answer text up in ``ScriptDialogBlocks``
+    (a substring match, the same as ``FindTextOffsetW``) and drops the choice
+    entirely when the entry's mode is >= 2.  The dialog named by ``AddDialogInject``
+    is only called when that answer is picked, so a hidden answer never reaches it.
+    """
+    candidates = {answer.casefold()}
+    if "~" in answer:
+        candidates.add(answer.split("~", 1)[1].casefold())
+    return any(block in candidate for block in blocked for candidate in candidates)
+
+
+def _call_is_unconditional(text: str, position: int) -> bool:
+    """Conservatively prove a call is not nested in an obvious branch.
+
+    A block collected from a conditional path must not globally suppress a missing
+    jump-target diagnostic: the condition may be false when the injection runs.
+    Unknown control-flow is therefore treated as *not proven*.
+    """
+    line_start = text.rfind("\n", 0, position) + 1
+    current = text[line_start:position]
+    if re.search(r"\b(?:if|else|for|while|switch|case)\b", current, re.IGNORECASE):
+        return False
+    previous = text[:line_start].splitlines()
+    for candidate in reversed(previous):
+        stripped = candidate.strip()
+        if not stripped:
+            continue
+        if re.search(r"\b(?:if|else|for|while|switch|case)\b", stripped, re.IGNORECASE):
+            return False
+        return True
+    return True
 
 
 def _dialog_graph_contexts(
@@ -8510,6 +8578,16 @@ def _lint_dialog_semantics(project: RsonProject) -> list[RuntimeIssue]:
 
     for container in _iter_code_containers(project):
         text = "\n".join(container.lines)
+        # Answers hidden by an unconditional AddDialogBlock(mode >= 2) are dropped
+        # before they can be picked. Keep this set local to the same code container:
+        # a conditional or unrelated handler must never suppress another warning.
+        blocked_answers: set[str] = set()
+        for position, block_arguments, _end in _iter_parsed_calls(text, "AddDialogBlock"):
+            if not block_arguments or (blocker := _literal_string(block_arguments[0])) is None:
+                continue
+            mode = _constant_int(block_arguments[1]) if len(block_arguments) > 1 else None
+            if blocker and mode is not None and mode >= 2 and _call_is_unconditional(text, position):
+                blocked_answers.add(blocker.casefold())
         context_id = container.object_id if container.object_id is not None else -1
         source_dialogs = contexts.get(context_id, set())
         for call, known_numbers in (("DChange", dmsg_numbers), ("DAdd", amsg_numbers)):
@@ -8530,7 +8608,7 @@ def _lint_dialog_semantics(project: RsonProject) -> list[RuntimeIssue]:
                     )
                 )
 
-        for call in ("AddDialogInject", "InjectAnswer"):
+        for call, answer_index in (("AddDialogInject", 2), ("InjectAnswer", 1)):
             for position, arguments, _end in _iter_parsed_calls(text, call):
                 if not arguments or (target := _literal_string(arguments[0])) is None:
                     continue
@@ -8539,6 +8617,27 @@ def _lint_dialog_semantics(project: RsonProject) -> list[RuntimeIssue]:
                 if not folded_target:
                     # Empty target is the documented callback/attached-code
                     # form of InjectAnswer, not a missing named TDialog.
+                    continue
+                if ":" in target:
+                    # The `Script:Dialog` form is resolved through FindScriptTemplateIndex
+                    # to another script's template, which this project cannot see.
+                    issues.append(
+                        RuntimeIssue(
+                            "info",
+                            "dialog-inject-cross-script-unverified",
+                            f"{call} ссылается на диалог другого скрипта {target}; локальная проверка цели невозможна",
+                            path,
+                            f"{container.location}:{line_number}",
+                            container.lines[line_number - 1].strip(),
+                        )
+                    )
+                    continue
+                answer = (
+                    _literal_string(arguments[answer_index])
+                    if len(arguments) > answer_index
+                    else None
+                )
+                if answer and _answer_is_blocked(answer, blocked_answers):
                     continue
                 if folded_target not in dialogs:
                     issues.append(
@@ -10679,7 +10778,10 @@ def dialog_semantic_map(project: RsonProject) -> dict[str, Any]:
             answers.append({**common, "number": _constant_int(str(item.get("AMsg.Num", "")))})
         elif item.get("Type") == "TDialog":
             dialogs.append(common)
-    key = lambda value: (value.get("object_id") is None, value.get("object_id"), value.get("name", ""))
+
+    def key(value: dict) -> tuple:
+        return (value.get("object_id") is None, value.get("object_id"), value.get("name", ""))
+
     return {
         "messages": sorted(messages, key=key),
         "answers": sorted(answers, key=key),
@@ -10760,14 +10862,11 @@ def literal_ct_references(project: RsonProject) -> list[LiteralCTReference]:
     return result
 
 
-def _blockpar_text_key_index(document: BlockParDocument) -> tuple[set[str], set[str]]:
+def _blockpar_text_key_index(document: BlockParDocument) -> set[str]:
     keys: set[str] = set()
-    roots: set[str] = set()
     for node_path, key, _value in _node_parameters(document.roots):
-        dotted = ".".join((*node_path.split("/"), key)).casefold()
-        keys.add(dotted)
-        roots.add(node_path.split("/", 1)[0].casefold())
-    return keys, roots
+        keys.add(".".join((*node_path.split("/"), key)).casefold())
+    return keys
 
 
 def lint_literal_ct_keys(
@@ -10779,19 +10878,20 @@ def lint_literal_ct_keys(
 ) -> list[RuntimeIssue]:
     """Check mod-owned literal CT keys in every shipped language artifact.
 
-    Base-game keys are intentionally left alone.  A reference is considered
-    mod-owned when its root block is present in at least one supplied Lang
-    document, or the exact key exists in at least one language.
+    A key is mod-owned when the mod itself defines it in at least one supplied Lang
+    document. Ownership deliberately does not follow the root block: a mod that extends
+    a shared namespace — `FormRuins` of the base game, `Script` of a companion mod —
+    also *reads* keys of that namespace that it never defines, and those are not its to
+    provide. What this catches is the asymmetric case: a key the mod defines in one
+    language but forgot in another.
     """
 
     artifacts: list[tuple[str, str, set[str]]] = []
-    local_roots: set[str] = set()
     local_keys: set[str] = set()
     for language, documents in language_documents.items():
         for source, document in documents:
-            keys, roots = _blockpar_text_key_index(document)
+            keys = _blockpar_text_key_index(document)
             artifacts.append((language, str(Path(source).resolve()), keys))
-            local_roots.update(roots)
             local_keys.update(keys)
     if not artifacts:
         return []
@@ -10801,8 +10901,7 @@ def lint_literal_ct_keys(
     spelling: dict[str, str] = {}
     for reference in references:
         folded = reference.key.casefold()
-        root = folded.split(".", 1)[0]
-        if folded not in local_keys and root not in local_roots:
+        if folded not in local_keys:
             continue
         grouped.setdefault(folded, []).append(reference)
         spelling.setdefault(folded, reference.key)

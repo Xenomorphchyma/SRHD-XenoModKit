@@ -17,9 +17,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .files import build_manifest, iter_files, sha256_file, stage_tree
 from .release import (
-    DeployPlan,
     DeployResult,
-    ReleaseResult,
     build_release,
     deploy_mod,
     plan_deploy,

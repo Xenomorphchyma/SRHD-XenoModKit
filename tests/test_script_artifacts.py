@@ -219,6 +219,49 @@ class ScriptArtifactTests(unittest.TestCase):
             self.assertEqual(matching[0].severity, "warning")
             self.assertIn(r"Mods\OtherMods\TestMod", matching[0].message)
 
+    def test_working_folder_uses_module_info_name_for_local_cache_path(self) -> None:
+        # A working copy is often just "mod"; the folder the mod is deployed
+        # under is its ModuleInfo Name. The path check must use that name, not
+        # the staging folder's, or a correct CacheData is flagged as a mismatch.
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "mod"
+            script = root / "DATA" / "Script" / "Mod_Test.scr"
+            cache = parse_blockpar(
+                "Script ^{\n"
+                "  Mod_Test=Mods\\OtherMods\\TestMod\\DATA\\Script\\Mod_Test.scr\n"
+                "}\n"
+            )
+            issues = lint_script_cache(
+                root,
+                [script],
+                {"mod_test": ["1,Script.Mod_Test"]},
+                [(root / "SOURCE" / "CFG" / "CacheData.txt", cache)],
+                mod_name="TestMod",
+            )
+            codes = [issue.code for issue in issues]
+            self.assertNotIn("cache-script-local-path-mismatch", codes)
+            self.assertIn("cache-script-install-path-unverified", codes)
+
+    def test_working_folder_still_reports_a_wrong_local_cache_folder(self) -> None:
+        # The name from ModuleInfo must not blind the check: a path pointing at
+        # another mod's folder is still a mismatch.
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "mod"
+            script = root / "DATA" / "Script" / "Mod_Test.scr"
+            cache = parse_blockpar(
+                "Script ^{\n"
+                "  Mod_Test=Mods\\OtherMods\\OtherMod\\DATA\\Script\\Mod_Test.scr\n"
+                "}\n"
+            )
+            issues = lint_script_cache(
+                root,
+                [script],
+                {"mod_test": ["1,Script.Mod_Test"]},
+                [(root / "SOURCE" / "CFG" / "CacheData.txt", cache)],
+                mod_name="TestMod",
+            )
+            self.assertIn("cache-script-local-path-mismatch", [issue.code for issue in issues])
+
     def test_declared_release_prefix_accepts_nested_installation(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "TestMod"

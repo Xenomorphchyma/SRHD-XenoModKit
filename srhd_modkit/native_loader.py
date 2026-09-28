@@ -12,7 +12,6 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable
 
 from .files import iter_files, sha256_file
-from .module_info import find_module_info, parse_module_info
 
 
 NATIVE_LOADER_SCHEMA = "srhd-modkit-native-loader-v1"

@@ -208,6 +208,34 @@ def lint_game_display_text(
     return issues
 
 
+_KNOWN_CODE_BLOCKS = frozenset(
+    {
+        "code",
+        "onactcode",
+        "onpresscode",
+        "onusecode",
+        "onusecodetypes",
+        "onusecodeblackhole",
+        "itemonactcode",
+        "itemonusecode",
+    }
+)
+
+
+def _is_code_block(name: str) -> bool:
+    """Whether a known SRHD language node holds executable code.
+
+    Do not use a substring test here: a legitimate display key such as ``Decode``
+    must still be checked.  The explicit catalogue covers known engine nodes, while
+    the narrow suffix rule keeps compatibility with conventional ``On*Code`` and
+    ``Item*Code`` extensions without swallowing unrelated text fields.
+    """
+    folded = name.strip().casefold()
+    if folded in _KNOWN_CODE_BLOCKS:
+        return True
+    return folded.endswith("code") and folded.startswith(("on", "item", "ship", "script"))
+
+
 def lint_blockpar_display_text(
     document: BlockParDocument,
     path: str | Path | None = None,
@@ -222,6 +250,8 @@ def lint_blockpar_display_text(
     ) -> None:
         for entry in entries:
             if isinstance(entry, BlockParParameter):
+                if _is_code_block(entry.key):
+                    continue
                 issues.extend(
                     lint_game_display_text(
                         entry.value,
@@ -230,6 +260,8 @@ def lint_blockpar_display_text(
                     )
                 )
             elif isinstance(entry, BlockParNode):
+                if _is_code_block(entry.name):
+                    continue
                 walk(entry.entries, f"{prefix}/{entry.name}")
 
     walk(document.entries)

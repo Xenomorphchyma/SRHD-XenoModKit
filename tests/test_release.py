@@ -46,11 +46,13 @@ class ReleaseTests(unittest.TestCase):
                     root,
                     base / "nested.zip",
                     prefix="OtherMods/ReleaseFixture",
+                    source_root=base / "sources",
                 )
             self.assertEqual(
                 audit.call_args.kwargs["install_subpath"],
                 "OtherMods/ReleaseFixture",
             )
+            self.assertEqual(audit.call_args.kwargs["source_root"], base / "sources")
             with zipfile.ZipFile(result.output) as archive:
                 self.assertIn(
                     "OtherMods/ReleaseFixture/ModuleInfo.txt",

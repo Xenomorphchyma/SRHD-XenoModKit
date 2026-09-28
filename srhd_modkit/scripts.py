@@ -261,7 +261,14 @@ class RsonProject:
             raise ValueError(f"Visual.Links[{index}] не является объектом")
         return link
 
-    def delete_object(self, object_id: int, *, detach_references: bool = False) -> dict[str, Any]:
+    def delete_object(
+        self,
+        object_id: int,
+        *,
+        detach_references: bool = False,
+        allow_dialog_renumber: bool = False,
+    ) -> dict[str, Any]:
+        original_data = deepcopy(self.data)
         container, index, item = self._object_container(object_id)
         children = [
             child.get("#")
@@ -296,10 +303,172 @@ class RsonProject:
                 if not (isinstance(link, dict) and object_id in (link.get("Begin"), link.get("End")))
             ]
         container.pop(index)
+        try:
+            renumbered = self.compact_ids()
+            if (renumbered["answers"] or renumbered["messages"]) and not allow_dialog_renumber:
+                raise ValueError(
+                    "Удаление изменило глобальные номера диалога; существующий Lang.dat может "
+                    "ссылаться на старые ключи. Повторите с allow_dialog_renumber=True и "
+                    "пересоберите/перенесите Lang.dat через lang remap"
+                )
+        except Exception:
+            self.data.clear()
+            self.data.update(original_data)
+            raise
+        dialog_language_remap_required = bool(renumbered["answers"] or renumbered["messages"])
         return {
             "object": item,
             "detached_children": children if detach_references else [],
             "removed_links": len(link_indexes) if detach_references else 0,
+            "renumbered": renumbered,
+            "dialog_language_remap_required": dialog_language_remap_required,
+        }
+
+    # code-bearing fields a `DAdd(...)`/`DChange(...)` constant can hide in
+    CODE_LIST_FIELDS = ("Code", "ActCode", "LinkCode", "OnActCode")
+
+    def _iter_code_fields(self) -> Iterable[tuple[dict[str, Any], str, list[str] | str]]:
+        """Every code field that may hold dialog constants, with its object and field."""
+        for item in self.iter_objects():
+            for field, value in item.items():
+                if field in self.CODE_LIST_FIELDS and isinstance(value, (list, str)):
+                    yield item, field, value
+
+    def _dialog_number_mapping(self, field: str) -> tuple[list[tuple[int, dict[str, Any]]], dict[int, int]]:
+        """Renumber a sparse `AMsg.Num`/`DMsg.Num` field densely, ascending.
+
+        RScript compacts such a numbering itself but does not rewrite the
+        `DAdd(...)`/`DChange(...)` constants that reference it, so every answer
+        after a deleted dialog element would silently re-point. Doing it here keeps
+        the constants and the fields in step.
+        """
+        entries: list[tuple[int, dict[str, Any]]] = []
+        for item in self.iter_objects():
+            value = item.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                entries.append((value, item))
+            elif isinstance(value, str) and value.strip().lstrip("-").isdigit():
+                entries.append((int(value), item))
+        grouped: dict[int, int] = {}
+        for old, _item in entries:
+            grouped[old] = grouped.get(old, 0) + 1
+        duplicates = sorted(old for old, count in grouped.items() if count > 1)
+        if duplicates:
+            raise ValueError(f"Нельзя безопасно уплотнить {field}: повторяющиеся номера {duplicates}")
+        mapping = {old: new for new, (old, _) in enumerate(sorted(entries, key=lambda pair: pair[0]))}
+        return entries, mapping
+
+    def _compact_number_field(self, field: str) -> dict[int, int]:
+        entries, mapping = self._dialog_number_mapping(field)
+        for old, item in entries:
+            if mapping[old] != old:
+                item[field] = str(mapping[old])
+        return mapping
+
+    def _validate_dialog_calls(self, call: str, mapping: dict[int, int]) -> None:
+        pattern = re.compile(rf"\b{re.escape(call)}\(\s*(\d+)\s*\)")
+        dangling: set[int] = set()
+        for _item, _field, value in self._iter_code_fields():
+            text = "\n".join(value) if isinstance(value, list) else value
+            dangling.update(
+                int(match.group(1))
+                for match in pattern.finditer(text)
+                if int(match.group(1)) not in mapping
+            )
+        if dangling:
+            values = ", ".join(str(value) for value in sorted(dangling))
+            raise ValueError(
+                f"{call} использует удалённый или неизвестный номер диалога {values}; "
+                "сначала исправьте ссылку вручную"
+            )
+
+    def _rewrite_dialog_calls(self, call: str, mapping: dict[int, int]) -> int:
+        """Rewrite `call(n)` constants through `mapping`; returns the rewrite count."""
+        pattern = re.compile(rf"\b{re.escape(call)}\(\s*(\d+)\s*\)")
+        rewritten = 0
+        dangling: set[int] = set()
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal rewritten
+            old = int(match.group(1))
+            new = mapping.get(old)
+            if new is None:
+                dangling.add(old)
+                return match.group(0)
+            if new == old:
+                return match.group(0)
+            rewritten += 1
+            return f"{call}({new})"
+
+        for item, field, value in self._iter_code_fields():
+            if isinstance(value, list):
+                for index, line in enumerate(value):
+                    if call in line:
+                        value[index] = pattern.sub(replace, line)
+            elif call in value:
+                item[field] = pattern.sub(replace, value)
+        if dangling:
+            values = ", ".join(str(value) for value in sorted(dangling))
+            raise ValueError(
+                f"{call} использует удалённый или неизвестный номер диалога {values}; "
+                "сначала исправьте ссылку вручную"
+            )
+        return rewritten
+
+    def compact_ids(self) -> dict[str, int]:
+        """Make every RSON numbering dense again and rewrite what references it.
+
+        RScript indexes objects by `#` and requires them dense from 0 (or 1) --
+        a sparse id makes the compiler run out of bounds -- so deleting an object
+        from the middle of the list must shift every higher id down and repoint the
+        graph links and parents. The dialog numberings (`AMsg.Num` for answers,
+        `DMsg.Num` for messages) are compacted with them, together with the
+        `DAdd(...)`/`DChange(...)` constants that name them.
+
+        The object numbering keeps its existing base (0 or 1, both of which the
+        compiler accepts), while the dialog numberings are normalised to the
+        canonical 0-based form the compiler expects. Already dense input is
+        returned unchanged, so calling this on a valid project is a no-op.
+        """
+        answer_entries, answers = self._dialog_number_mapping("AMsg.Num")
+        message_entries, messages = self._dialog_number_mapping("DMsg.Num")
+        self._validate_dialog_calls("DAdd", answers)
+        self._validate_dialog_calls("DChange", messages)
+        objects = [
+            item
+            for item in self.iter_objects()
+            if isinstance(item.get("#"), int) and not isinstance(item.get("#"), bool)
+        ]
+        # RScript accepts a 0- or a 1-based object numbering, so the lowest surviving
+        # id stays the base: an already dense project is returned untouched
+        identifiers = sorted(item["#"] for item in objects)
+        base = identifiers[0] if identifiers else 0
+        object_map = {old: base + position for position, old in enumerate(identifiers)}
+        for item in objects:
+            item["#"] = object_map[item["#"]]
+            parent = item.get("Parent")
+            if isinstance(parent, int) and not isinstance(parent, bool) and parent in object_map:
+                item["Parent"] = object_map[parent]
+        links = self.data.get("Visual.Links")
+        if isinstance(links, list):
+            for link in links:
+                if not isinstance(link, dict):
+                    continue
+                for key in ("Begin", "End"):
+                    value = link.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value in object_map:
+                        link[key] = object_map[value]
+
+        for old, item in answer_entries:
+            if answers[old] != old:
+                item["AMsg.Num"] = str(answers[old])
+        for old, item in message_entries:
+            if messages[old] != old:
+                item["DMsg.Num"] = str(messages[old])
+        return {
+            "objects": sum(1 for old, new in object_map.items() if old != new),
+            "answers": self._rewrite_dialog_calls("DAdd", answers),
+            "messages": self._rewrite_dialog_calls("DChange", messages),
         }
 
     def validate(self, *, rscript_profile: str = "legacy-cli") -> list[ScriptIssue]:
