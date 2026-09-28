@@ -492,6 +492,7 @@ def plan_deploy(
     exclude: Sequence[str] = (),
     strip_sources: bool = True,
     tools_root: str | Path | None = None,
+    source_root: str | Path | None = None,
     allow: Sequence[str] = (),
     warnings_as_errors: bool = False,
     require_complete: bool = False,
@@ -511,6 +512,7 @@ def plan_deploy(
         profile=AuditProfile.RELEASE,
         tools_root=tools_root,
         install_subpath=archive_prefix,
+        source_root=source_root,
         allow=allow,
     )
     effective_exclude = _distribution_excludes(
@@ -528,6 +530,7 @@ def plan_deploy(
             profile=AuditProfile.RELEASE,
             tools_root=tools_root,
             install_subpath=archive_prefix,
+            source_root=source_root,
             allow=allow,
         )
         staged_report = _retarget_audit_report(staged_report, staged, mod_dir)
@@ -574,6 +577,7 @@ def build_release(
     prefix: str | None = None,
     exclude: Sequence[str] = (),
     tools_root: str | Path | None = None,
+    source_root: str | Path | None = None,
     allow: Sequence[str] = (),
     warnings_as_errors: bool = False,
     overwrite: bool = False,
@@ -599,6 +603,7 @@ def build_release(
         profile=AuditProfile.RELEASE,
         tools_root=tools_root,
         install_subpath=archive_prefix,
+        source_root=source_root,
         allow=allow,
     )
     if source_report.blocking_issues(warnings_as_errors=warnings_as_errors) or (
@@ -626,6 +631,7 @@ def build_release(
             profile=AuditProfile.RELEASE,
             tools_root=tools_root,
             install_subpath=archive_prefix,
+            source_root=source_root,
             allow=allow,
         )
         report = _retarget_audit_report(report, staged, mod_dir)
@@ -709,6 +715,7 @@ def deploy_mod(
     exclude: Sequence[str] = (),
     strip_sources: bool = True,
     tools_root: str | Path | None = None,
+    source_root: str | Path | None = None,
     allow: Sequence[str] = (),
     warnings_as_errors: bool = False,
     overwrite: bool = False,
@@ -729,6 +736,7 @@ def deploy_mod(
         exclude=exclude,
         strip_sources=strip_sources,
         tools_root=tools_root,
+        source_root=source_root,
         allow=allow,
         warnings_as_errors=warnings_as_errors,
         require_complete=require_complete,

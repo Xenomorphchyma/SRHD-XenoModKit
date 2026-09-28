@@ -197,6 +197,11 @@ class AuditTests(unittest.TestCase):
             }
             self.assertNotIn("scr-semantic-analysis-unavailable", with_sources)
 
+    def test_source_root_rejects_missing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            with self.assertRaises(NotADirectoryError):
+                audit_mod(Path(name), source_root=Path(name) / "missing")
+
     def test_release_blocks_imported_function_missing_from_scriptlibs(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "AuditFixture"
