@@ -3827,6 +3827,7 @@ class RuntimeLintTests(unittest.TestCase):
             for issue in lint_rson_runtime(RsonProject(data, Path("cross-script.rson")))
         }
         self.assertNotIn("dialog-inject-target-missing", codes)
+        self.assertIn("dialog-inject-cross-script-unverified", codes)
 
     def test_blocked_injected_answer_does_not_need_a_jump_target(self) -> None:
         # The dialog named by AddDialogInject is called only when its answer is picked,
@@ -3852,6 +3853,14 @@ class RuntimeLintTests(unittest.TestCase):
         codes = {
             issue.code
             for issue in lint_rson_runtime(RsonProject(data, Path("live-inject.rson")))
+        }
+        self.assertIn("dialog-inject-target-missing", codes)
+
+        # A conditional block cannot globally prove that the answer is hidden.
+        group["Operations"][0]["Code"].insert(0, "if(flag) AddDialogBlock('Ask', 2);")
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("conditional-block.rson")))
         }
         self.assertIn("dialog-inject-target-missing", codes)
 
