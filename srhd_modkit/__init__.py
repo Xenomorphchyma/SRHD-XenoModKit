@@ -60,6 +60,7 @@ from .runtime_lint import (
     lint_module_runtime,
     lint_quest_item_images,
     lint_rson_runtime,
+    script_launch_mode,
 )
 from .script_artifacts import (
     ScriptArtifactIssue,

@@ -2326,6 +2326,28 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertIn("runtime-rscript-paired-array-dimension", codes)
 
+    def test_persistent_paired_dynamic_arrays_mutated_in_lockstep_are_proven_equal(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "queue_ids", "Init": "newarray(1)", "#": 20},
+            {"Type": "TVar", "Name": "queue_turns", "Init": "newarray(1)", "#": 21},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "ArrayClear(queue_ids);",
+            "ArrayClear(queue_turns);",
+            "ArrayAdd(queue_ids, 7);",
+            "ArrayAdd(queue_turns, CurTurn());",
+            "for(int i = 1; i < ArrayDim(queue_ids); i = i + 1)",
+            "{",
+            "    if(queue_ids[i] && queue_turns[i] <= CurTurn()) exit;",
+            "}",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("paired-dynamic-safe.rson")))
+        }
+        self.assertNotIn("runtime-rscript-paired-array-dimension", codes)
+
     def test_rndobject_rejects_proven_item_anchor(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Operations"][1]["Code"] = [
@@ -3092,10 +3114,31 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-persistent-fixed-array-terminal-slot", reserved_codes)
 
-    def test_dynamic_persistent_array_live_dimension_drift_is_reported(self) -> None:
+    def test_fixed_persistent_array_live_dimension_drift_is_reported(self) -> None:
         data = deepcopy(SAFE_RSON)
         data["Visual.Objects"][0]["Variables"] = [
             {"Type": "TVar", "Name": "ship_ids", "Parent": -1, "#": 20},
+        ]
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = [
+            "function ResetIds()",
+            "{",
+            "    ship_ids = newarray(7);",
+            "    ArrayClear(ship_ids);",
+            "    ArrayAdd(ship_ids, 7);",
+            "}",
+            "for(int i = 1; i < ArrayDim(ship_ids); i = i + 1)",
+            "    if(ship_ids[i] == 7) exit;",
+        ]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("persistent-drift.rson")))
+        }
+        self.assertIn("runtime-persistent-array-live-dimension-drift", codes)
+
+    def test_dynamic_persistent_array_live_dimension_is_not_reported_as_drift(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Variables"] = [
+            {"Type": "TVar", "Name": "ship_ids", "Parent": -1, "Init": "newarray(1)", "#": 20},
         ]
         data["Visual.Objects"][0]["Operations"][1]["Code"] = [
             "function ResetIds()",
@@ -3109,9 +3152,9 @@ class RuntimeLintTests(unittest.TestCase):
         ]
         codes = {
             issue.code
-            for issue in lint_rson_runtime(RsonProject(data, Path("persistent-drift.rson")))
+            for issue in lint_rson_runtime(RsonProject(data, Path("dynamic-dimension-safe.rson")))
         }
-        self.assertIn("runtime-persistent-array-live-dimension-drift", codes)
+        self.assertNotIn("runtime-persistent-array-live-dimension-drift", codes)
 
     def test_literal_ct_keys_are_checked_in_every_language_and_fatal_sink(self) -> None:
         data = deepcopy(SAFE_RSON)
@@ -4031,6 +4074,49 @@ class RuntimeLintTests(unittest.TestCase):
         }
         self.assertNotIn("runtime-dialog-msg-eager-array-index", safe_codes)
         self.assertNotIn("runtime-dialog-msg-eager-mutable-value", safe_codes)
+
+    def test_dialog_msg_assignment_before_dchange_matches_compiled_message_order(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        group = data["Visual.Objects"][0]
+        group["Variables"] = [{"Type": "TVar", "Name": "caption", "Init": "''", "#": 20}]
+        group["Dialogs"] = [
+            {"Type": "TDialog", "Name": "Questions", "Parent": -1, "#": 10},
+            {"Type": "TDialogMsg", "Name": "Answer", "Parent": -1, "#": 11, "DMsg.Num": "12", "Msg": "<caption>"},
+        ]
+        group["Operations"].append(
+            {"Type": "Top", "Name": "Prepare", "Parent": 10, "#": 12, "Code.Type": "Turn", "Code": [
+                "caption = CT('Question.Answer');",
+                "DChange(12);",
+            ]}
+        )
+        data["Visual.Links"] = [{"Begin": 10, "End": 12}]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("dialog-msg-prepared-before-change.rson")))
+        }
+        self.assertNotIn("runtime-dialog-msg-eager-mutable-value", codes)
+
+    def test_world_template_launch_does_not_require_startup_ui_barrier(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        data["Visual.Objects"][0]["Operations"][1]["Code"] = ["GetShipPlanet(Player());"]
+        project = RsonProject(data, Path("world-template.rson"))
+        standalone = {issue.code for issue in lint_rson_runtime(project)}
+        world = {issue.code for issue in lint_rson_runtime(project, launch_mode="world")}
+        self.assertIn("runtime-turn-direct-world-access", standalone)
+        self.assertNotIn("runtime-turn-direct-world-access", world)
+        self.assertNotIn("runtime-ui-readiness-source-missing", world)
+
+    def test_duplicate_unlinked_turn_object_is_reported(self) -> None:
+        data = deepcopy(SAFE_RSON)
+        operations = data["Visual.Objects"][0]["Operations"]
+        operations.append({"Type": "Top", "Name": "LinkedTurn", "Parent": -1, "#": 10, "Code.Type": "Turn", "Code": ["DChange(1);"]})
+        operations.append({"Type": "Top", "Name": "CopiedTurn", "Parent": -1, "#": 11, "Code.Type": "Turn", "Code": ["DChange(1);"]})
+        data["Visual.Links"] = [{"Begin": 3, "End": 10}]
+        codes = {
+            issue.code
+            for issue in lint_rson_runtime(RsonProject(data, Path("orphan-turn.rson")))
+        }
+        self.assertIn("runtime-orphan-turn-object", codes)
 
     def test_answer_caption_is_checked_against_its_parent_message(self) -> None:
         """An answer carries AMsg.Num; its caption is resolved with the parent message's build."""

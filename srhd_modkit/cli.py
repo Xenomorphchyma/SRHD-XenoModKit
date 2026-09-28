@@ -61,6 +61,7 @@ from .runtime_lint import (
     lint_module_runtime,
     lint_quest_item_images,
     lint_rson_runtime,
+    script_launch_mode,
 )
 from .validation import validate_collection
 from .audit import AuditProfile, AuditReport, audit_collection, audit_mod
@@ -1790,6 +1791,35 @@ def _runtime_lint_target(
                 language_documents,
             )
         )
+
+    # Runtime lint runs before Main.dat is loaded so it can also operate on a
+    # standalone RSON.  Once an explicit Main.dat is available, remove only the
+    # startup-UI diagnostics for scripts registered as world/dialog templates;
+    # unknown launch paths remain conservative.
+    if main_documents:
+        world_script_paths = {
+            str(project.path)
+            for project in rson_projects
+            if project.path is not None
+            and any(
+                script_launch_mode(document, project.name) == "world"
+                for document in main_documents
+            )
+        }
+        if world_script_paths:
+            readiness_codes = {
+                "runtime-turn-direct-world-access",
+                "runtime-turn-before-ui",
+                "runtime-ui-readiness-source-missing",
+            }
+            issues = [
+                issue
+                for issue in issues
+                if not (
+                    issue.code in readiness_codes
+                    and issue.path in world_script_paths
+                )
+            ]
 
     onstart_risks = {
         "runtime-turn-direct-world-access",
