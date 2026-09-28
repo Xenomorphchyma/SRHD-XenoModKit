@@ -1945,7 +1945,11 @@ def cmd_script_delete_link(args: argparse.Namespace) -> int:
 
 def cmd_script_delete_object(args: argparse.Namespace) -> int:
     project, output = _rson_mutation(args.source, args.output, args.overwrite)
-    removed = project.delete_object(args.id, detach_references=args.detach_references)
+    removed = project.delete_object(
+        args.id,
+        detach_references=args.detach_references,
+        allow_dialog_renumber=args.allow_dialog_renumber,
+    )
     digest = _save_valid_rson(project, output)
     result = {"output": str(output), "object_id": args.id, **removed, "sha256": digest}
     if args.json:
@@ -1953,9 +1957,12 @@ def cmd_script_delete_object(args: argparse.Namespace) -> int:
     else:
         print(
             f"Объект #{args.id} удалён; связей удалено: {removed['removed_links']}; "
-            f"детей отвязано: {len(removed['detached_children'])}"
+            f"детей отвязано: {len(removed['detached_children'])}; "
+            f"перенумеровано объектов: {removed['renumbered']['objects']}"
         )
         print(f"RSON: {output}")
+        if removed.get("dialog_language_remap_required"):
+            print("Внимание: номера диалога изменены; перенесите Lang.dat через lang remap перед выпуском.")
     return 0
 
 
@@ -3525,6 +3532,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--detach-references",
         action="store_true",
         help="Удалить его связи и поставить Parent=-1 дочерним объектам",
+    )
+    script_delete_object.add_argument(
+        "--allow-dialog-renumber",
+        action="store_true",
+        help="Разрешить изменение AMsg.Num/DMsg.Num; после этого обязательно пересоберите или перенесите Lang.dat",
     )
     script_delete_object.add_argument("--overwrite", action="store_true")
     script_delete_object.add_argument("--json", action="store_true")
