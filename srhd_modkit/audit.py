@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from .blockpar import BlockParDocument, load_blockpar
 from .discovery import discover_mods, load_mod
 from .diagnostics import matching_allowance
-from .files import iter_files
+from .files import iter_files, safe_archive_name
 from .formats import get_format_spec, inspect_file
 from .game_text import (
     lint_blockpar_display_text,
@@ -202,6 +202,7 @@ class AuditContext:
     temp: Path
     install_subpath: str | None = None
     mod_name: str = ""
+    source_root: Path | None = None
     dat_documents: dict[Path, BlockParDocument | None] = field(default_factory=dict)
     dat_failures: dict[Path, Exception] = field(default_factory=dict)
 
@@ -1413,6 +1414,19 @@ def _script_check(context: AuditContext) -> AuditCheck:
         and path.relative_to(context.root).as_posix().casefold().startswith("data/script/")
     ]
     rsons = [path for path in files if path.suffix.casefold() == ".rson"]
+    external_rsons: set[Path] = set()
+    if context.source_root is not None:
+        # Readable sources may live beside the mod folder instead of inside it, so the
+        # RSON of a script the mod ships is not among `root`'s files. Adding them here is
+        # what lets the dialog and language checks compare the SCR with the source it was
+        # built from instead of trusting the binary alone.
+        known = {path.resolve() for path in rsons}
+        external_rsons.update(
+            path.resolve()
+            for path in iter_files(context.source_root)
+            if path.suffix.casefold() == ".rson" and path.resolve() not in known
+        )
+        rsons.extend(sorted(external_rsons, key=lambda value: str(value).casefold()))
     if not scripts and not rsons:
         return AuditCheck(name, "skipped", details={"reason": "SCR/RSON не найдены"})
 
@@ -1508,6 +1522,22 @@ def _script_check(context: AuditContext) -> AuditCheck:
     for path in rsons:
         try:
             project = load_rson(path)
+            if path.resolve() in external_rsons and scripts:
+                shipped_names = {item.stem.casefold() for item in scripts}
+                if project.name.casefold() not in shipped_names:
+                    issues.append(
+                        _issue(
+                            context,
+                            name,
+                            "info",
+                            "source-rson-not-shipped",
+                            f"Внешний RSON {path.name} не сопоставлен ни с одним SCR мода и не включён в семантический аудит",
+                            path,
+                            evidence=f"ScriptName={project.name}; SCR={', '.join(sorted(shipped_names))}",
+                        )
+                    )
+                    checked.append(str(path))
+                    continue
             structural = project.validate(
                 rscript_profile=context.tools._rscript_cli_profile()
             )
@@ -1814,12 +1844,21 @@ def audit_mod(
     profile: str | AuditProfile = AuditProfile.DEV,
     tools_root: str | Path | None = None,
     install_subpath: str | Path | None = None,
+    source_root: str | Path | None = None,
     allow: Sequence[str] = (),
     registry: AuditRegistry | None = None,
 ) -> AuditReport:
     root = Path(path).resolve()
     if not root.is_dir():
         raise NotADirectoryError(root)
+    if install_subpath is not None:
+        safe_archive_name(str(install_subpath))
+    if source_root is not None:
+        source_root_path = Path(source_root).resolve()
+        if not source_root_path.is_dir():
+            raise NotADirectoryError(source_root_path)
+    else:
+        source_root_path = None
     parsed_profile = AuditProfile.parse(profile)
     with tempfile.TemporaryDirectory(prefix="srhd-audit-") as temp_name:
         context = AuditContext(
@@ -1828,6 +1867,8 @@ def audit_mod(
             Toolchain(tools_root),
             Path(temp_name),
             str(install_subpath) if install_subpath is not None else None,
+            "",
+            source_root_path,
         )
         checks = (registry or default_registry()).run(context)
     return _apply_allowances(

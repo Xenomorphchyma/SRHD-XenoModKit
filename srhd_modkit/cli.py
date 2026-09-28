@@ -195,9 +195,12 @@ def cmd_audit(args: argparse.Namespace) -> int:
             target,
             profile=args.profile,
             tools_root=args.tools_root,
+            source_root=args.sources,
             allow=args.allow,
         )
     else:
+        if getattr(args, "prefix", None) is not None:
+            raise ValueError("--prefix применим только к одному моду; для audit коллекции укажите путь установки каждому моду отдельно")
         report = audit_collection(
             target,
             profile=args.profile,
@@ -224,6 +227,7 @@ def cmd_release_check(args: argparse.Namespace) -> int:
         profile=AuditProfile.RELEASE,
         tools_root=args.tools_root,
         install_subpath=install_subpath,
+        source_root=args.sources,
         allow=args.allow,
     )
     if args.json:
@@ -247,6 +251,7 @@ def cmd_release_build(args: argparse.Namespace) -> int:
             prefix=args.prefix,
             exclude=args.exclude,
             tools_root=args.tools_root,
+            source_root=args.sources,
             allow=args.allow,
             warnings_as_errors=args.warnings_as_errors,
             overwrite=args.overwrite,
@@ -299,6 +304,7 @@ def cmd_release_plan(args: argparse.Namespace) -> int:
         exclude=args.exclude,
         strip_sources=not args.include_sources,
         tools_root=args.tools_root,
+        source_root=args.sources,
         allow=args.allow,
         warnings_as_errors=args.warnings_as_errors,
         require_complete=args.require_complete,
@@ -323,6 +329,7 @@ def cmd_release_deploy(args: argparse.Namespace) -> int:
             exclude=args.exclude,
             strip_sources=not args.include_sources,
             tools_root=args.tools_root,
+            source_root=args.sources,
             allow=args.allow,
             warnings_as_errors=args.warnings_as_errors,
             overwrite=args.overwrite,
@@ -2771,6 +2778,12 @@ def build_parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit", help="Универсально проверить мод или коллекцию")
     audit.add_argument("target")
     audit.add_argument("--profile", choices=("dev", "release"), default="dev")
+    audit.add_argument(
+        "--sources",
+        help="Каталог с читаемыми исходниками мода (например src рядом с папкой мода); "
+        "его RSON подключаются к проверке, чтобы SCR сверялся с исходником, а не "
+        "проверялся только бинарно",
+    )
     audit.add_argument("--allow", action="append", default=[], help="Подавить CODE или CODE:GLOB с записью в отчёт")
     audit.add_argument("--warnings-as-errors", action="store_true")
     audit.add_argument(
@@ -2791,6 +2804,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefix",
         help="Точный путь мода внутри Mods и ZIP, например OtherMods/MyMod",
     )
+    release_check.add_argument("--sources", help="Каталог с внешними RSON-исходниками этого мода")
     release_check.add_argument("--allow", action="append", default=[])
     release_check.add_argument("--warnings-as-errors", action="store_true")
     release_check.add_argument("--require-complete", action="store_true")
@@ -2805,6 +2819,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefix",
         help="Точный путь мода внутри Mods и ZIP, например OtherMods/MyMod",
     )
+    release_build.add_argument("--sources", help="Каталог с внешними RSON-исходниками этого мода")
     release_build.add_argument("--exclude", action="append", default=[])
     release_build.add_argument("--allow", action="append", default=[])
     release_build.add_argument("--warnings-as-errors", action="store_true")
@@ -2829,6 +2844,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefix",
         help="Точный путь внутри destination_root, например OtherMods/MyMod",
     )
+    release_plan.add_argument("--sources", help="Каталог с внешними RSON-исходниками этого мода")
     release_plan.add_argument("--exclude", action="append", default=[])
     release_plan.add_argument("--allow", action="append", default=[])
     release_plan.add_argument("--warnings-as-errors", action="store_true")
@@ -2852,6 +2868,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefix",
         help="Точный путь внутри destination_root, например OtherMods/MyMod",
     )
+    release_deploy.add_argument("--sources", help="Каталог с внешними RSON-исходниками этого мода")
     release_deploy.add_argument("--exclude", action="append", default=[])
     release_deploy.add_argument("--allow", action="append", default=[])
     release_deploy.add_argument("--warnings-as-errors", action="store_true")
