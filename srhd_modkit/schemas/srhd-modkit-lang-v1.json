@@ -4,6 +4,6 @@
   "title": "SRHD ModKit language operation result",
   "type": "object",
   "required": ["schema", "operation"],
-  "properties": {"schema": {"const": "srhd-modkit-lang-v1"}, "operation": {"enum": ["extract", "build", "diff", "coverage"]}},
+  "properties": {"schema": {"const": "srhd-modkit-lang-v1"}, "operation": {"enum": ["extract", "build", "diff", "coverage", "remap"]}},
   "additionalProperties": true
 }

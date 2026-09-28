@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any, Iterable
 from .blockpar import BlockParDocument, BlockParNode, BlockParParameter, load_blockpar
 from .files import iter_files, sha256_file
 from .module_info import find_module_info, parse_module_info
+from .safe_io import atomic_write_text
 from .toolchain import Toolchain
 
 
@@ -310,9 +312,383 @@ def language_coverage(
     }
 
 
+def _decode_language_text(path: Path) -> str:
+    """Decode a language TXT by BOM/NUL sniffing, so UTF-16 text is never read as UTF-8."""
+
+    raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in raw[:32]:
+        return raw.decode("utf-16")
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("cp1251", "replace")
+
+
+def _language_text(path: Path, toolchain: Toolchain | None, temp: Path) -> str:
+    """Return a language as editable text, decoding a DAT into ``temp`` first."""
+
+    if path.suffix.casefold() == ".dat":
+        if toolchain is None:
+            raise RuntimeError("Для Lang.dat не инициализирован BlockPar toolchain")
+        decoded = temp / f"{len(list(temp.iterdir())):04d}-{path.stem}.txt"
+        toolchain.convert_dat(path, decoded, overwrite=True)
+        return _decode_language_text(decoded)
+    return _decode_language_text(path)
+
+
+def _script_keys_from_text(text: str) -> dict[str, dict[str, str]]:
+    """Collect ``Script/<name>/<n>`` values from a Lang tree, following the block path."""
+
+    scripts: dict[str, dict[str, str]] = {}
+    path: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped == "}":
+            if path:
+                path.pop()
+            continue
+        block = re.match(r"^(.*?)\s*(\^\{|~\{)$", stripped)
+        if block:
+            path.append(block.group(1).strip())
+            continue
+        if len(path) >= 2 and path[0].casefold() == "script" and "=" in stripped:
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            if key.isdecimal():
+                scripts.setdefault(path[1], {}).setdefault(key, value)
+    return scripts
+
+
+def _fragment_keys(text: str, script: str) -> dict[str, dict[str, str]]:
+    """Read an RScript ``number=value`` fragment (the ``--lang`` output of ``script build``)."""
+
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if key.isdecimal():
+            values.setdefault(key, value)
+    return {script: values} if values else {}
+
+
+def _placeholder_signature(text: str, tokens: tuple[str, ...]) -> str:
+    """Collapse ``<n>`` and caller-listed word tokens, so one message in two token styles pairs up."""
+
+    collapsed = re.sub(r"<[^<>]{1,24}>", "#", text)
+    for token in tokens:
+        collapsed = re.sub(
+            rf"(?<![0-9A-Za-z_]){re.escape(token)}(?![0-9A-Za-z_])", "#", collapsed
+        )
+    return collapsed
+
+
+def _pair_keys_by_text(
+    old: dict[str, str],
+    new: dict[str, str],
+    tokens: tuple[str, ...] = (),
+) -> tuple[dict[str, str], list[dict[str, Any]], list[dict[str, str]]]:
+    """Pair old and new keys through the text; within a duplicate group keep the key order.
+
+    A pair whose texts differ only in placeholder style (``planet``/``star`` against ``<0>``/``<1>``)
+    still carries the same message, so ``tokens`` lists the word placeholders to treat as equal; such
+    pairs are returned separately for the report. A text that appears more than once is paired by key
+    order and always reported as ambiguous — however many copies each side has — because that order
+    is not proof of anything.
+    """
+
+    old_by_text: dict[str, list[str]] = {}
+    for key, value in old.items():
+        old_by_text.setdefault(value, []).append(key)
+    new_by_text: dict[str, list[str]] = {}
+    for key, value in new.items():
+        new_by_text.setdefault(value, []).append(key)
+    mapping: dict[str, str] = {}
+    groups: list[dict[str, Any]] = []
+    for value, old_keys in old_by_text.items():
+        new_keys = new_by_text.get(value)
+        if not new_keys:
+            continue
+        old_keys = sorted(old_keys, key=int)
+        new_keys = sorted(new_keys, key=int)
+        paired = list(zip(old_keys, new_keys))
+        for old_key, new_key in paired:
+            mapping[old_key] = new_key
+        if len(old_keys) > 1 or len(new_keys) > 1:
+            # Identical texts are paired by key order, which is only a guess: report
+            # it even when the two counts match, so ``valid`` can say the result is
+            # not verified.
+            groups.append(
+                {
+                    "text": value,
+                    "old": old_keys,
+                    "new": new_keys,
+                    "ambiguous": True,
+                    "paired": [[old_key, new_key] for old_key, new_key in paired],
+                }
+            )
+
+    normalized: list[dict[str, str]] = []
+    if tokens:
+        by_signature: dict[str, list[str]] = {}
+        for key, value in new.items():
+            if key in mapping.values():
+                continue
+            by_signature.setdefault(_placeholder_signature(value, tokens), []).append(key)
+        for old_key in sorted((key for key in old if key not in mapping), key=int):
+            candidates = sorted(by_signature.get(_placeholder_signature(old[old_key], tokens), []), key=int)
+            if not candidates:
+                continue
+            target = candidates.pop(0)
+            mapping[old_key] = target
+            normalized.append({"old": old_key, "new": target})
+    return mapping, groups, normalized
+
+
+def _rewrite_script_keys(
+    text: str,
+    mappings: dict[str, dict[str, str]],
+    known: dict[str, dict[str, str]],
+    occupied: dict[str, set[str]],
+) -> tuple[str, dict[str, Any]]:
+    """Move ``Script/<name>/<n>`` keys onto the new numbering, keeping the rest verbatim."""
+
+    lines = text.split("\n")
+    path: list[str] = []
+    plan: dict[int, tuple[str | None, str, str]] = {}
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped == "}":
+            if path:
+                path.pop()
+            continue
+        block = re.match(r"^(.*?)\s*(\^\{|~\{)$", stripped)
+        if block:
+            path.append(block.group(1).strip())
+            continue
+        if len(path) < 2 or path[0].casefold() != "script" or "=" not in stripped:
+            continue
+        head = stripped.split("=", 1)[0].strip()
+        for name, mapping in mappings.items():
+            if path[1].casefold() == name.casefold() and head.isdecimal():
+                plan[index] = (mapping.get(head), path[1], head)
+                break
+
+    # A key left in place must not land on a number the rebuilt script already uses for another
+    # text: that would override a live string with a stranger's.  Such keys are dropped and reported.
+    dropped: set[int] = set()
+    for index, (target, script, old_key) in plan.items():
+        if target is None and old_key in occupied.get(script.casefold(), set()):
+            dropped.add(index)
+
+    out: list[str] = []
+    stats = {"mapped": 0, "kept": 0, "dropped": 0, "unmatched": 0}
+    for index, line in enumerate(lines):
+        if index in dropped:
+            stats["dropped"] += 1
+            continue
+        row = plan.get(index)
+        if row is None:
+            out.append(line)
+            continue
+        target, script, old_key = row
+        if target is None:
+            stats["kept"] += 1
+            if old_key in known.get(script, {}):
+                stats["unmatched"] += 1
+            out.append(line)
+            continue
+        match = re.match(r"^(\s*)(\d+)(\s*=.*)$", line)
+        out.append(f"{match.group(1)}{target}{match.group(3)}" if match else line)
+        stats["mapped"] += 1
+    return "\n".join(out), stats
+
+
+def _common_parent(paths: list[Path]) -> Path | None:
+    """The deepest directory holding every language file, or None across roots/drives."""
+
+    try:
+        return Path(os.path.commonpath([str(item.parent) for item in paths]))
+    except ValueError:  # e.g. different drives on Windows
+        return None
+
+
+def _remap_output_path(out_dir: Path, item: Path, common_root: Path | None) -> Path:
+    """Mirror the input's folder under ``out_dir`` so two ``Lang.dat`` cannot collide.
+
+    ``CFG/Rus/Lang.dat`` and ``CFG/Eng/Lang.dat`` become ``<out>/Rus/Lang.dat`` and
+    ``<out>/Eng/Lang.dat``; a lone file keeps its own name. Falls back to the parent
+    folder's name when the inputs have no common root.
+    """
+
+    if common_root is not None:
+        try:
+            relative = item.relative_to(common_root)
+        except ValueError:
+            relative = None
+        if relative and relative.parts:
+            return out_dir / relative
+    return out_dir / item.parent.name / item.name if item.parent.name else out_dir / item.name
+
+
+def remap_languages(
+    truth: str | Path,
+    onto: str | Path,
+    languages: Iterable[str | Path],
+    *,
+    out_dir: str | Path,
+    script: str | None = None,
+    placeholder_tokens: Iterable[str] = (),
+    tools_root: str | Path | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Re-key language overlays onto the script numbering of a rebuilt SCR.
+
+    ``truth`` is one language in the old numbering, ``onto`` the same language in the new one
+    (a Lang DAT/TXT or the RScript fragment a rebuild emits).  The pair maps old keys to new ones
+    through the text, and every language in ``languages`` is moved onto that numbering, so the
+    localization DATs keep overriding the rebuilt SCR.  The language taken as the truth is
+    arbitrary: a mod authored in English uses English there and feeds the Russian overlay.
+    """
+
+    truth_path = Path(truth).resolve()
+    onto_path = Path(onto).resolve()
+    out_path = Path(out_dir).resolve()
+    language_paths = [Path(item).resolve() for item in languages]
+    if not language_paths:
+        raise ValueError("lang remap требует хотя бы один --language")
+    needs_toolchain = any(
+        item.suffix.casefold() == ".dat" for item in (truth_path, onto_path, *language_paths)
+    )
+    chain = Toolchain(tools_root) if needs_toolchain else None
+    out_path.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".srhd-lang-remap-") as name:
+        temp = Path(name)
+        truth_scripts = _script_keys_from_text(_language_text(truth_path, chain, temp))
+        onto_text = _language_text(onto_path, chain, temp)
+        onto_scripts = _script_keys_from_text(onto_text)
+        if not onto_scripts:
+            if not script:
+                raise ValueError("--onto выглядит фрагментом RScript: укажите --script <имя>")
+            onto_scripts = _fragment_keys(onto_text, script)
+        if not truth_scripts or not onto_scripts:
+            raise ValueError("--truth и --onto не дали ни одного ключа Script.<имя>.<n>")
+
+        mappings: dict[str, dict[str, str]] = {}
+        groups: dict[str, list[dict[str, Any]]] = {}
+        normalized: dict[str, list[dict[str, str]]] = {}
+        tokens = tuple(placeholder_tokens)
+        for name, old_keys in truth_scripts.items():
+            new_keys = next(
+                (value for key, value in onto_scripts.items() if key.casefold() == name.casefold()),
+                None,
+            )
+            if not new_keys:
+                continue
+            mappings[name], groups[name], normalized[name] = _pair_keys_by_text(
+                old_keys, new_keys, tokens
+            )
+        if not any(mappings.values()):
+            raise ValueError("--truth и --onto не дали ни одного соответствия по текстам")
+
+        # Preliminary pass: read and decode every language once, and settle every
+        # output path, before anything is written.
+        common_root = _common_parent(language_paths)
+        prepared: list[tuple[Path, str, Path]] = []
+        targets: dict[str, Path] = {}
+        for item in language_paths:
+            target = _remap_output_path(out_path, item, common_root)
+            key = str(target).casefold()
+            if key in targets:
+                raise ValueError(
+                    "Два языка дают один и тот же путь результата: "
+                    f"{targets[key]} и {item} -> {target}"
+                )
+            targets[key] = item
+            if target.exists() and not overwrite:
+                raise FileExistsError(f"Результат уже существует: {target}")
+            prepared.append((item, _language_text(item, chain, temp), target))
+
+        results: list[dict[str, Any]] = []
+        occupied = {
+            name.casefold(): set(keys) for name, keys in onto_scripts.items()
+        }
+        for item, text, target in prepared:
+            rewritten, stats = _rewrite_script_keys(text, mappings, truth_scripts, occupied)
+            if item.suffix.casefold() == ".dat":
+                staged = temp / f"out-{item.stem}.txt"
+                staged.write_text(rewritten, encoding="utf-16", newline="")
+                # convert_dat stages and os.replace()s, so the destination is never half-written.
+                chain.convert_dat(staged, target, overwrite=True, verify=True)
+            else:
+                encoding = (
+                    "utf-16"
+                    if item.read_bytes().startswith((b"\xff\xfe", b"\xfe\xff"))
+                    else "utf-8"
+                )
+                atomic_write_text(target, rewritten, encoding=encoding)
+            results.append({"path": str(item), "output": str(target), **stats})
+
+    ambiguous = sum(
+        min(len(group["old"]), len(group["new"]))
+        for script_groups in groups.values()
+        for group in script_groups
+    )
+    normalized_count = sum(len(items) for items in normalized.values())
+    valid = (
+        ambiguous == 0
+        and normalized_count == 0
+        and all(item["unmatched"] == 0 and item["dropped"] == 0 for item in results)
+    )
+    return {
+        "schema": LANG_SCHEMA,
+        "operation": "remap",
+        "truth": str(truth_path),
+        "onto": str(onto_path),
+        "scripts": [
+            {
+                "script": name,
+                "mapped": len(mapping),
+                "ambiguous": sum(
+                    min(len(group["old"]), len(group["new"]))
+                    for group in groups.get(name, [])
+                ),
+                "normalized": normalized.get(name, []),
+                "duplicate_text_groups": groups.get(name, []),
+            }
+            for name, mapping in sorted(mappings.items())
+        ],
+        "languages": results,
+        # ``valid`` means the whole remap is exact: nothing left behind, nothing
+        # dropped for a collision, and no match that is only a guess — the
+        # order-paired duplicates (ambiguous) or the placeholder-style pairs
+        # (normalized) all make it False, however far the run got.
+        "valid": valid,
+        "status": "verified" if valid else "provisional",
+        "provisional": not valid,
+        "summary": {
+            "languages": len(results),
+            "mapped": sum(item["mapped"] for item in results),
+            "unmatched": sum(item["unmatched"] for item in results),
+            "dropped": sum(item["dropped"] for item in results),
+            "ambiguous": ambiguous,
+            "normalized": normalized_count,
+        },
+    }
+
+
 __all__ = [
     "extract_language",
     "build_language",
     "diff_languages",
     "language_coverage",
+    "remap_languages",
 ]
