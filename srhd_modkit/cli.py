@@ -89,6 +89,24 @@ from .schemas import list_schemas, load_schema, validate_schema_document
 from .compat import analyze_modset
 from .hidden_process import inspect_hidden_processes, terminate_hidden_processes
 from .native_loader import initialize_native_mod, inspect_native_dll, validate_native_mod
+from .rangers_exe import (
+    EXE_SCHEMA,
+    HOOKS_SCHEMA,
+    find_pattern,
+    find_symbol,
+    hooks_from_manifest,
+    hooks_from_source,
+    identify_executable,
+    iter_executables,
+    load_pe,
+    load_symbols,
+    make_signature,
+    parse_pattern,
+    port_address,
+    probe_hooks,
+    symbol_at,
+    symbol_chunks,
+)
 
 
 def human_size(value: int) -> str:
@@ -990,6 +1008,161 @@ def cmd_resource_build_pkg(args: argparse.Namespace) -> int:
         print(f"Файлов: {result['files']}; после распаковки: {human_size(result['uncompressed_size'])}")
         print(f"SHA-256: {result['sha256']}; проверен: {'да' if result['verified'] else 'НЕТ'}")
     return 0
+
+
+def _parse_va(value: str) -> int:
+    try:
+        return int(value, 16)
+    except ValueError as exc:
+        raise ValueError(f"адрес должен быть шестнадцатеричным, например 0x0079CBFF: {value}") from exc
+
+
+def _resolve_site(args: argparse.Namespace) -> tuple[int, list[tuple[int, int]] | None]:
+    """VA from --va, or from --name in a --symbols map of the same EXE.
+
+    With --name the function's chunks come back too: they are the region
+    whose references and constants locate it in a recompiled build.
+    """
+
+    if args.va:
+        return _parse_va(args.va), None
+    if not args.name or not args.symbols:
+        raise ValueError("укажите --va либо --name вместе с --symbols")
+    symbols = load_symbols(args.symbols)
+    matches = find_symbol(symbols, args.name)
+    if not matches:
+        raise ValueError(f"символ {args.name!r} не найден в {args.symbols}")
+    exact = [item for item in matches if item[0].casefold() == args.name.casefold()]
+    if len(exact) != 1 and len(matches) != 1:
+        names = ", ".join(name for name, _, _ in matches[:8])
+        raise ValueError(f"имя {args.name!r} неоднозначно: {names}")
+    name, start, _ = (exact or matches)[0]
+    return start + (args.offset or 0), symbol_chunks(symbols, start)
+
+
+def cmd_exe_identify(args: argparse.Namespace) -> int:
+    results = [identify_executable(path) for path in iter_executables(args.exe)]
+    if args.json:
+        print_json({"schema": EXE_SCHEMA, "executables": results})
+        return 0
+    for item in results:
+        print(item["path"])
+        print(f"  профиль: {item['profile']} (ebp-локалов на КБ: "
+              f"{item['profile_metric']['ebp_locals_per_kb']}, порог {item['profile_metric']['threshold']})")
+        print(f"  сборка: {item['known_build'] or 'неизвестна'}; дата в PE: {item['build_date']} "
+              f"({item['timestamp']})")
+        print(f"  SHA-256: {item['sha256']}")
+        for note in item["notes"]:
+            print(f"  примечание: {note}")
+    return 0
+
+
+def cmd_exe_scan(args: argparse.Namespace) -> int:
+    pattern = parse_pattern(args.pattern)
+    rows = []
+    for path in iter_executables(args.exe):
+        image = load_pe(path)
+        matches = find_pattern(image, pattern, limit=args.limit)
+        rows.append({
+            "exe": str(path.resolve()),
+            "profile": identify_executable(path)["profile"],
+            "matches": len(matches),
+            "va": [f"{image.offset_to_va(offset):#010x}" for offset in matches],
+        })
+    if args.json:
+        print_json({"schema": EXE_SCHEMA, "pattern": pattern.text(), "results": rows})
+    else:
+        for row in rows:
+            shown = ", ".join(row["va"][:8]) + (" …" if len(row["va"]) > 8 else "")
+            print(f"{row['matches']:4} [{row['profile']}] {row['exe']}  {shown}")
+    return 0 if all(row["matches"] for row in rows) else 1
+
+
+def cmd_exe_sig(args: argparse.Namespace) -> int:
+    va, _ = _resolve_site(args)
+    result = make_signature(load_pe(args.exe), va, min_length=args.min_length, max_length=args.max_length)
+    if args.json:
+        print_json({"schema": EXE_SCHEMA, **result})
+    else:
+        state = "уникальна" if result["unique"] else f"НЕ уникальна ({result.get('matches')} совпадений)"
+        print(f"{result['va']}: {result['length']} байт, {state}")
+        print(f"  {result['pattern']}")
+        print(f"  {{ {result['c_array']} }}")
+    return 0 if result["unique"] else 1
+
+
+def cmd_exe_probe(args: argparse.Namespace) -> int:
+    hooks = []
+    for path in args.source or []:
+        hooks.extend(hooks_from_source(path, all_arrays=args.all_arrays, min_length=args.min_length))
+    for path in args.hooks or []:
+        hooks.extend(hooks_from_manifest(path))
+    if not hooks:
+        raise ValueError("не найдено ни одной сигнатуры: укажите --source с исходником плагина или --hooks")
+    report = probe_hooks(hooks, iter_executables(args.exe))
+    if args.json:
+        print_json(report)
+    else:
+        marks = {"ok": "ok", "found": "ok", "other-profile": "  ", "missing": "НЕТ", "count-mismatch": "!="}
+        for exe in report["executables"]:
+            print(f"{exe['exe']} [{exe['profile']}] {exe['known_build'] or ''}")
+            for row in exe["hooks"]:
+                where = ", ".join(row["va"][:3]) + (" …" if row["matches"] > 3 else "")
+                expect = f"/{row['expect']}" if row["expect"] is not None else ""
+                print(f"  {marks[row['status']]:3} {row['matches']:3}{expect:3} {row['name']:44} "
+                      f"[{row['profile']}] {where}")
+        print(f"Проблем: {report['failures']}")
+    return 0 if report["failures"] == 0 else 2
+
+
+def cmd_exe_port(args: argparse.Namespace) -> int:
+    va, regions = _resolve_site(args)
+    results = [port_address(args.old, va, path, regions=regions) for path in iter_executables(args.new)]
+    if args.json:
+        print_json(results[0] if len(results) == 1 else {"schema": EXE_SCHEMA, "results": results})
+        return 0 if all(item.get("va") for item in results) else 1
+    for item in results:
+        print(f"{item['old']['va']} [{item['old']['profile']}] -> {item['new']['path']} [{item['new']['profile']}]")
+        print(f"  метод: {item['method']}, уверенность: {item['confidence']}")
+        if item.get("va"):
+            print(f"  новый адрес: {item['va']}")
+            signature = item.get("signature")
+            if signature:
+                print(f"  сигнатура ({signature['length']} байт): {signature['pattern']}")
+            continue
+        if item.get("message"):
+            print(f"  {item['message']}")
+        if item.get("estimate"):
+            print(f"  оценка по общим фрагментам: {item['estimate']['va']}")
+        for hint in item.get("site_hints", [])[:4]:
+            print(f"  константа {hint['const']} у места хука найдена в {hint['new_va']}")
+        for candidate in item.get("candidates", [])[:3]:
+            evidence = ", ".join(candidate["evidence"][:4])
+            start = candidate.get("function_start_guess")
+            routine = f", начало функции ~{start}" if start else ""
+            print(f"  кандидат {candidate['region']} (вес {candidate['weight']}{routine}): {evidence}")
+    return 0 if all(item.get("va") for item in results) else 1
+
+
+def cmd_exe_symbol(args: argparse.Namespace) -> int:
+    symbols = load_symbols(args.symbols)
+    query = args.query
+    if re.fullmatch(r"0[xX][0-9A-Fa-f]+", query):
+        found = symbol_at(symbols, int(query, 16))
+        rows = [] if found is None else [{"name": found[0], "start": f"{found[1]:#010x}",
+                                           "offset": int(query, 16) - found[1]}]
+    else:
+        rows = [{"name": name, "start": f"{start:#010x}", "end": f"{end:#010x}"}
+                for name, start, end in find_symbol(symbols, query)]
+    if args.json:
+        print_json({"schema": EXE_SCHEMA, "query": query, "symbols": rows})
+    else:
+        for row in rows:
+            suffix = f"+{row['offset']:#x}" if "offset" in row else f"..{row['end']}"
+            print(f"{row['start']}{suffix}  {row['name']}")
+        if not rows:
+            print("Ничего не найдено")
+    return 0 if rows else 1
 
 
 def cmd_native_inspect(args: argparse.Namespace) -> int:
@@ -3233,6 +3406,76 @@ def build_parser() -> argparse.ArgumentParser:
     native_validate.add_argument("mod")
     native_validate.add_argument("--json", action="store_true")
     native_validate.set_defaults(func=cmd_native_validate)
+
+    exe = sub.add_parser(
+        "exe",
+        help="Различать сборки Rangers.exe, проверять сигнатуры хуков и переносить их на новый EXE",
+    )
+    exe_sub = exe.add_subparsers(dest="exe_command", required=True)
+    exe_identify = exe_sub.add_parser(
+        "identify", help="Определить сборку и профиль кода ($O- legacy / $O+ optimized)"
+    )
+    exe_identify.add_argument("exe", nargs="+", help="EXE или папка с EXE")
+    exe_identify.add_argument("--json", action="store_true")
+    exe_identify.set_defaults(func=cmd_exe_identify)
+
+    exe_scan = exe_sub.add_parser("scan", help="Найти байтовую сигнатуру в исполняемом коде")
+    exe_scan.add_argument("exe", nargs="+", help="EXE или папка с EXE")
+    exe_scan.add_argument(
+        "--pattern", required=True, help='"8B 45 ?? 89", "8B45??89" или C-список "{0x8B, -1}"'
+    )
+    exe_scan.add_argument("--limit", type=int, default=50)
+    exe_scan.add_argument("--json", action="store_true")
+    exe_scan.set_defaults(func=cmd_exe_scan)
+
+    def add_site(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--va", help="Адрес места хука, например 0x0079CBFF")
+        parser.add_argument("--name", help="Имя функции из --symbols вместо --va")
+        parser.add_argument("--offset", type=lambda v: int(v, 0), default=0, help="Смещение от начала функции")
+        parser.add_argument(
+            "--symbols",
+            help="Карта функций именно этого EXE (формат native_ranges.json проекта SpaceRangersHD_decomp)",
+        )
+
+    exe_sig = exe_sub.add_parser(
+        "sig", help="Построить кратчайшую уникальную сигнатуру с маской адресов из .reloc"
+    )
+    exe_sig.add_argument("exe")
+    add_site(exe_sig)
+    exe_sig.add_argument("--min-length", type=int, default=12)
+    exe_sig.add_argument("--max-length", type=int, default=160)
+    exe_sig.add_argument("--json", action="store_true")
+    exe_sig.set_defaults(func=cmd_exe_sig)
+
+    exe_probe = exe_sub.add_parser(
+        "probe", help="Проверить сигнатуры плагина (из исходника или манифеста) на нескольких EXE"
+    )
+    exe_probe.add_argument("exe", nargs="+", help="EXE или папка с EXE")
+    exe_probe.add_argument(
+        "--source", action="append", help="C/C++-исходник с массивами сигнатур (-1 или маска \"xx?x\")"
+    )
+    exe_probe.add_argument("--hooks", action="append", help=f"JSON-манифест {HOOKS_SCHEMA}")
+    exe_probe.add_argument(
+        "--all-arrays", action="store_true", help="Брать все байтовые массивы, а не только *Pattern/*Signature"
+    )
+    exe_probe.add_argument("--min-length", type=int, default=8)
+    exe_probe.add_argument("--json", action="store_true")
+    exe_probe.set_defaults(func=cmd_exe_probe)
+
+    exe_port = exe_sub.add_parser(
+        "port", help="Найти место хука из одной сборки в другой (тот же профиль — точно, иначе кандидаты)"
+    )
+    exe_port.add_argument("old", help="EXE, для которого адрес известен")
+    exe_port.add_argument("new", nargs="+", help="Новый EXE или папка с EXE")
+    add_site(exe_port)
+    exe_port.add_argument("--json", action="store_true")
+    exe_port.set_defaults(func=cmd_exe_port)
+
+    exe_symbol = exe_sub.add_parser("symbol", help="Найти функцию по имени или адресу в карте функций")
+    exe_symbol.add_argument("symbols", help="native_ranges.json или совместимая карта")
+    exe_symbol.add_argument("query", help="Часть имени (TScript.LoadFromBuffer) или адрес 0x...")
+    exe_symbol.add_argument("--json", action="store_true")
+    exe_symbol.set_defaults(func=cmd_exe_symbol)
 
     compare = sub.add_parser("compare", help="Точно сравнить две папки")
     compare.add_argument("left")

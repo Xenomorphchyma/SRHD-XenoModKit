@@ -142,4 +142,6 @@ Loader нашёл их через `ModCFG.txt`, вызвал Query и Initialize
 статическими проверками без ошибок обработаны опубликованные нативные моды
 XenoMods: XenoBigGalaxy, XenoCoalitionSupplyLines, XenoDomRangers и
 XenoEquipmentInflation. Установку хуков в самом Rangers.exe проверяет только
-запуск игры.
+запуск игры; найдутся ли сигнатуры плагина в конкретном EXE, заранее
+показывает `exe probe --source <исходник>` (см. README_RU.md, раздел «Новый
+Rangers.exe»).

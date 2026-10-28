@@ -312,3 +312,11 @@ python -B srhd.py doctor deployments "<GAME>/Mods" --json
 ## Python API
 
 Основные экспорты: `audit_mod`, `audit_collection`, `build_release`, `plan_deploy`, `deploy_mod`, `load_project`, `build_project`, `deploy_project`, `publish_project`, `inspect_deployments`, `rollback_deployment`, `cleanup_deployments`, `analyze_modset`, `build_gai`, `build_pkg`, `Toolchain`, `load_blockpar`, `compare_storage_schemas`, `dialog_semantic_map`, `RgbaImage`, `inspect_gi`, `read_gi`, `write_gi`, `read_png`, `write_png`, `verify_gi`, `inspect_gai`, `inspect_hai`, `inspect_pkg`, `inspect_quest`, `verify_quest`, `export_quest_json`, `build_quest_from_json`, `inspect_hidden_processes`, `terminate_hidden_processes`. Новые JSON-схемы: `srhd-modkit-project-v1`, `srhd-modkit-project-build-v1`, `srhd-modkit-project-deploy-v1`, `srhd-modkit-project-publish-v1`, `srhd-modkit-deploy-plan-v1` и `srhd-modkit-deploy-transaction-v1`.
+
+## Rangers.exe: сборки и хуки (`exe`)
+
+- `exe identify <exe|папка>...` — сборка, профиль кода (legacy $O- / optimized $O+), SHA-256, дата в PE.
+- `exe probe <exe|папка>... --source <runtime_scan.cpp>` или `--hooks hooks.json` — какие сигнатуры плагина находятся в каких EXE; `...Optimized...` = $O+.
+- `exe port <old.exe> <new.exe>... --va 0x...` — перенос места хука: тот же профиль даёт точный адрес и сигнатуру, другой профиль — кандидатов.
+- `exe sig <exe> --va 0x...` — кратчайшая уникальная сигнатура с маской адресов по `.reloc` (текст и C-массив).
+- `--name <функция> --symbols native_ranges.json` вместо `--va`, если есть карта функций этого EXE. EXE не запускается и не меняется.
