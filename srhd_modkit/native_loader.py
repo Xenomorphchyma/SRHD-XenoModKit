@@ -7,6 +7,7 @@ import os
 import re
 import struct
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable
@@ -839,6 +840,18 @@ def initialize_native_mod(
     existing = [item for item in generated if item.exists()]
     if existing and not overwrite:
         raise FileExistsError("Не перезаписаны существующие файлы: " + ", ".join(str(item) for item in existing))
+    if project_file.is_file():
+        # The project file lives beside the mod, so a folder shared by several
+        # mods already holds another mod's project; --overwrite must not take it.
+        try:
+            other_root = tomllib.loads(project_file.read_text(encoding="utf-8")).get("mod_root")
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            other_root = None
+        if not isinstance(other_root, str) or Path(other_root).as_posix().casefold() != root.name.casefold():
+            raise FileExistsError(
+                f"{project_file} описывает другой мод (mod_root={other_root!r}); "
+                "создайте новый мод в отдельной папке проекта"
+            )
     for parent in {item.parent for item in generated}:
         parent.mkdir(parents=True, exist_ok=True)
     selected_name = name or plugin_id

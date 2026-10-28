@@ -383,6 +383,20 @@ class NativeLoaderTests(unittest.TestCase):
             self.assertEqual(project.external_builds[0]["kind"], "xeno-native-plugin")
             self.assertEqual(project.external_builds[0]["mode"], "prebuilt")
 
+    def test_native_init_never_overwrites_another_mods_project(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            first = Path(name) / "FirstNative"
+            initialize_native_mod(first, plugin_id="FirstRuntime")
+            project_file = Path(name) / "srhd-modkit.toml"
+            before = project_file.read_bytes()
+            with self.assertRaises(FileExistsError):
+                initialize_native_mod(
+                    Path(name) / "SecondNative", plugin_id="SecondRuntime", overwrite=True
+                )
+            self.assertEqual(project_file.read_bytes(), before)
+            self.assertFalse((Path(name) / "SecondNative").exists())
+            initialize_native_mod(first, plugin_id="FirstRuntime", overwrite=True)
+
     def test_project_init_links_native_build_script_to_all_plugin_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
