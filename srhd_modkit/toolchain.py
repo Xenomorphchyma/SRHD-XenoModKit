@@ -349,6 +349,12 @@ def _replace_cross_device_safe(staged: Path, destination: Path) -> None:
         local_stage.unlink(missing_ok=True)
 
 
+# RScript 4.10f (TBCEditor) fails an assertion in its font cache while it
+# shuts down after a CLI conversion when Windows text services (the language
+# bar windows CiceroUIWndFrame/TF_FloatingLangBar) are loaded into it. The
+# file is already written; the address pins the message to that binary.
+_RSCRIPT410_SHUTDOWN_ASSERT = "Runtime error 217 at 007523C4"
+
 _STAGED_NAME = re.compile(r"_srhd_[0-9a-f]{32}\.[A-Za-z0-9]{1,8}")
 # Staging must outlive the longest RScript run; anything older is an orphan.
 _STAGED_ORPHAN_SECONDS = 6 * 60 * 60
@@ -3240,8 +3246,10 @@ class Toolchain:
                 timeout=timeout_seconds,
                 progress_timeout=timeout_policy["progress_seconds"],
                 abort_window_patterns=("Run-time error", "Runtime error", "Error", "Ошибка"),
+                tolerated_exit_windows=(_RSCRIPT410_SHUTDOWN_ASSERT,),
             )
             _require_external_success(process_result, "RScript convert")
+            tolerated = getattr(process_result, "tolerated_window", "")
             if not generated.is_file():
                 raise RuntimeError("RScript CLI не создал результат конвертации")
             if generated.suffix.casefold() == ".rson":
@@ -3250,6 +3258,27 @@ class Toolchain:
                 )
                 if any(item.severity == "error" for item in issues):
                     raise RuntimeError(f"Полученный RSON не прошёл проверку: {issues[0].message}")
+            elif tolerated:
+                # Nothing reads SVR headlessly, so an SVR from a run that
+                # crashed on shutdown is proven by converting it back.
+                with tempfile.TemporaryDirectory(prefix="srhd-svr-verify-") as verify_name:
+                    verify = Path(verify_name)
+                    copied = verify / "check.svr"
+                    shutil.copy2(generated, copied)
+                    self.convert_script_project(copied, verify / "back.rson")
+                    expected = load_rson(source)
+                    recovered = load_rson(verify / "back.rson")
+                    fields = ("objects", "links", "code_lines", "types")
+                    expected_summary = expected.summary()
+                    recovered_summary = recovered.summary()
+                    if expected.name != recovered.name or any(
+                        expected_summary.get(field) != recovered_summary.get(field)
+                        for field in fields
+                    ):
+                        raise RuntimeError(
+                            "RScript упал при закрытии после записи SVR, и обратная "
+                            "конвертация не совпала с исходным RSON"
+                        )
             with tempfile.TemporaryDirectory(prefix=".srhd-script-output-", dir=destination.parent) as output_name:
                 staged_output = Path(output_name) / destination.name
                 shutil.copy2(generated, staged_output)
@@ -3263,6 +3292,7 @@ class Toolchain:
             "sha256": sha256_file(destination),
             "compiler_exit_code": process_result.exit_code,
             "compiler_was_waiting_after_output": process_result.forced_after_outputs,
+            "compiler_tolerated_exit_error": tolerated or None,
             "compiler_queue_seconds": round(getattr(process_result, "queue_seconds", 0.0), 3),
             "compiler_progress_updates": getattr(process_result, "progress_updates", 0),
             "compiler_timeout": timeout_policy,

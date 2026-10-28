@@ -40,6 +40,9 @@ class HiddenProcessResult:
     queue_seconds: float = 0.0
     progress_updates: int = 0
     last_progress_seconds: float = 0.0
+    # Error line accepted through ``tolerated_exit_windows`` after the outputs
+    # were complete; callers must validate those outputs themselves.
+    tolerated_window: str = ""
 
 
 class HiddenProcessTimeout(TimeoutError):
@@ -98,6 +101,32 @@ def _abort_window_matches(window_text: tuple[str, ...], patterns: tuple[str, ...
         elif any(pattern in line for line in folded_lines):
             return True
     return False
+
+
+def _tolerated_window(
+    window_text: tuple[str, ...],
+    abort_patterns: tuple[str, ...],
+    tolerated: tuple[str, ...],
+) -> str | None:
+    """Return the tolerated error line when it explains every error shown.
+
+    The tolerated line and the bare ``Error`` caption of its message box are
+    set aside; any other text that still matches an abort pattern means a
+    second, unexplained failure, and nothing is tolerated.
+    """
+
+    folded = {value.strip().casefold() for value in tolerated if value.strip()}
+    if not folded:
+        return None
+    hit = next((line.strip() for line in window_text if line.strip().casefold() in folded), None)
+    if hit is None:
+        return None
+    rest = tuple(
+        line for line in window_text if line.strip().casefold() not in folded | {"error", "ошибка"}
+    )
+    if _abort_window_matches(rest, abort_patterns):
+        return None
+    return hit
 
 
 @dataclass(frozen=True)
@@ -231,6 +260,7 @@ def run_on_hidden_desktop(
     abort_window_patterns: Sequence[str] = (),
     control_actions: Sequence[HiddenControlAction] = (),
     no_console: bool = False,
+    tolerated_exit_windows: Sequence[str] = (),
 ) -> HiddenProcessResult:
     """Run a legacy GUI-subsystem CLI on an invisible Windows desktop.
 
@@ -239,6 +269,9 @@ def run_on_hidden_desktop(
     dialog is then terminated without ever exposing that dialog to the user.
     ``timeout`` is a hard total deadline. ``progress_timeout`` is a sliding
     inactivity window reset by output, process-I/O, or control-action progress.
+    ``tolerated_exit_windows`` lists exact error lines that do not fail the run
+    once every output is complete and stable; the line is reported in
+    ``HiddenProcessResult.tolerated_window`` for the caller to verify outputs.
     """
     if os.name != "nt":
         raise OSError("Скрытый desktop доступен только в Windows")
@@ -473,6 +506,7 @@ def run_on_hidden_desktop(
         started = time.monotonic()
         forced = False
         captured_window_text: tuple[str, ...] = ()
+        tolerated_window = ""
         last_signature: tuple[tuple[int, int], ...] | None = None
         stable_since: float | None = None
         last_window_probe = started
@@ -614,12 +648,19 @@ def run_on_hidden_desktop(
                         if abort_window_patterns and _abort_window_matches(
                             captured_window_text, abort_window_patterns
                         ):
-                            terminate_process_tree(1)
-                            details = "; ".join(captured_window_text)
-                            raise RuntimeError(
-                                "Процесс создал выходные файлы, но затем показал окно ошибки: "
-                                f"{details}"
+                            tolerated = _tolerated_window(
+                                captured_window_text,
+                                tuple(abort_window_patterns),
+                                tuple(tolerated_exit_windows),
                             )
+                            if tolerated is None:
+                                terminate_process_tree(1)
+                                details = "; ".join(captured_window_text)
+                                raise RuntimeError(
+                                    "Процесс создал выходные файлы, но затем показал окно ошибки: "
+                                    f"{details}"
+                                )
+                            tolerated_window = tolerated
                         terminate_process_tree(0)
                         forced = True
                         break
@@ -660,6 +701,7 @@ def run_on_hidden_desktop(
             queue_seconds=queue_seconds,
             progress_updates=progress_updates,
             last_progress_seconds=max(0.0, last_progress_at - started),
+            tolerated_window=tolerated_window,
         )
     finally:
         # Explicitly terminate the job even after the main process exits: a

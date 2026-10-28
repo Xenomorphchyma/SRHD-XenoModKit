@@ -15,6 +15,7 @@ from srhd_modkit.cli import main
 from srhd_modkit.hidden_process import (
     HiddenProcessTimeout,
     _abort_window_matches,
+    _tolerated_window,
     inspect_hidden_processes,
     run_on_hidden_desktop,
 )
@@ -29,6 +30,19 @@ class HiddenWindowPatternTests(unittest.TestCase):
         self.assertTrue(_abort_window_matches(("Error", "File could not be opened"), ("Error",)))
         self.assertTrue(
             _abort_window_matches(("Access violation at address 0",), ("Access violation",))
+        )
+
+    def test_tolerated_line_must_explain_every_error(self) -> None:
+        patterns = ("Runtime error", "Error")
+        known = ("Runtime error 217 at 007523C4",)
+        shown = ("Error", "ОК", "Runtime error 217 at 007523C4", "CiceroUIWndFrame")
+        self.assertEqual(_tolerated_window(shown, patterns, known), known[0])
+        self.assertIsNone(_tolerated_window(shown, patterns, ()))
+        self.assertIsNone(
+            _tolerated_window(("Error", "Runtime error 217 at 00401000"), patterns, known)
+        )
+        self.assertIsNone(
+            _tolerated_window(shown + ("Runtime error 216 at 00402000",), patterns, known)
         )
 
 
