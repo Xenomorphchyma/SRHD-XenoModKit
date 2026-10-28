@@ -349,6 +349,34 @@ def _replace_cross_device_safe(staged: Path, destination: Path) -> None:
         local_stage.unlink(missing_ok=True)
 
 
+_STAGED_NAME = re.compile(r"_srhd_[0-9a-f]{32}\.[A-Za-z0-9]{1,8}")
+# Staging must outlive the longest RScript run; anything older is an orphan.
+_STAGED_ORPHAN_SECONDS = 6 * 60 * 60
+
+
+def _sweep_orphaned_staging(directory: Path) -> None:
+    """Remove ``_srhd_<uuid>`` files a killed run left in a tool's folder.
+
+    RScript only accepts a bare filename in its own working directory, so
+    inputs are staged next to the EXE and removed in ``finally``. A process
+    killed before that (shutdown, task kill) leaves them behind for good.
+    """
+
+    cutoff = time.time() - _STAGED_ORPHAN_SECONDS
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if _STAGED_NAME.fullmatch(entry.name) is None:
+            continue
+        try:
+            if entry.is_file() and not entry.is_symlink() and entry.stat().st_mtime < cutoff:
+                entry.unlink()
+        except OSError:
+            continue
+
+
 def _require_external_success(result: Any, operation: str) -> None:
     """Reject unsolicited tool failures while allowing verified forced exits."""
 
@@ -1735,6 +1763,7 @@ class Toolchain:
                 )
             return process_result, timeout_policy
 
+        _sweep_orphaned_staging(tool.path.parent)
         stem = f"_srhd_{uuid.uuid4().hex}"
         staged_scr = tool.path.parent / f"{stem}.scr"
         try:
@@ -3197,6 +3226,7 @@ class Toolchain:
         # RScript 4.10f crashes with Runtime error 217 for absolute paths and
         # even relative paths containing a directory. Only a bare filename in
         # its own working directory is reliable. A UUID prevents collisions.
+        _sweep_orphaned_staging(tool.path.parent)
         stem = f"_srhd_{uuid.uuid4().hex}"
         staged_source = tool.path.parent / f"{stem}{source.suffix.casefold()}"
         generated = tool.path.parent / f"{stem}{target[1]}"

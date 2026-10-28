@@ -1063,5 +1063,29 @@ class ToolchainWorkflowTests(unittest.TestCase):
             self.assertFalse(lang_dat.exists())
 
 
+class StagingSweepTests(unittest.TestCase):
+    def test_only_old_staged_files_are_removed(self) -> None:
+        from srhd_modkit.toolchain import _sweep_orphaned_staging
+
+        with tempfile.TemporaryDirectory() as name:
+            folder = Path(name)
+            stale = folder / ("_srhd_" + "a" * 32 + ".scr")
+            fresh = folder / ("_srhd_" + "b" * 32 + ".rson")
+            foreign = folder / "_srhd_notes.scr"
+            tool = folder / "RScript.exe"
+            for path in (stale, fresh, foreign, tool):
+                path.write_bytes(b"x")
+            old = os.path.getmtime(stale) - 7 * 60 * 60
+            for path in (stale, foreign, tool):
+                os.utime(path, (old, old))
+
+            _sweep_orphaned_staging(folder)
+
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(foreign.exists())
+            self.assertTrue(tool.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
