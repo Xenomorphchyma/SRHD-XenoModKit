@@ -36,9 +36,18 @@ def _path_parts(value: str) -> list[str]:
 
 
 def _installed_mod_subpath(root: Path) -> tuple[str, ...] | None:
-    """Return the real path below the nearest ``Mods`` directory, if known."""
+    """Return the real path below the game's ``Mods`` directory, if known.
+
+    A folder merely named ``mods`` is not proof: source repositories keep
+    their mods in one (``XenoMods/mods/<Mod>``), and taking it for the game
+    folder expects ``Mods/<Mod>`` where the mod really installs under
+    ``Mods/XenoMods/<Mod>``. Only a ``Mods`` folder with the game's
+    ``ModCFG.txt`` or next to ``Rangers.exe`` counts.
+    """
     for parent in root.parents:
         if parent.name.casefold() != "mods":
+            continue
+        if not (parent / "ModCFG.txt").is_file() and not (parent.parent / "Rangers.exe").is_file():
             continue
         relative = root.relative_to(parent)
         if relative.parts:

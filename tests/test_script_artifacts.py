@@ -171,6 +171,8 @@ class ScriptArtifactTests(unittest.TestCase):
     def test_installed_mod_cache_path_must_match_actual_mods_location(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "Mods" / "LifeBeforeRanger"
+            root.mkdir(parents=True)
+            (root.parent / "ModCFG.txt").write_text("CurrentMod=LifeBeforeRanger\n", encoding="utf-8")
             script = root / "DATA" / "Script" / "Mod_LifeBeforeRanger.scr"
             cache = parse_blockpar(
                 "Script ^{\n"
@@ -194,6 +196,35 @@ class ScriptArtifactTests(unittest.TestCase):
                 r"ожидается: Mods\LifeBeforeRanger\DATA\Script\Mod_LifeBeforeRanger.scr",
                 matching[0].evidence or "",
             )
+
+    def test_repository_mods_folder_is_not_taken_for_the_game_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            # XenoMods keeps sources in <repo>/mods/<Mod>; the mod installs
+            # under Mods/XenoMods/<Mod>, which a lowercase repo folder must
+            # not contradict.
+            root = Path(name) / "XenoMods" / "mods" / "XenoDomRangers"
+            script = root / "DATA" / "Script" / "Mod_XenoDomRangers.scr"
+            cache = parse_blockpar(
+                "Script ^{\n"
+                "  Mod_XenoDomRangers=Mods\\XenoMods\\XenoDomRangers\\DATA\\Script\\Mod_XenoDomRangers.scr\n"
+                "}\n"
+            )
+            registrations = {"mod_xenodomrangers": ["1,Script.Mod_XenoDomRangers"]}
+            cache_documents = [(root / "SOURCE" / "CFG" / "CacheData.txt", cache)]
+            codes = {
+                issue.code
+                for issue in lint_script_cache(root, [script], registrations, cache_documents)
+            }
+            self.assertNotIn("cache-script-install-path-mismatch", codes)
+            self.assertIn("cache-script-install-path-unverified", codes)
+            exact = lint_script_cache(
+                root,
+                [script],
+                registrations,
+                cache_documents,
+                install_subpath="XenoMods/XenoDomRangers",
+            )
+            self.assertEqual(exact, [])
 
     def test_workspace_nested_cache_path_is_reported_as_unverified(self) -> None:
         with tempfile.TemporaryDirectory() as name:

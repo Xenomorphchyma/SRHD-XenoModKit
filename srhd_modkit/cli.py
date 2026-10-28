@@ -2075,6 +2075,7 @@ def _script_artifact_lint_target(
     scripts: Sequence[str | Path] | None = None,
     registrations: dict[str, list[str]] | None = None,
     check_dialog_language: bool = True,
+    install_subpath: str | None = None,
 ) -> dict[str, Any]:
     root = Path(root).resolve()
     chain = Toolchain(tools_root)
@@ -2127,7 +2128,15 @@ def _script_artifact_lint_target(
                 issues.append(
                     ScriptArtifactIssue("error", "cachedata-load", str(exc), str(path.resolve()))
                 )
-        issues.extend(lint_script_cache(root, local_scripts, registrations, cache_documents))
+        issues.extend(
+            lint_script_cache(
+                root,
+                local_scripts,
+                registrations,
+                cache_documents,
+                install_subpath=install_subpath,
+            )
+        )
 
         if check_dialog_language:
             rson_projects = []
@@ -2789,6 +2798,7 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
         tools_root=args.tools_root,
         scripts=scripts,
         registrations=registrations,
+        install_subpath=getattr(args, "prefix", None),
     )
     issues.extend(artifact_lint["issues"])
     text_lint = _game_text_lint_target(root, tools_root=args.tools_root)
@@ -3770,6 +3780,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     script_audit = script_sub.add_parser("audit-mod", help="Проверить SCR, RSON и регистрацию в Main.dat")
     script_audit.add_argument("mod")
+    script_audit.add_argument(
+        "--prefix",
+        help="Точный путь мода внутри Mods, например XenoMods/XenoDomRangers; без него "
+        "путь из CacheData проверяется только по имени папки мода",
+    )
     script_audit.add_argument("--tools-root")
     script_audit.add_argument("--json", action="store_true")
     script_audit.set_defaults(func=cmd_script_audit_mod)
