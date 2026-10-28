@@ -294,7 +294,7 @@
   `srhd-modkit-process-audit-v1`, `srhd-modkit-process-cleanup-v1` и
   `srhd-modkit-native-loader-v1`.
 - Проверка `native-loader` разбирает automatic/manifest discovery
-  XenoNativeLoader Host API V1 (минимум 0.6.5, проверено 0.6.7), INI и безопасные пути, затем статически доказывает
+  XenoNativeLoader Host API V1 (минимум 0.6.5, проверено 0.8.0), INI и безопасные пути, затем статически доказывает
   x86 PE32 и обязательные ABI exports. Она не вызывает `XenoPlugin_Query`,
   поэтому runtime ID, capabilities и установку хуков честно оставляет
   динамическому Loader/игре.

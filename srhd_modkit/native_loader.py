@@ -16,7 +16,7 @@ from .files import iter_files, sha256_file
 
 NATIVE_LOADER_SCHEMA = "srhd-modkit-native-loader-v1"
 NATIVE_LOADER_MINIMUM_VERSION = "0.6.5"
-NATIVE_LOADER_TESTED_VERSION = "0.6.7"
+NATIVE_LOADER_TESTED_VERSION = "0.8.0"
 NATIVE_LOADER_SOURCE_URL = "https://github.com/Xenomorphchyma/XenoMods"
 # Public compatibility alias retained for callers that used the original API.
 NATIVE_LOADER_VERSION = NATIVE_LOADER_MINIMUM_VERSION
@@ -819,7 +819,7 @@ def initialize_native_mod(
     capability: str = "none",
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Create a minimal, auditable Host API V1 plugin tested with Loader 0.6.7."""
+    """Create a minimal, auditable Host API V1 plugin tested with Loader 0.8.0."""
 
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,62}", plugin_id) is None:
         raise ValueError("plugin id должен начинаться с латинской буквы и содержать до 63 ASCII-символов")

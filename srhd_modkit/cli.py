@@ -3183,7 +3183,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     native = sub.add_parser(
         "native",
-        help="Создать и проверить Host API V1 плагины XenoNativeLoader 0.6.5+ (проверено 0.6.7) без исполнения DLL",
+        help="Создать и проверить Host API V1 плагины XenoNativeLoader 0.6.5+ (проверено 0.8.0) без исполнения DLL",
     )
     native_sub = native.add_subparsers(dest="native_command", required=True)
     native_init = native_sub.add_parser(

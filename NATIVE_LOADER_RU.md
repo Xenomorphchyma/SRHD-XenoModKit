@@ -1,7 +1,7 @@
 # XenoNativeLoader и SRHD ModKit
 
 Поддерживаемый контракт: **XenoNativeLoader 0.6.5+**, C ABI Host API V1;
-актуальная проверенная версия — **0.6.7**. Loader и готовые реальные примеры
+актуальная проверенная версия — **0.8.0**. Loader и готовые реальные примеры
 модов публикуются отдельно в
 **[XenoMods](https://github.com/Xenomorphchyma/XenoMods)** и не являются
 обязательной зависимостью самого ModKit.
@@ -132,11 +132,14 @@ Sidecar не исполняет DLL и не добавляется в игров
 плагинов. Совпадения runtime ID и эксклюзивных capabilities статически не
 объявляются: для этого Loader должен безопасно вызвать Query при запуске игры.
 
-## Проверка совместимости 0.6.7
+## Проверка совместимости 0.8.0
 
-Scaffold `native init` собран MSVC как настоящий x86 PE32, затем прошёл
-`native inspect`, `native validate` и `project build`. Теми же проверками без
-native/ImportedFunction-ошибок обработаны пять опубликованных примеров из
-XenoMods: XenoBigGalaxy, XenoCoalitionSupplyLines, XenoDomRangers,
-XenoEquipmentInflation и XenoHangarPaging. Это подтверждает файловый layout и
-Host API V1, но не заменяет вызов Query и установку хуков самим Loader в игре.
+Оба варианта scaffold `native init` (`--capability none` и `galaxy-generator`)
+собраны MSVC как настоящие x86 PE32, прошли `native validate` и затем были
+загружены настоящими `dsound.dll`/`XenoCore.dll` 0.8.0 в тестовой папке игры:
+Loader нашёл их через `ModCFG.txt`, вызвал Query и Initialize, журнал показал
+`plugin_load=loaded` и `capabilities=0x1` для генератора галактики. Теми же
+статическими проверками без ошибок обработаны опубликованные нативные моды
+XenoMods: XenoBigGalaxy, XenoCoalitionSupplyLines, XenoDomRangers и
+XenoEquipmentInflation. Установку хуков в самом Rangers.exe проверяет только
+запуск игры.

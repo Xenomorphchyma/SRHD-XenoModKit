@@ -322,7 +322,7 @@ class NativeLoaderTests(unittest.TestCase):
             self.assertEqual(report.plugins[0].source, "automatic")
             payload = report.as_dict()
             self.assertEqual(payload["loader"]["minimum_version"], "0.6.5")
-            self.assertEqual(payload["loader"]["tested_version"], "0.6.7")
+            self.assertEqual(payload["loader"]["tested_version"], "0.8.0")
             self.assertEqual(
                 payload["loader"]["source"],
                 "https://github.com/Xenomorphchyma/XenoMods",
@@ -368,7 +368,7 @@ class NativeLoaderTests(unittest.TestCase):
                 capability="galaxy-generator",
             )
             self.assertEqual(result["loader_minimum_version"], "0.6.5")
-            self.assertEqual(result["loader_tested_version"], "0.6.7")
+            self.assertEqual(result["loader_tested_version"], "0.8.0")
             self.assertEqual(
                 result["loader_source"],
                 "https://github.com/Xenomorphchyma/XenoMods",

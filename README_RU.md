@@ -65,7 +65,7 @@ Ruff проверяет исходники библиотеки на механ�
 | `.scr` | версия, строки и фрагменты кода, настоящий CLI SCR→RSON и сборка | собственный анализатор + RScript 4.15f |
 | `.rson`, `.rsm` | граф/модули, экспорт, сборка и смысловой runtime-lint | Python + RScript 4.15f + rsmc |
 | `.svr` | legacy-конвертация RSON↔SVR | совместимый RScript 4.10f из setup |
-| `.XenoPlugin.dll`, `.XenoManifest.ini` | PE32/x86, ABI exports, manifest/config discovery и безопасные пути XenoNativeLoader Host API V1 (проверено 0.6.7) | собственный статический инспектор; DLL не исполняется |
+| `.XenoPlugin.dll`, `.XenoManifest.ini` | PE32/x86, ABI exports, manifest/config discovery и безопасные пути XenoNativeLoader Host API V1 (проверено 0.8.0) | собственный статический инспектор; DLL не исполняется |
 | `.txt`, `.ini`, `.cfg`, `.json` | обычная текстовая обработка | Python |
 | `.wav`, `.dds`, `.webm`, `.psd`, `.jpg`, `.bmp`, `.vdo`, архивы, неизвестные | проверка известных сигнатур и точное копирование | standard/passthrough |
 
@@ -156,7 +156,7 @@ x86 PE32 и точные ABI exports `XenoPlugin_Query` / `XenoPlugin_Initialize
 сигнатуры EXE и хуки окончательно проверяет Loader/игра. `dsound.dll`,
 `XenoCore.dll` и общий `XenoNative.ini` не входят в обычный мод. Подробнее:
 [NATIVE_LOADER_RU.md](NATIVE_LOADER_RU.md). Сам Loader не обязателен для
-обычных модов и не входит в ModKit; актуальная проверенная версия 0.6.7 и
+обычных модов и не входит в ModKit; актуальная проверенная версия 0.8.0 и
 реальные примеры модов публикуются в
 [XenoMods](https://github.com/Xenomorphchyma/XenoMods).
 

@@ -77,7 +77,7 @@ python -B srhd.py project clean --json
 сборку и может обновить `.srhd-build`/`.srhd-cache`. `project clean` без
 `--apply` является только dry-run; `--build` и `--cache` включаются явно.
 
-## XenoNativeLoader Host API V1 (0.6.5+, проверено 0.6.7)
+## XenoNativeLoader Host API V1 (0.6.5+, проверено 0.8.0)
 
 ```powershell
 python -B srhd.py native init "<WORK>/MyNativeMod" --id MyNativeRuntime --json
@@ -86,7 +86,7 @@ python -B srhd.py native inspect "<WORK>/MyNativeMod/Native/MyNativeRuntime.Xeno
 python -B srhd.py native validate "<WORK>/MyNativeMod" --json
 ```
 
-Loader необязателен и не включён в ModKit. Проверенная версия 0.6.7 и реальные
+Loader необязателен и не включён в ModKit. Проверенная версия 0.8.0 и реальные
 примеры automatic/manifest-плагинов доступны в
 `https://github.com/Xenomorphchyma/XenoMods`.
 
