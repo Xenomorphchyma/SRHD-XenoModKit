@@ -708,6 +708,7 @@ class ScriptArtifactTests(unittest.TestCase):
                 "event_signatures": [],
                 "dialog_language_keys": [],
                 "code_samples": [],
+                "structure": {"valid": True, "trailing_bytes": 0},
             }
 
             with (

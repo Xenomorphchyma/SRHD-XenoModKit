@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .safe_io import atomic_write_text
+from .scr_format import check_scr_structure
 
 
 RSON_FILE_ID = 573785173
@@ -1032,6 +1033,7 @@ def inspect_scr(path: str | Path) -> dict[str, Any]:
         "size": len(data),
         "version": version,
         "supported_version": version in {6, 7, 8},
+        "structure": check_scr_structure(data),
         "utf16_strings": len(strings),
         "event_signatures": event_signatures,
         "dialog_language_keys": [

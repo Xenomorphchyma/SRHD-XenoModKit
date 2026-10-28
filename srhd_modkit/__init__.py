@@ -27,6 +27,7 @@ from .toolchain import (
 from .executable_version import ExecutableVersion, detect_executable_version
 from .rsm import RsmIssue, RsmModule, RsmProject, inspect_rsm_project
 from .blockpar import BlockParDocument, BlockParNode, BlockParParameter, load_blockpar, parse_blockpar
+from .scr_format import ScrFormatError, check_scr_structure, parse_scr_structure
 from .scripts import RsonProject, ScriptIssue, inspect_scr, load_rson
 from .resources import (
     GaiInfo,
@@ -213,6 +214,9 @@ __all__ = [
     "ScriptIssue",
     "load_rson",
     "inspect_scr",
+    "ScrFormatError",
+    "check_scr_structure",
+    "parse_scr_structure",
     "GaiInfo",
     "HaiInfo",
     "PkgInfo",

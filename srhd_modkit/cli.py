@@ -22,6 +22,7 @@ from .toolchain import (
     is_empty_rscript_lang_dat,
 )
 from .blockpar import BlockParDocument, BlockParNode, load_blockpar
+from .scr_format import scr_structure_issues
 from .scripts import inspect_scr, load_rson
 from .resources import (
     PKG_GAME_CHUNK_SIZE,
@@ -2710,6 +2711,8 @@ def cmd_script_audit_mod(args: argparse.Namespace) -> int:
             scr_info.append(info)
             if not info["supported_version"]:
                 issues.append({"severity": "error", "code": "scr-version", "message": f"{path.name}: версия SCR {info['version']} не поддерживается"})
+            for severity, code, message in scr_structure_issues(info["structure"]):
+                issues.append({"severity": severity, "code": code, "message": f"{path.name}: {message}"})
         except Exception as exc:
             issues.append({"severity": "error", "code": "scr-invalid", "message": f"{path.name}: {exc}"})
 

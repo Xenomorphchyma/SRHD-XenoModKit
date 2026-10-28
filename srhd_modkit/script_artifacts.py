@@ -764,4 +764,41 @@ def lint_script_cache(
                             "через --prefix при release check/build",
                         )
                     )
+
+        # The loop above starts from the SCR files that exist, so a mapping
+        # into this mod's own DATA/Script whose file is gone was never seen.
+        own_folders = {root.name.casefold(), ((mod_name or "").strip() or root.name).casefold()}
+        for key, value in parameters:
+            parts = _path_parts(value)
+            folded_parts = [part.casefold() for part in parts]
+            if (
+                len(folded_parts) < 5
+                or folded_parts[0] != "mods"
+                or folded_parts[-3:-1] != ["data", "script"]
+                or folded_parts[-4] not in own_folders
+                or not folded_parts[-1].endswith(".scr")
+            ):
+                continue
+            stem = Path(parts[-1]).stem.casefold()
+            if stem in local_scripts:
+                continue
+            registered = key.casefold() in normalized_registrations
+            issues.append(
+                ScriptArtifactIssue(
+                    "error" if registered else "warning",
+                    "cache-script-file-missing",
+                    (
+                        f"CacheData указывает на {parts[-1]} внутри этого мода, но файла "
+                        "DATA/Script нет"
+                        + (
+                            "; скрипт зарегистрирован в Main, игра не сможет его загрузить"
+                            if registered
+                            else "; ссылка не зарегистрирована в Main и останется висячей"
+                        )
+                    ),
+                    resolved_cache,
+                    f"Script/{key}",
+                    value,
+                )
+            )
     return issues

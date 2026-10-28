@@ -37,6 +37,7 @@ from .runtime_lint import (
     script_launch_mode,
 )
 from .script_artifacts import lint_script_cache, lint_script_dialog_language
+from .scr_format import scr_structure_issues
 from .scripts import inspect_scr, load_rson
 from .textio import DecodedText, read_text
 from .toolchain import (
@@ -1429,6 +1430,28 @@ def _registrations(document: BlockParDocument) -> dict[str, list[str]]:
     return result
 
 
+def _cache_maps_scripts(context: AuditContext) -> bool:
+    """Whether CacheData still maps scripts after every SCR file was removed."""
+
+    index = _relative_index(context.root)
+    paths = (
+        *_source_config_candidates(index, "cachedata.txt"),
+        index.get("cfg/cachedata.txt"),
+        index.get("cfg/cachedata.dat"),
+    )
+    for path in dict.fromkeys(value for value in paths if value is not None):
+        try:
+            document = load_blockpar(path) if path.suffix.casefold() == ".txt" else _load_dat(context, path)
+        except Exception:
+            # The full check reports unreadable CacheData; here it only gates the run.
+            return True
+        if document is not None and any(
+            node.name.casefold() == "script" and node.parameters for node in document.roots
+        ):
+            return True
+    return False
+
+
 def _script_check(context: AuditContext) -> AuditCheck:
     name = "scripts"
     files = iter_files(context.root)
@@ -1452,7 +1475,7 @@ def _script_check(context: AuditContext) -> AuditCheck:
             if path.suffix.casefold() == ".rson" and path.resolve() not in known
         )
         rsons.extend(sorted(external_rsons, key=lambda value: str(value).casefold()))
-    if not scripts and not rsons:
+    if not scripts and not rsons and not _cache_maps_scripts(context):
         return AuditCheck(name, "skipped", details={"reason": "SCR/RSON не найдены"})
 
     issues: list[AuditIssue] = []
@@ -1474,6 +1497,10 @@ def _script_check(context: AuditContext) -> AuditCheck:
                         path,
                     )
                 )
+            issues.extend(
+                _issue(context, name, severity, code, message, path)
+                for severity, code, message in scr_structure_issues(info["structure"])
+            )
         except Exception as exc:
             issues.append(_issue(context, name, "error", "scr-invalid", str(exc), path))
 
