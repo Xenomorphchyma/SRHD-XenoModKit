@@ -15,7 +15,7 @@ def _copy_project(root: Path) -> Path:
     mod = root / "RuntimeMod"
     (mod / "DATA").mkdir(parents=True)
     (mod / "ModuleInfo.txt").write_text(
-        "Name=ProjectOpsFixture\nSection=Test\nPriority=1\nLanguages=Rus\n",
+        "Name=ProjectOpsFixture\nNoNormalResources=1\nSection=Test\nPriority=1\nLanguages=Rus\n",
         encoding="cp1251",
     )
     (mod / "DATA" / "base.cmap").write_bytes(b"base")
@@ -130,7 +130,7 @@ class ProjectOperationsTests(unittest.TestCase):
             (mod / "SOURCE" / "Native").mkdir(parents=True)
             (mod / "DATA").mkdir()
             (mod / "ModuleInfo.txt").write_text(
-                "Name=NativeMod\nSection=Test\nLanguages=Rus\n",
+                "Name=NativeMod\nNoNormalResources=1\nSection=Test\nLanguages=Rus\n",
                 encoding="cp1251",
             )
             (mod / "SOURCE" / "Native" / "Worker.csproj").write_text(
@@ -172,7 +172,7 @@ class ProjectOperationsTests(unittest.TestCase):
             (mod / "DATA").mkdir(parents=True)
             (mod / "SOURCE" / "Tools").mkdir(parents=True)
             (mod / "ModuleInfo.txt").write_text(
-                "Name=LauncherMod\nSection=Test\nLanguages=Rus\n",
+                "Name=LauncherMod\nNoNormalResources=1\nSection=Test\nLanguages=Rus\n",
                 encoding="cp1251",
             )
             (mod / "Launcher.exe").write_bytes(b"MZruntime")
@@ -196,7 +196,7 @@ class ProjectOperationsTests(unittest.TestCase):
             source.mkdir(parents=True)
             (mod / "DATA").mkdir()
             (mod / "ModuleInfo.txt").write_text(
-                "Name=NativeMod\nSection=Test\nLanguages=Rus\n",
+                "Name=NativeMod\nNoNormalResources=1\nSection=Test\nLanguages=Rus\n",
                 encoding="cp1251",
             )
             worker = source / "Worker.csproj"

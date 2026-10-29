@@ -24,6 +24,7 @@ from srhd_modkit.quests import (
 )
 from srhd_modkit.scripts import RSON_FILE_ID, RSON_FILE_VERSION
 from srhd_modkit.toolchain import Toolchain
+from srhd_modkit.validation import has_mod_list_resources
 
 
 def _mod(root: Path) -> None:
@@ -341,6 +342,39 @@ class AuditTests(unittest.TestCase):
                 )
                 with self.assertRaises(ValueError):
                     cmd_audit(args)
+
+    def test_mod_without_list_resources_needs_no_normal_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "AuditFixture"
+            _mod(root)
+            codes = {item.code for item in audit_mod(root, profile="dev").issues}
+            self.assertIn("hidden-from-mod-list", codes)
+
+            (root / "ModuleInfo.txt").write_text(
+                "Name=AuditFixture\nNoNormalResources=1\nSection=Test\nLanguages=Rus\n",
+                encoding="cp1251",
+            )
+            codes = {item.code for item in audit_mod(root, profile="dev").issues}
+            self.assertNotIn("hidden-from-mod-list", codes)
+
+    def test_mod_list_resources_follow_the_game_probe(self) -> None:
+        for resource, listed in (
+            ("install.txt", True),
+            ("INSTALL_Eng.txt", True),
+            ("install_.txt", False),
+            ("CFG/Main.dat", True),
+            ("cfg/cachedata.dat", True),
+            ("CFG/Rus/Lang.dat", True),
+            ("CFG/Lang.dat", False),
+            ("DATA/Main.dat", False),
+        ):
+            with self.subTest(resource=resource), tempfile.TemporaryDirectory() as name:
+                root = Path(name) / "AuditFixture"
+                _mod(root)
+                path = root / resource
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"")
+                self.assertEqual(has_mod_list_resources(root), listed)
 
     def test_dev_accepts_sources_config_but_release_requires_packaged_main_dat(self) -> None:
         with tempfile.TemporaryDirectory() as name:

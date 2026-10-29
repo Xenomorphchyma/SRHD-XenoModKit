@@ -1,10 +1,42 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 
 from .game_text import lint_game_text
 from .models import Issue, ModRecord, normalize_ref
 from .textio import read_text
+
+
+def has_mod_list_resources(root: Path) -> bool:
+    """Whether the game's mod list finds resources in a mod folder.
+
+    Mirrors TModsInfo's resource probe: install.txt or install_<lang>.txt,
+    CFG\\Main.dat, CFG\\CacheData.dat or CFG\\<lang>\\Lang.dat. A folder without
+    them is listed only when its ModuleInfo has a NoNormalResources key.
+    """
+
+    children = {child.name.casefold(): child for child in root.iterdir()}
+    if "install.txt" in children:
+        return True
+    if any(
+        name.startswith("install_") and name.endswith(".txt") and len(name) > 12
+        and child.is_file()
+        for name, child in children.items()
+    ):
+        return True
+    cfg = children.get("cfg")
+    if cfg is None or not cfg.is_dir():
+        return False
+    for child in cfg.iterdir():
+        name = child.name.casefold()
+        if child.is_file() and name in {"main.dat", "cachedata.dat"}:
+            return True
+        if child.is_dir() and any(
+            item.is_file() and item.name.casefold() == "lang.dat" for item in child.iterdir()
+        ):
+            return True
+    return False
 
 
 def validate_mod(mod: ModRecord) -> list[Issue]:
@@ -54,6 +86,18 @@ def validate_mod(mod: ModRecord) -> list[Issue]:
     )
     if not mod.has_cfg and not mod.has_data and not has_native_runtime:
         issues.append(Issue("warning", "missing-content", "Нет ни CFG, ни DATA.", mod.root, mod.name))
+    if not mod.module.values("NoNormalResources") and not has_mod_list_resources(mod.root):
+        issues.append(
+            Issue(
+                "error",
+                "hidden-from-mod-list",
+                "Игра не покажет мод в списке: нет install.txt, CFG\\Main.dat, "
+                "CFG\\CacheData.dat или CFG\\<язык>\\Lang.dat, а в ModuleInfo.txt нет "
+                "NoNormalResources=1.",
+                mod.module.path,
+                mod.name,
+            )
+        )
     if mod.module.first("Priority") and mod.module.priority is None:
         issues.append(Issue("warning", "invalid-priority", "Priority должен быть целым числом.", mod.module.path, mod.name))
     if not mod.module.languages:

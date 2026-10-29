@@ -935,7 +935,10 @@ outputs = ["{relative_mod}/Native/{plugin_id}.XenoPlugin.dll"]
 '''
     contents: dict[Path, tuple[str, str]] = {
         root / "ModuleInfo.txt": (
-            f"Name={selected_name}\nAuthor={author}\nSection=OtherMods\nPriority=0\nLanguages=Rus\n",
+            # A plugin-only mod has no CFG or install.txt; without
+            # NoNormalResources the game leaves it out of the mod list.
+            f"Name={selected_name}\nAuthor={author}\nNoNormalResources=1\n"
+            "Section=OtherMods\nPriority=0\nLanguages=Rus\n",
             "cp1251",
         ),
         root / "Native" / f"{plugin_id}.XenoPlugin.ini": ("[Plugin]\nEnabled=1\n", "utf-8"),

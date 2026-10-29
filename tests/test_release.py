@@ -25,7 +25,7 @@ from srhd_modkit.schemas import validate_schema_document
 def _mod(root: Path) -> bytes:
     root.mkdir(parents=True)
     (root / "ModuleInfo.txt").write_text(
-        "Name=ReleaseFixture\nSection=Test\nPriority=1\nLanguages=Rus\n",
+        "Name=ReleaseFixture\nNoNormalResources=1\nSection=Test\nPriority=1\nLanguages=Rus\n",
         encoding="cp1251",
     )
     (root / "DATA").mkdir()

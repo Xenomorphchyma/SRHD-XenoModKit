@@ -22,7 +22,7 @@ def _write_project(root: Path) -> tuple[Path, Path]:
     mod = root / "RuntimeMod"
     (mod / "DATA").mkdir(parents=True)
     (mod / "ModuleInfo.txt").write_text(
-        "Name=ProjectFixture\nSection=Test\nPriority=1\nLanguages=Rus\n",
+        "Name=ProjectFixture\nNoNormalResources=1\nSection=Test\nPriority=1\nLanguages=Rus\n",
         encoding="cp1251",
     )
     (mod / "DATA" / "base.cmap").write_bytes(b"base")

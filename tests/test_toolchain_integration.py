@@ -232,7 +232,7 @@ class ToolchainIntegrationTests(unittest.TestCase):
             mod = root / "RuntimeMod"
             mod.mkdir()
             (mod / "ModuleInfo.txt").write_text(
-                "Name=ProjectRScriptFixture\nSection=Test\nPriority=1\nLanguages=Rus\n",
+                "Name=ProjectRScriptFixture\nNoNormalResources=1\nSection=Test\nPriority=1\nLanguages=Rus\n",
                 encoding="cp1251",
             )
             source = root / "Source" / "LastOneHP.rson"
@@ -274,7 +274,7 @@ output = "DATA/Script/LastOneHP.scr"
             mod = root / "RuntimeMod"
             mod.mkdir()
             (mod / "ModuleInfo.txt").write_text(
-                "Name=ProjectDatFixture\nSection=Test\nPriority=1\nLanguages=Rus\n",
+                "Name=ProjectDatFixture\nNoNormalResources=1\nSection=Test\nPriority=1\nLanguages=Rus\n",
                 encoding="cp1251",
             )
             source = root / "Source" / "Config.txt"
